@@ -1,0 +1,49 @@
+﻿#!/bin/bash
+
+### This script is called after the user uninstalls the application.
+### 卸载即清理本应用全部资源：容器、网络、镜像、数据卷、拉取残留。
+
+### 关键：把本脚本全部输出重定向到日志文件，保证 stdout 干净，
+### 避免被飞牛判定为「脚本出错且原因未知」（与 install/upgrade 一致）。
+LOG_DIR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+exec >> "$LOG_DIR/uninstall.log" 2>&1
+
+### 1) 双保险：再次停止后台拉取进程并清理拉取残留文件。
+VAR_DIR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+if [ -f "$VAR_DIR/pull.pid" ]; then
+    PID=$(cat "$VAR_DIR/pull.pid" 2>/dev/null)
+    [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
+fi
+pkill -f "pull_image.sh" 2>/dev/null || true
+pkill -f "redroid/redroid" 2>/dev/null || true
+pkill -f "scrcpy-over-webrtc" 2>/dev/null || true
+rm -f "$VAR_DIR/pull.pid" "$VAR_DIR/pull.log" "$VAR_DIR/pull-progress.log" "$VAR_DIR/eta.state" 2>/dev/null || true
+
+### 2) 停止并删除容器（compose down 之外再兜底一次；新旧命名都清，兼容改名前的残留）。
+docker rm -f androidemu-android androidemu-webrtc androidvm-rd-android androidvm-rd-webrtc 2>/dev/null || true
+
+### 3) 删除默认网络（compose 与手工两种可能命名都删）。
+docker network rm androidemu_default docker_default androidvm-rd_default 2>/dev/null || true
+
+### 4) 清理本地镜像：先按固定 tag 删除，再按仓库名兜底删除
+###    （覆盖用户预拉/手动 pull 产生的其它 tag）。仅限本应用两个镜像，
+###    不影响宿主机其它镜像。
+for IMG in \
+    "redroid/redroid:12.0.0-latest" \
+    "docker.m.daocloud.io/redroid/redroid:12.0.0-latest" \
+    "buutuu/scrcpy-over-webrtc:latest" \
+    "docker.m.daocloud.io/buutuu/scrcpy-over-webrtc:latest"; do
+    docker image rm "$IMG" 2>/dev/null || true
+done
+docker images --format '{{.Repository}}:{{.Tag}}' | grep -E '^(docker\.m\.daocloud\.io/)?(redroid/redroid|buutuu/scrcpy-over-webrtc):' | sort -u | while read -r IMG; do
+    docker image rm "$IMG" 2>/dev/null || true
+done
+
+### 5) 删除数据卷（两个卷：安卓数据 + 穿云投屏数据）。
+###    默认卸载即全删；仅在向导明确选择“保留数据”时才保留。
+if [ "$wizard_keep_data" != "true" ]; then
+    docker volume rm androidemu-data androidemu-webrtc-data androidvm-rd-data androidvm-rd-webrtc-data 2>/dev/null || true
+fi
+
+exit 0

@@ -1,0 +1,54 @@
+#!/bin/bash
+
+### This script is called before the user uninstalls the application.
+### 卸载前直接清理本应用全部资源（容器/网络/镜像），不依赖卸载后回调，
+### 彻底解决「应用已删、容器/项目/本地镜像仍残留」。
+### 数据卷按卸载向导的选择在 uninstall_callback 中处理（默认保留）。
+
+### 关键：把本脚本全部输出重定向到日志文件，保证 stdout 干净。
+### 此前 uninstall_init 的 docker compose down 输出污染 stdout，被飞牛
+### 判定为「脚本出错且原因未知」而中断卸载流程，导致容器/镜像残留。
+LOG_DIR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+exec >> "$LOG_DIR/uninstall_init.log" 2>&1
+
+### 1) 先停止本应用的后台拉取进程（安装后/启用时可能正在拉镜像）。
+###    不杀的话，卸载后拉取进程会继续拉镜像并重建容器（“卸载残留/复活”）。
+VAR_DIR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+if [ -f "$VAR_DIR/pull.pid" ]; then
+    PID=$(cat "$VAR_DIR/pull.pid" 2>/dev/null)
+    [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
+fi
+pkill -f "pull_image.sh" 2>/dev/null || true
+pkill -f "redroid/redroid" 2>/dev/null || true
+pkill -f "scrcpy-over-webrtc" 2>/dev/null || true
+rm -f "$VAR_DIR/pull.pid" "$VAR_DIR/pull.log" "$VAR_DIR/pull-progress.log" "$VAR_DIR/eta.state" 2>/dev/null || true
+
+### 2) 强制删除容器（新旧命名都清；不依赖 compose，compose 文件异常也能清干净）。
+for C in androidemu-android androidemu-webrtc androidvm-rd-android androidvm-rd-webrtc; do
+    docker rm -f "$C" 2>/dev/null || true
+done
+
+### 3) 删除默认网络（compose 与手工两种可能命名都删）。
+docker network rm androidemu_default docker_default androidvm-rd_default 2>/dev/null || true
+
+### 4) compose down 兜底（--remove-orphans 清理孤儿容器；优雅停止在前，rm -f 兜底）。
+if [ -d "${TRIM_APPDEST}/docker" ]; then
+    cd "${TRIM_APPDEST}/docker" || true
+    docker compose -p androidemu down -t 60 --remove-orphans 2>/dev/null || true
+fi
+
+### 5) 清理本地镜像（先按固定 tag 删除，再按仓库名兜底删除；
+###    覆盖 DaoCloud / 官方两种 tag。仅限本应用两个镜像，不影响其它镜像）。
+for IMG in \
+    "redroid/redroid:12.0.0-latest" \
+    "docker.m.daocloud.io/redroid/redroid:12.0.0-latest" \
+    "buutuu/scrcpy-over-webrtc:latest" \
+    "docker.m.daocloud.io/buutuu/scrcpy-over-webrtc:latest"; do
+    docker image rm "$IMG" 2>/dev/null || true
+done
+docker images --format '{{.Repository}}:{{.Tag}}' | grep -E '^(docker\.m\.daocloud\.io/)?(redroid/redroid|buutuu/scrcpy-over-webrtc):' | sort -u | while read -r IMG; do
+    docker image rm "$IMG" 2>/dev/null || true
+done
+
+exit 0

@@ -1,0 +1,12 @@
+{
+    ".url": {
+        "androidemu.Application": {
+            "title": "安卓模拟器（国内版）",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "http",
+            "url": "/cgi/ThirdParty/androidemu/index.cgi/",
+            "allUsers": false
+        }
+    }
+}

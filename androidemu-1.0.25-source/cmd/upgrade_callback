@@ -1,0 +1,62 @@
+#!/bin/bash
+
+### This script is called after the user upgrades the application.
+### Re-apply the same safeguards as install_callback so that an upgrade
+### from a previous version keeps images ready, PUBLIC_IP correct, and
+### GPU passthrough auto-fallback (software rendering) intact.
+
+### 关键：把本脚本全部输出重定向到日志文件，保证 stdout 干净。
+### 飞牛对升级/安装脚本的 stdout 敏感：若脚本向标准输出打印内容
+### （如镜像拉取 echo 日志），会被判定为「脚本出错且原因未知」。
+LOG_DIR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+exec >> "$LOG_DIR/upgrade.log" 2>&1
+
+COMPOSE="${TRIM_APPDEST}/docker/docker-compose.yaml"
+HELPER="${TRIM_APPDEST}/scripts/pull_image.sh"
+
+### Round pull: ensure both images are present.
+if [ -f "$HELPER" ]; then
+    . "$HELPER"
+    ensure_redroid_image || true
+    ensure_webrtc_image || true
+fi
+
+### 1) Fill the real NAS IP into the compose file.
+NAS_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+[ -z "$NAS_IP" ] && NAS_IP="127.0.0.1"
+if [ -f "$COMPOSE" ]; then
+    sed -i "s/PUBLIC_IP=127\.0\.0\.1/PUBLIC_IP=${NAS_IP}/g" "$COMPOSE"
+fi
+
+### 2) GPU 直通智能回退：宿主不具备 GPU 直通条件（无 /dev/dri 或宿主无 DRI 驱动）时，
+###    自动移除 GPU 直通配置，回退为软件渲染，保证无 GPU 直通能力的机器稳定开机。
+if [ -f "$COMPOSE" ]; then
+    if [ ! -e /dev/dri ] || [ ! -d /usr/lib/x86_64-linux-gnu/dri ]; then
+        sed -i '/redroid_gpu_mode=host/d' "$COMPOSE"
+        sed -i '\#/usr/lib/x86_64-linux-gnu/dri:/usr/lib/x86_64-linux-gnu/dri:ro#d' "$COMPOSE"
+        # 软件渲染（swiftshader）性能有限，帧率从 60 降为 30 保证稳定
+        sed -i 's/androidboot.redroid_fps=60/androidboot.redroid_fps=30/' "$COMPOSE"
+    fi
+fi
+
+### 3) 启动前放开宿主 DRM 设备权限（GPU 直通需要；redroid 无 /bin/sh，须宿主侧 chmod）
+if [ -e /dev/dri ]; then
+    chmod 666 /dev/dri/card0 /dev/dri/renderD128 2>/dev/null || true
+fi
+
+### 4) Start the compose project.
+if [ -d "${TRIM_APPDEST}/docker" ]; then
+    cd "${TRIM_APPDEST}/docker" || true
+    # -p androidemu：固定 compose 项目名，避免与飞牛应用中心创建的项目名不一致
+    # 导致「容器名已被占用」Conflict，升级/启动失败（报执行脚本出错）
+    docker compose -p androidemu up -d 2>/dev/null || true
+fi
+
+### 5) 容器内兜底：放开 /dev/dri 权限并重启渲染服务（宿主 chmod 在部分机器会被重置，
+###    须容器内 root 再 chmod + 重启 surfaceflinger，boot 才能完成）。后台执行。
+if [ -f "${TRIM_APPDEST}/scripts/fix_gpu_perms.sh" ]; then
+    nohup bash "${TRIM_APPDEST}/scripts/fix_gpu_perms.sh" >/dev/null 2>&1 &
+fi
+
+exit 0

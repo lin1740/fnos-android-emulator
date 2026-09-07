@@ -1,0 +1,21 @@
+[
+  {
+    "stepTitle": "卸载安卓模拟器（国内版）",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "卸载将删除本应用创建的容器与网络，并同时删除本应用下载的容器镜像（redroid、穿云投屏，合计约 2GB，重装需重新下载）。安卓应用与数据存储在专用数据卷中，您可以选择卸载后保留或删除。"
+      },
+      {
+        "type": "radio",
+        "field": "wizard_keep_data",
+        "label": "卸载后是否保留数据",
+        "initValue": "true",
+        "options": [
+          { "label": "保留数据（重装后可继续使用）", "value": "true" },
+          { "label": "删除数据（彻底清理，不可恢复）", "value": "false" }
+        ]
+      }
+    ]
+  }
+]

@@ -1,0 +1,48 @@
+#!/bin/bash
+
+### This script is called after the user installs the application.
+### 安装不阻塞：不做同步镜像拉取，只做必要校准，然后在后台拉取镜像，
+### 镜像就绪后自动启动容器（start_pull_bg.sh）。
+### 好处：安装秒完成，不会因拉取约 2GB 镜像占用过高资源导致 NAS 网页断连。
+
+### 关键：把本脚本全部输出重定向到日志文件，保证 stdout 干净，
+### 避免被飞牛判定为「脚本出错且原因未知」。
+LOG_DIR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+exec >> "$LOG_DIR/install.log" 2>&1
+
+COMPOSE="${TRIM_APPDEST}/docker/docker-compose.yaml"
+
+### 1) 清理本应用遗留容器（新旧命名都清，兼容改名前的旧版残留）。
+for LEGACY_NAME in androidemu-android androidemu-webrtc androidvm-rd-android androidvm-rd-webrtc; do
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${LEGACY_NAME}$"; then
+        docker rm -f "${LEGACY_NAME}" 2>/dev/null || true
+    fi
+done
+
+### 2) 填充真实 NAS 局域网 IP 到 compose（WebRTC 前端 PUBLIC_IP 参数）。
+NAS_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+[ -z "$NAS_IP" ] && NAS_IP="127.0.0.1"
+if [ -f "$COMPOSE" ]; then
+    sed -i "s/PUBLIC_IP=127\.0\.0\.1/PUBLIC_IP=${NAS_IP}/g" "$COMPOSE"
+fi
+
+### 3) GPU 直通智能回退：宿主不具备 GPU 直通条件（无 /dev/dri 或宿主无 DRI 驱动）时，
+###    自动移除 GPU 直通配置（androidboot.redroid_gpu_mode=host 与 DRI 驱动挂载），
+###    回退为软件渲染（swiftshader），保证无 GPU 直通能力的机器也能稳定开机。
+if [ -f "$COMPOSE" ]; then
+    if [ ! -e /dev/dri ] || [ ! -d /usr/lib/x86_64-linux-gnu/dri ]; then
+        sed -i '/redroid_gpu_mode=host/d' "$COMPOSE"
+        sed -i '\#/usr/lib/x86_64-linux-gnu/dri:/usr/lib/x86_64-linux-gnu/dri:ro#d' "$COMPOSE"
+        # 软件渲染（swiftshader）性能有限，帧率从 60 降为 30 保证稳定
+        sed -i 's/androidboot.redroid_fps=60/androidboot.redroid_fps=30/' "$COMPOSE"
+    fi
+fi
+
+### 4) 后台拉取镜像并在就绪后自动启动容器（不阻塞安装；拉取以低 IO/CPU 优先级
+###    运行，避免占满系统资源导致 NAS 网页服务断连）。安装流程到此结束，秒级完成。
+if [ -f "${TRIM_APPDEST}/scripts/start_pull_bg.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/start_pull_bg.sh" >/dev/null 2>&1 || true
+fi
+
+exit 0

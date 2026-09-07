@@ -1,0 +1,59 @@
+﻿name: androidemu
+
+services:
+  redroid:
+    image: redroid/redroid:12.0.0-latest
+    pull_policy: missing
+    container_name: androidemu-android
+    tty: true
+    stdin_open: true
+    privileged: true
+    stop_grace_period: 60s
+    stop_signal: SIGTERM
+    devices:
+      - /dev/dri
+      - /dev/binder
+    ports:
+      - "5556:5555"
+    volumes:
+      - androidemu-data:/data
+      # 挂载宿主 DRI 驱动（radeonsi/i915/iris/nouveau/virtio 等通用路径）；
+      # 安装脚本会按宿主是否具备 GPU 直通条件自动保留或移除该挂载
+      - /usr/lib/x86_64-linux-gnu/dri:/usr/lib/x86_64-linux-gnu/dri:ro
+    command:
+      # v1.0.10 默认启用 GPU 直通（androidboot.redroid_gpu_mode=host），流畅度更高；
+      # 不具备 GPU 直通条件的机器，安装脚本会自动移除本行回退软件渲染（swiftshader）保证稳定开机
+      # v1.0.19 起 guest 渲染帧率对齐 60fps（GPU 直通时；软件渲染回退时自动降为 30）
+      - androidboot.redroid_gpu_mode=host
+      - androidboot.redroid_fps=60
+      - androidboot.use_memfd=1
+
+  webrtc:
+    image: buutuu/scrcpy-over-webrtc:latest
+    pull_policy: missing
+    container_name: androidemu-webrtc
+    privileged: true
+    stop_grace_period: 30s
+    environment:
+      - PUBLIC_IP=127.0.0.1
+      # v1.0.19 起画面流畅度优化：60fps / 最大 10Mbps / 编码长边 1280（匹配 720x1280 guest 分辨率）。
+      # 单引号包裹是 YAML 语法，实际传入环境变量的值为合法 JSON。
+      - DEFAULT_SETTINGS='{"maxBitrate":10,"minBitrate":2,"fps":60,"size":1280,"bitrate":10}'
+    ports:
+      - "8443:8443"
+      - "3478:3478"
+      - "3478:3478/udp"
+      - "50000-50100:50000-50100/udp"
+    volumes:
+      # v1.0.10 起持久化穿云投屏数据（admin 账号、设备绑定等），容器重建后不再丢失
+      - androidemu-webrtc-data:/app/data
+
+volumes:
+  androidemu-data:
+    name: androidemu-data
+  androidemu-webrtc-data:
+    name: androidemu-webrtc-data
+
+networks:
+  default:
+    name: androidemu_default

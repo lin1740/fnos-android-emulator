@@ -1,0 +1,48 @@
+#!/bin/bash
+
+FILE_PATH="${TRIM_APPDEST}/docker/docker-compose.yaml"
+
+is_docker_running () {
+    DOCKER_NAME=""
+    if [ -f "$FILE_PATH" ]; then
+        DOCKER_NAME=$(sed -n 's/.*container_name:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$FILE_PATH" | head -1)
+    fi
+    if [ -n "$DOCKER_NAME" ]; then
+        if docker inspect "$DOCKER_NAME" >/dev/null 2>&1; then
+            docker inspect -f '{{.State.Running}}' "$DOCKER_NAME" 2>/dev/null | grep -q true && return 0
+        fi
+        return 1
+    fi
+    return 0
+}
+
+case $1 in
+start)
+    ### 点「启用」：缺镜像时后台自动拉取（低优先级），镜像就绪后自动启动容器。
+    ### 立即返回，不阻塞、不卡界面。
+    if [ -f "${TRIM_APPDEST}/scripts/start_pull_bg.sh" ]; then
+        bash "${TRIM_APPDEST}/scripts/start_pull_bg.sh" >/dev/null 2>&1 || true
+    fi
+    ### docker application will be started by appcenter afterwards
+    exit 0
+    ;;
+stop)
+    # graceful stop；任何错误都不阻塞升级/卸载流程（避免「执行脚本出错且原因未知」）
+    if [ -f "$FILE_PATH" ]; then
+        cd "$(dirname "$FILE_PATH")" || exit 0
+        # -p androidemu：固定 compose 项目名，与飞牛应用中心创建的项目名保持一致
+        docker compose -p androidemu stop -t 60 >/dev/null 2>&1 || true
+    fi
+    exit 0
+    ;;
+status)
+    if is_docker_running; then
+        exit 0
+    else
+        exit 3
+    fi
+    ;;
+*)
+    exit 1
+    ;;
+esac

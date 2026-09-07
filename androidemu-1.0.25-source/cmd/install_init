@@ -1,0 +1,19 @@
+#!/bin/bash
+
+### This script is called before the user installs the application.
+### Redroid needs the binder kernel module (install the "binder_linux"
+### driver from fnOS app center first) and a GPU device for host mode.
+
+if [ ! -e /dev/binder ] && [ ! -e /dev/binder_linux ]; then
+    echo "未检测到 /dev/binder。Redroid 方案依赖 binder 内核模块，请先在应用中心安装 binder_linux 驱动，确认 lsmod 能看到 binder_linux 后再安装本应用。" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+fi
+
+if [ ! -e /dev/dri ]; then
+    echo "提示：未检测到 /dev/dri 显卡设备，GPU 直通模式可能不可用，画面性能会下降。" > "$TRIM_TEMP_LOGFILE"
+fi
+
+### 安装不阻塞：镜像由安装完成后的后台脚本自动拉取（start_pull_bg.sh），
+### 应用面板与启用入口也会在缺镜像时自动触发拉取。此处不再同步拉取，
+### 避免安装过程占用过高资源导致 NAS 网页断连。
+exit 0
