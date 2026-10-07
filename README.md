@@ -169,8 +169,8 @@ GMS 服务支持 x86_64 和 arm64 双架构，安装时自动检测系统架构�
 
 | 架构 | GMS 镜像 | 来源 |
 |------|----------|------|
-| x86_64 | `ghcr.io/lin1740/androidemu-gms:x86_64-1.0.0` | 从第三方 redroid 衍生镜像（whojk/redroid:12.0.0_mindthegapps）提取 |
-| arm64 | `ghcr.io/lin1740/androidemu-gms:arm64-1.0.0` | 从 MindTheGapps 12.1.0-arm64 官方包提取 |
+| x86_64 | `ghcr.io/lin1740/androidemu-gms:x86_64` | 从第三方 redroid 衍生镜像（whojk/redroid:12.0.0_mindthegapps）提取 |
+| arm64 | `ghcr.io/lin1740/androidemu-gms:arm64` | 从 MindTheGapps 12.1.0-arm64 官方包提取 |
 
 - x86_64 版本：MindTheGapps 官方无 x86_64 预编译包，因此从已集成 GMS 的第三方 redroid 镜像中提取系统文件
 - arm64 版本：使用 MindTheGapps 官方发布的 arm64 安装包提取
@@ -240,11 +240,11 @@ A: 脚本会自动尝试多个镜像源（南京大学 → DaoCloud → GHCR 官
 1. 检查 NAS 网络连接和 DNS 配置
 2. 在飞牛「Docker → 镜像仓库 → 设置 → 加速源设置」中配置可用的加速源
 3. 在飞牛「Docker → 镜像仓库 → 设置 → 代理设置」中配置代理（如网络出口受限）
-4. 手动拉取镜像后重试：`docker pull ghcr.io/lin1740/androidemu-gms:x86_64-1.0.0`（x86_64）或 `docker pull ghcr.io/lin1740/androidemu-gms:arm64-1.0.0`（arm64）
+4. 手动拉取镜像后重试：`docker pull ghcr.io/lin1740/androidemu-gms:x86_64`（x86_64）或 `docker pull ghcr.io/lin1740/androidemu-gms:arm64`（arm64）
 
 **Q: 安装 GMS 后穿云投屏反复连接/离线，过一会儿才正常？**
 
-A: 这是正常现象。GMS 安装完成后会重启安卓容器，容器重启后 GMS 核心组件（GmsCore、GoogleServicesFramework、Play 商店等）需要进行首次启动的 dex 优化、服务注册、权限初始化和网络握手，这个过程通常持续 1-3 分钟。期间穿云投屏会显示「正在连接」或反复离线重连，耐心等待即可，不要频繁刷新或重启容器。
+A: 这是正常现象。GMS 安装完成后会重启安卓容器，容器重启后 GMS 核心组件（GmsCore、GoogleServicesFramework、Play 商店等）需要进行首次启动的 dex 优化、服务注册、权限初始化和网络握手，这个过程通常持续数分钟至十余分钟。期间穿云投屏会显示「正在连接」或反复离线重连，耐心等待即可，不要频繁刷新或重启容器。
 
 **Q: 安装 GMS 后画面黑屏或启动不了怎么办？**
 
@@ -264,8 +264,8 @@ A: 目前 GMS 只能在安装时选择。已安装标准版的用户需要：
 
 A: 可以。GMS 镜像仅在安装时用于提取文件，安装完成后不再需要。3.8.7+ 版本安装脚本会在安装成功后**自动删除** GMS 镜像。如需手动清理：
 ```bash
-docker rmi ghcr.io/lin1740/androidemu-gms:x86_64-1.0.0   # x86_64
-docker rmi ghcr.io/lin1740/androidemu-gms:arm64-1.0.0    # arm64
+docker rmi ghcr.io/lin1740/androidemu-gms:x86_64   # x86_64
+docker rmi ghcr.io/lin1740/androidemu-gms:arm64    # arm64
 ```
 删除后如将来需要重新安装 GMS（如卸载重装），会重新从镜像仓库拉取。
 
@@ -1063,7 +1063,7 @@ A: 这是正常现象，不是 bug。
 - Play 商店的应用列表同步
 - 网络连接和 Google 服务器握手（国内网络下可能超时重试）
 
-这个过程通常持续 **1~3 分钟**，期间穿云投屏会显示"正在连接"或反复离线重连，属于正常现象。
+这个过程通常持续 **数分钟至十余分钟**，期间穿云投屏会显示"正在连接"或反复离线重连，属于正常现象。
 
 **建议：**
 - 安装 GMS 后耐心等待 3 分钟，不要频繁刷新或重启容器
@@ -1072,14 +1072,14 @@ A: 这是正常现象，不是 bug。
 
 ### Q: GMS 安装完成后，GMS 镜像可以删除吗？
 
-A: 可以。GMS 镜像（`ghcr.io/lin1740/androidemu-gms:x86_64-1.0.0` 或 `arm64-1.0.0`，约 700MB）仅在安装时用于提取 GMS 文件，安装完成后不再需要。
+A: 可以。GMS 镜像（`ghcr.io/lin1740/androidemu-gms:x86_64` 或 `arm64`，约 700MB）仅在安装时用于提取 GMS 文件，安装完成后不再需要。
 
 **自动清理（3.8.7+ 默认开启）：** 安装脚本在 GMS 安装成功后会自动删除 GMS 镜像，释放约 700MB 空间。
 
 **手动删除：** 如果需要手动清理，执行：
 ```bash
-docker rmi ghcr.io/lin1740/androidemu-gms:x86_64-1.0.0   # x86_64
-docker rmi ghcr.io/lin1740/androidemu-gms:arm64-1.0.0    # arm64
+docker rmi ghcr.io/lin1740/androidemu-gms:x86_64   # x86_64
+docker rmi ghcr.io/lin1740/androidemu-gms:arm64    # arm64
 ```
 
 > 注意：删除后如果将来需要重新安装 GMS（如卸载重装），会重新从镜像仓库拉取，约 700MB。
