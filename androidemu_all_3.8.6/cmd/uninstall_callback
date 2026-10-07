@@ -1,0 +1,99 @@
+#!/bin/bash
+
+### This script is called after the user uninstalls the application.
+### 卸载即清理本应用资源：容器、网络、镜像、（按向导选择处理的）数据卷、拉取残留。
+
+### 关键：把本脚本全部输出重定向到日志文件，保证 stdout 干净，
+### 避免被飞牛判定为「脚本出错且原因未知」（与 install/upgrade 一致）。
+LOG_DIR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+exec >> "$LOG_DIR/uninstall.log" 2>&1
+
+### 升级守卫：升级/安装替换流程也会调用本脚本。
+### 此时绝不做任何破坏性清理（删容器/删镜像/删数据卷/杀后台拉取）。
+### 2.0.16：判定除 TRIM_APP_STATUS 外，再补 TRIM_OLD_APPVER / TRIM_TEMP_UPGRADE_FOLDER
+### （实测飞牛「更新」路径下 TRIM_APP_STATUS 并不总是 UPGRADE，旧守卫会失效、镜像被删）。
+if [ "$TRIM_APP_STATUS" = "UPGRADE" ] || [ -n "${TRIM_OLD_APPVER:-}" ] || [ -n "${TRIM_TEMP_UPGRADE_FOLDER:-}" ]; then
+    mkdir -p /docker 2>/dev/null || true
+    cp -f "${TRIM_APPDEST}/docker/docker-compose.yaml" /docker/docker-compose.yaml 2>/dev/null || true
+    chmod 644 /docker/docker-compose.yaml 2>/dev/null || true
+    exit 0
+fi
+
+### 1) 先停掉宿主侧常驻辅助进程（ADB 端口转发、音频声明守护）。
+###    2.0.18 修正：旧版把这两段写在文件末尾的 `exit 0` 之后，属于死代码，
+###    导致卸载后宿主 0.0.0.0:5556 的 socat 与音频守护仍在运行（端口被占）。
+if [ -f "${TRIM_APPDEST}/scripts/redroid_adb_forward.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/redroid_adb_forward.sh" remove >/dev/null 2>&1 || true
+fi
+### 3.0.3：停止音频守护与网关（PID 文件 + cmdline 身份校验；同时清理 2.x 遗留的
+### gw_socket.sh / gw_relay.py 进程），不再用 pkill 按名字杀。
+if [ -f "${TRIM_APPDEST}/scripts/androidemu_daemon.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/androidemu_daemon.sh" stop >/dev/null 2>&1 || true
+fi
+if [ -f "${TRIM_APPDEST}/server/gateway.py" ]; then
+    python3 "${TRIM_APPDEST}/server/gateway.py" stop >/dev/null 2>&1 || true
+fi
+rm -f "${TRIM_APPDEST:-/var/apps/androidemu/target}/app.sock" 2>/dev/null || true
+### 兜底：即使脚本已不在，也清掉本应用遗留的 socat 监听
+pkill -f "socat TCP-LISTEN:5556" 2>/dev/null || true
+
+### 2) 停止后台拉取进程并清理拉取残留文件。
+VAR_DIR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+if [ -f "$VAR_DIR/pull.pid" ]; then
+    PID=$(cat "$VAR_DIR/pull.pid" 2>/dev/null)
+    [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
+fi
+pkill -f "pull_image.sh" 2>/dev/null || true
+pkill -f "redroid/redroid" 2>/dev/null || true
+pkill -f "scrcpy-over-webrtc" 2>/dev/null || true
+rm -f "$VAR_DIR/pull.pid" "$VAR_DIR/pull.log" "$VAR_DIR/pull-progress.log" "$VAR_DIR/eta.state" 2>/dev/null || true
+
+### 3) 移除本应用安装的 DRM 放权 udev 规则（只删自己的规则文件；非 root 时删不掉会记录）。
+RULE_FILE="/etc/udev/rules.d/99-androidemu-drm.rules"
+if [ -f "$RULE_FILE" ]; then
+    rm -f "$RULE_FILE" 2>/dev/null || true
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules 2>/dev/null || true
+    fi
+fi
+
+### 4) 停止并删除容器（compose down 之外再兜底一次；新旧命名都清）。
+docker rm -f androidemu-android androidemu-webrtc androidvm-rd-android androidvm-rd-webrtc 2>/dev/null || true
+
+### 5) 删除默认网络。
+docker network rm androidemu_default docker_default androidvm-rd_default 2>/dev/null || true
+
+### 6) 本地镜像：**默认保留**（2.0.20 修正，理由见 uninstall_init 注释）。
+###    仅当卸载向导明确选择「同时删除镜像」（wizard_delete_images=true）时才删。
+if [ "${wizard_delete_images:-false}" = "true" ]; then
+### 6.1) 清理本地镜像：先按固定 tag 删除，再按仓库名兜底删除
+###    （覆盖用户预拉/手动 pull 产生的其它 tag）。仅限本应用两个镜像。
+for IMG in \
+    "redroid/redroid:11.0.0-latest" \
+    "docker.fnnas.com/redroid/redroid:11.0.0-latest" \
+"docker.m.daocloud.io/redroid/redroid:11.0.0-latest" \
+    "buutuu/scrcpy-over-webrtc:latest" \
+    "docker.fnnas.com/buutuu/scrcpy-over-webrtc:latest" \
+"docker.m.daocloud.io/buutuu/scrcpy-over-webrtc:latest"; do
+    docker image rm "$IMG" 2>/dev/null || true
+done
+docker images --format '{{.Repository}}:{{.Tag}}' | grep -E '^((docker\.m\.daocloud\.io|docker\.fnnas\.com)/)?(redroid/redroid|buutuu/scrcpy-over-webrtc):' | sort -u | while read -r IMG; do
+    docker image rm "$IMG" 2>/dev/null || true
+done
+else
+    echo "[$(date '+%F %T')] 保留容器镜像（未选择删除镜像）"
+fi
+
+### 7) 数据卷：**默认保留**，只有向导明确选择「删除数据」（wizard_keep_data=false）时才删。
+###    2.0.18 修正（严重）：旧实现是 `[ "$wizard_keep_data" != "true" ]` 就删 ——
+###    而安装失败自动回滚、非向导卸载等路径根本不会传这个变量（为空），
+###    于是数据卷被误删，模拟器里的安卓数据不可恢复。现在改为「不明确说删就不删」。
+if [ "${wizard_keep_data:-true}" = "false" ]; then
+    echo "[$(date '+%F %T')] 向导选择了「删除数据」，删除数据卷"
+    docker volume rm androidemu-data androidemu-webrtc-data androidvm-rd-data androidvm-rd-webrtc-data 2>/dev/null || true
+else
+    echo "[$(date '+%F %T')] 保留数据卷（wizard_keep_data=${wizard_keep_data:-未提供}）：androidemu-data / androidemu-webrtc-data"
+fi
+
+exit 0

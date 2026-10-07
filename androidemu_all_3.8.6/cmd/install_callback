@@ -1,0 +1,484 @@
+#!/bin/bash
+
+### This script is called after the user installs the application.
+### 安装不阻塞：不做同步镜像拉取，只做必要校准，然后在后台拉取镜像，
+### 镜像就绪后自动启动容器（start_pull_bg.sh）。
+### 好处：安装秒完成，不会因拉取约 2GB 镜像占用过高资源导致 NAS 网页断连。
+
+### 0) 免责声明安装向导兜底校验：向导默认 disagree，用户必须主动选择 agree。
+###    仅当明确为 disagree 时中止；变量为空（非向导的幂等重执行场景）不阻断。
+    ### 2.0.11：向导已改为「复选框」勾选同意（值为 agree，未勾选为空），并兼容旧 radio 值：
+    ### 只要不是明确包含 agree 就中止安装；空值视为非向导的幂等重执行场景，不阻断。
+    case "${wizard_agree_disclaimer:-}" in
+        *agree*) : ;;
+        "")      : ;;
+        *)
+            echo "[$(date '+%F %T')] 未勾选同意《免责声明》《权限说明》，安装中止。" >&2
+            exit 1
+            ;;
+    esac
+
+### ============================================================
+### 3.6.3：X86 架构强制依赖 binder 驱动
+### X86 需要 /dev/binder 设备节点（由飞牛应用中心的 binder_linux 驱动提供）；
+### ARM 不需要（容器内自建 binderfs，tune_compose.sh 会自动删除 /dev/binder 直通）。
+### 直接检测 /dev/binder 是否存在，不依赖应用目录名（避免应用改名导致误判）。
+### ============================================================
+### 关键：把本脚本全部输出重定向到日志文件，保证 stdout 干净，
+### 避免被飞牛判定为「脚本出错且原因未知」。
+LOG_DIR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+### 2.0.57 修复：本脚本此前只定义了 LOG_DIR，却在端口逻辑里用了 ${VAR_DIR}/ports.conf，
+###        变量为空导致写入 /ports.conf 报 Permission denied —— 后果是安装/升级向导里的
+###        「自定义端口」根本没生效（一直用默认端口）。补齐定义。
+VAR_DIR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+exec >> "$LOG_DIR/install.log" 2>&1
+
+### ============================================================
+### 3.0.1：安装/升级中途取消或失败时的自动清理
+### 防止残留容器/网络/临时文件占位，导致下次安装失败
+### ============================================================
+_INSTALL_SUCCESS=0
+
+### ============================================================
+### 3.7.0：全面预检查（在日志重定向之后执行，错误同时写入日志和stderr）
+### 检测项：binder驱动、内存、Docker、磁盘空间、GPU
+### 阻断项：binder缺失（X86）、内存<1GB、Docker不可用、磁盘<2GB
+### 警告项：内存<2GB、无GPU（自动软件渲染）
+### ============================================================
+_PRECHECK_FAIL=0
+_precheck_warn() {
+    echo "[$(date '+%F %T')] [预检查-警告] $1"
+    echo "[警告] $1" >&2
+}
+_precheck_fail() {
+    echo "[$(date '+%F %T')] [预检查-失败] $1"
+    echo "============================================================" >&2
+    echo "  安装中止：$1" >&2
+    echo "============================================================" >&2
+    echo "  详细日志：/var/apps/androidemu/var/install.log" >&2
+    echo "  反馈：官网 www.lin1740.de5.net" >&2
+    echo "============================================================" >&2
+    _PRECHECK_FAIL=1
+}
+
+# 3.7.0：架构检测 + binder检查（X86必需，ARM不需要）
+_ARCH=$(uname -m)
+echo "[$(date '+%F %T')] 架构：$_ARCH"
+case "$_ARCH" in
+    x86_64|amd64)
+        if [ ! -e "/dev/binder" ]; then
+            _precheck_fail "X86 架构缺少 binder 驱动。请先在飞牛应用中心搜索并安装「binder_linux」，安装完成后再重新安装本应用。ARM 架构不受此限制。"
+        else
+            echo "[$(date '+%F %T')] binder 驱动：已检测到 /dev/binder"
+        fi
+        ;;
+    aarch64|arm64)
+        echo "[$(date '+%F %T')] ARM 架构：使用容器内 binderfs，无需宿主 binder 驱动"
+        ;;
+    *)
+        _precheck_warn "未知架构 $_ARCH，可能不兼容"
+        ;;
+esac
+
+# 内存检查
+_MEM_TOTAL_KB=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+if [ -n "$_MEM_TOTAL_KB" ]; then
+    _MEM_TOTAL_MB=$((_MEM_TOTAL_KB / 1024))
+    echo "[$(date '+%F %T')] 总内存：${_MEM_TOTAL_MB}MB"
+    if [ "$_MEM_TOTAL_MB" -lt 1024 ]; then
+        _precheck_fail "内存不足（${_MEM_TOTAL_MB}MB < 1GB），安卓容器无法启动。请升级内存或关闭其他占用内存的应用。"
+    elif [ "$_MEM_TOTAL_MB" -lt 2048 ]; then
+        _precheck_warn "内存偏低（${_MEM_TOTAL_MB}MB < 2GB），安卓容器可能卡顿或被 OOM 杀死。建议关闭其他应用后再试。"
+    fi
+else
+    _precheck_warn "无法读取内存信息"
+fi
+
+# Docker检查
+if ! command -v docker >/dev/null 2>&1; then
+    _precheck_fail "未检测到 docker 命令，请确认飞牛 Docker 服务已安装并启动。"
+elif ! docker info >/dev/null 2>&1; then
+    _precheck_fail "Docker 服务未运行或无权限访问。请在飞牛应用中心确认 Docker 已启动。"
+else
+    echo "[$(date '+%F %T')] Docker：可用"
+fi
+
+# 磁盘空间检查（应用所在分区）
+_APP_DIR="${TRIM_APPDEST:-/vol1/@appcenter/androidemu}"
+_DISK_AVAIL_KB=$(df -k "$_APP_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
+if [ -n "$_DISK_AVAIL_KB" ]; then
+    _DISK_AVAIL_MB=$((_DISK_AVAIL_KB / 1024))
+    echo "[$(date '+%F %T')] 应用目录可用空间：${_DISK_AVAIL_MB}MB"
+    if [ "$_DISK_AVAIL_MB" -lt 2048 ]; then
+        _precheck_fail "磁盘空间不足（${_DISK_AVAIL_MB}MB < 2GB），无法拉取约 2GB 的安卓镜像。请清理磁盘空间。"
+    fi
+else
+    _precheck_warn "无法读取磁盘空间信息"
+fi
+
+# GPU检测（仅警告，不阻断，无GPU自动软件渲染）
+if [ -e "/dev/dri" ]; then
+    echo "[$(date '+%F %T')] GPU：检测到 /dev/dri，将尝试硬件加速"
+else
+    _precheck_warn "未检测到 /dev/dri（无 GPU 或驱动未装），将使用软件渲染，性能较低。这是正常的，不影响使用。"
+fi
+
+# 如果有阻断项，退出
+if [ "$_PRECHECK_FAIL" = "1" ]; then
+    echo "[$(date '+%F %T')] 预检查未通过，安装中止"
+    exit 1
+fi
+echo "[$(date '+%F %T')] 预检查全部通过"
+
+### ============================================================
+
+_cleanup_on_failure() {
+    # 只有在未成功完成时才清理
+    if [ "$_INSTALL_SUCCESS" = "1" ]; then
+        return 0
+    fi
+    echo "[$(date '+%F %T')] 检测到安装/升级未正常完成，执行清理..." >&2
+
+    # 1. 停止并删除本应用的容器（新旧命名都清）
+    for _CN in androidemu-android androidemu-webrtc \
+               androidemu_arm-android androidemu_arm-webrtc \
+               androidvm-rd-android androidvm-rd-webrtc; do
+        docker rm -f "$_CN" >/dev/null 2>&1 || true
+    done
+
+    # 2. 删除本应用的网络
+    docker network rm androidemu_default androidvm-rd_default >/dev/null 2>&1 || true
+
+    # 3. 停止后台进程（音频守护、agent部署、镜像拉取等，不碰网关）
+    # 3.0.3：音频守护改用 Python 自带的 stop（PID 文件 + cmdline 身份校验），不再 pkill
+    if [ -f "${TRIM_APPDEST}/scripts/androidemu_daemon.sh" ]; then
+        bash "${TRIM_APPDEST}/scripts/androidemu_daemon.sh" stop >/dev/null 2>&1 || true
+    fi
+    pkill -f "bash .*androidemu.*/scripts/agent_autodeploy.sh" >/dev/null 2>&1 || true
+    pkill -f "bash .*androidemu.*/scripts/start_pull_bg.sh" >/dev/null 2>&1 || true
+    pkill -f "bash .*androidemu.*/scripts/pull_image.sh" >/dev/null 2>&1 || true
+    pkill -f "bash .*androidemu.*/scripts/webrtc_watchdog.sh" >/dev/null 2>&1 || true
+    pkill -f "bash .*androidemu.*/scripts/redroid_adb_forward.sh" >/dev/null 2>&1 || true
+    # 注意：不停止网关服务、不删除 socket，由 systemd 自动管理
+
+    # 5. 全新安装失败时，删除 /docker/docker-compose.yaml（如果是本应用创建的）
+    #    升级时不删除，因为可能有其他版本依赖
+    if [ -f /docker/docker-compose.yaml ]; then
+        if grep -q "androidemu" /docker/docker-compose.yaml 2>/dev/null; then
+            rm -f /docker/docker-compose.yaml >/dev/null 2>&1 || true
+        fi
+    fi
+
+    # 6. 删除临时状态文件
+    rm -f "${TRIM_PKGVAR:-/var/apps/androidemu/var}/.installing" >/dev/null 2>&1 || true
+
+    echo "[$(date '+%F %T')] 清理完成" >&2
+}
+trap _cleanup_on_failure EXIT INT TERM HUP
+### ============================================================
+
+
+
+echo "[$(date '+%F %T')] ==== install_callback 开始，宿主架构：$(uname -m)，向导内核选项：${wizard_kernel_status:-未提供} ===="
+
+COMPOSE="${TRIM_APPDEST}/docker/docker-compose.yaml"
+
+### 1) 清理本应用遗留容器（新旧命名都清：androidemu-* 历代命名、旧独立 ARM 版
+###    androidemu_arm-*、改名前的 androidvm-rd-*。避免端口冲突与残留）。
+for LEGACY_NAME in androidemu-android androidemu-webrtc \
+                   androidemu_arm-android androidemu_arm-webrtc \
+                   androidvm-rd-android androidvm-rd-webrtc; do
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${LEGACY_NAME}$"; then
+        docker rm -f "${LEGACY_NAME}" 2>/dev/null || true
+    fi
+done
+
+### 1.5) 复制 compose 文件到 /docker/docker-compose.yaml——飞牛 docker-project 机制升级时
+###     把相对路径 docker 解析为根目录 /docker/，必须在此处放真实 compose 文件，
+###     否则升级时报 open /docker/docker-compose.yaml: no such file or directory。
+###     用真实文件而非软链接，避免飞牛机制不跟随软链接。
+mkdir -p /docker 2>/dev/null || true
+cp -f "$COMPOSE" /docker/docker-compose.yaml 2>/dev/null || true
+chmod 644 /docker/docker-compose.yaml 2>/dev/null || true
+
+### 2) 填充真实 NAS 局域网 IP 到 compose（WebRTC 前端 PUBLIC_IP 参数）。
+### 3.4.9 修复：hostname -I 可能返回 Docker 网桥地址（172.x/10.x），
+### 必须优先选择 192.168.x.x 局域网 IP；用 ip route 获取出口 IP 更准确。
+NAS_IP=""
+for _ip in $(hostname -I 2>/dev/null); do
+    case "$_ip" in
+        192.168.*) NAS_IP="$_ip"; break ;;
+        10.*)     [ -z "$NAS_IP" ] && NAS_IP="$_ip" ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) : ;;  # Docker 网桥，跳过
+        *)        [ -z "$NAS_IP" ] && NAS_IP="$_ip" ;;
+    esac
+done
+# 兜底：用 ip route 获取默认出口 IP
+if [ -z "$NAS_IP" ] || [ "$NAS_IP" = "127.0.0.1" ]; then
+    NAS_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+fi
+[ -z "$NAS_IP" ] && NAS_IP="127.0.0.1"
+if [ -f "$COMPOSE" ]; then
+    # 兼容两种格式：硬编码 127.0.0.1 和变量引用 ${ANDROIDEMU_HOST_IP:-127.0.0.1}
+    # 3.5.2 修复：匹配任意硬编码 IP、变量引用格式，确保替换生效
+    sed -i "s/PUBLIC_IP=127\.0\.0\.1/PUBLIC_IP=${NAS_IP}/g" "$COMPOSE"
+    sed -i "s#PUBLIC_IP=\${ANDROIDEMU_HOST_IP:-127\.0\.0\.1}#PUBLIC_IP=${NAS_IP}#g" "$COMPOSE"
+    sed -i -E "s/PUBLIC_IP=[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/PUBLIC_IP=${NAS_IP}/g" "$COMPOSE"
+    # 3.5.7：同时替换 ICE_SERVERS 中的 IP（避免重装后 ICE_SERVERS 还是 127.0.0.1）
+    sed -i "s#\${ANDROIDEMU_HOST_IP:-127\.0\.0\.1}#${NAS_IP}#g" "$COMPOSE"
+    sed -i -E "s/@[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:3478/@${NAS_IP}:3478/g" "$COMPOSE"
+fi
+
+### 2.5) 确保使用标准版镜像（防止升级时残留 gms 标签）
+if [ -f "$COMPOSE" ]; then
+    sed -i 's#redroid/redroid:12.0.0-gms#redroid/redroid:12.0.0-latest#g' "$COMPOSE"
+    sed -i 's#whojk/redroid:12.0.0_mindthegapps#redroid/redroid:12.0.0-latest#g' "$COMPOSE"
+    echo "[$(date '+%F %T')] 标准版安卓系统（redroid:12.0.0-latest）"
+fi
+
+### 3) 架构识别 + GPU 直通/软件渲染 + binderfs 自适应校准（x86/ARM 合包核心）。
+###    统一由 tune_compose.sh 处理（幂等）：x86 有 GPU 走 host 直通并校正 DRI 路径；
+###    无 GPU、无驱动或 ARM 首版回退软件渲染并移除不存在的 /dev/dri、/dev/binder 直通，
+###    避免宿主设备节点不存在导致 docker compose up 创建容器失败。
+if [ -f "$COMPOSE" ] && [ -f "${TRIM_APPDEST}/scripts/tune_compose.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/tune_compose.sh" "$COMPOSE" || true
+fi
+
+### 4) 把校准后的 compose 同步到 /docker（步骤 1.5 复制的是校准前版本，此处覆盖为最终版）。
+if [ -f "$COMPOSE" ]; then
+    cp -f "$COMPOSE" /docker/docker-compose.yaml 2>/dev/null || true
+    chmod 644 /docker/docker-compose.yaml 2>/dev/null || true
+fi
+
+### 4.5) 安装 DRM 设备放权 udev 规则（2.0.1）：GPU 直通机器在「NAS 重启 + 容器自启」
+###      路径下，udev 会在节点创建时即置为 0666，避免 surfaceflinger 因节点仍是
+###      660 而 EGLConfig 失败、boot 无法完成。无 /dev/dri 时脚本自身跳过。
+if [ -f "${TRIM_APPDEST}/scripts/gpu_udev_rules.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/gpu_udev_rules.sh" install >/dev/null 2>&1 || true
+fi
+
+### 2.0.34：端口设置（向导可选）。install 向导默认 default（用默认端口）、可选 custom；
+### upgrade 向导默认 keep（保持现有端口）、可选 custom。
+PORTS_CONF="${VAR_DIR}/ports.conf"
+port_cur() { sed -n "s/^$1=//p" "$PORTS_CONF" 2>/dev/null | head -n1; }
+PMODE="${wizard_port_mode:-default}"
+PW="${wizard_web_port:-}"; PT="${wizard_turn_port:-}"; PA="${wizard_adb_port:-}"
+if [ "$PMODE" = "custom" ]; then
+    [ -n "$PW" ] || PW="$(port_cur WEB_PORT)"; [ -n "$PW" ] || PW=8443
+    [ -n "$PT" ] || PT="$(port_cur TURN_PORT)"; [ -n "$PT" ] || PT=3478
+    [ -n "$PA" ] || PA="$(port_cur ADB_PORT)"; [ -n "$PA" ] || PA=5556
+    case "$PW" in ''|*[!0-9]*) PW=8443 ;; esac
+    case "$PT" in ''|*[!0-9]*) PT=3478 ;; esac
+    case "$PA" in ''|*[!0-9]*) PA=5556 ;; esac
+    { echo "WEB_PORT=$PW"; echo "TURN_PORT=$PT"; echo "ADB_PORT=$PA"; echo "UPDATED=$(date '+%F %T')"; } > "$PORTS_CONF" 2>/dev/null || true
+    echo "[$(date '+%F %T')] 端口按向导设置更新：画面=$PW TURN=$PT ADB=$PA"
+else
+    if [ ! -f "$PORTS_CONF" ]; then
+        { echo "WEB_PORT=8443"; echo "TURN_PORT=3478"; echo "ADB_PORT=5556"; echo "UPDATED=$(date '+%F %T')"; } > "$PORTS_CONF" 2>/dev/null || true
+        echo "[$(date '+%F %T')] 使用默认端口：画面=8443 TURN=3478 ADB=5556"
+    else
+        echo "[$(date '+%F %T')] 保持现有端口：画面=$(port_cur WEB_PORT) TURN=$(port_cur TURN_PORT) ADB=$(port_cur ADB_PORT)"
+    fi
+fi
+### 3.8.6：多端分辨率设置（向导可选，用户填写"宽x高"格式）。
+###      分别保存电脑/手机/平板三端分辨率到配置文件，默认用手机端分辨率启动。
+###      提供 switch_resolution.sh 脚本，可动态切换分辨率（adb shell wm size，即时生效）。
+###      留空则该端使用默认值；格式错误自动回退默认。
+RES_CONF="${VAR_DIR}/resolution.conf"
+# 解析"宽x高"格式并校验，返回 宽x高 或默认值
+_parse_res() {
+    local input="$1" def_w="$2" def_h="$3" min_w="$4" max_w="$5" min_h="$6" max_h="$7"
+    local w h
+    # 支持 x、×、X、* 作为分隔符
+    w=$(echo "$input" | sed -E 's/[xX×*]/ /' | awk '{print $1}')
+    h=$(echo "$input" | sed -E 's/[xX×*]/ /' | awk '{print $2}')
+    case "$w" in ''|*[!0-9]*) w="$def_w" ;; esac
+    case "$h" in ''|*[!0-9]*) h="$def_h" ;; esac
+    [ "$w" -lt "$min_w" ] 2>/dev/null || [ "$w" -gt "$max_w" ] 2>/dev/null && w="$def_w"
+    [ "$h" -lt "$min_h" ] 2>/dev/null || [ "$h" -gt "$max_h" ] 2>/dev/null && h="$def_h"
+    echo "${w}x${h}"
+}
+PC_RES=$(_parse_res "${wizard_res_pc:-}" 1920 1080 320 3840 240 2160)
+PH_RES=$(_parse_res "${wizard_res_phone:-}" 720 1440 320 2160 480 3840)
+TB_RES=$(_parse_res "${wizard_res_tablet:-}" 1200 2000 320 2560 480 3840)
+{
+    echo "# 多端分辨率配置（安装向导生成，可手动修改）"
+    echo "# 格式：端=宽x高"
+    echo "PC=${PC_RES}"
+    echo "PHONE=${PH_RES}"
+    echo "TABLET=${TB_RES}"
+    echo "DEFAULT=PHONE"
+    echo "UPDATED=$(date '+%F %T')"
+} > "$RES_CONF" 2>/dev/null || true
+echo "[$(date '+%F %T')] 多端分辨率已保存：PC=${PC_RES} PHONE=${PH_RES} TABLET=${TB_RES}"
+
+# 默认用手机端分辨率写入 compose（容器启动时的初始分辨率）
+RW=$(echo "$PH_RES" | cut -dx -f1)
+RH=$(echo "$PH_RES" | cut -dx -f2)
+COMPOSE_FILE="${TRIM_APPDEST}/docker/docker-compose.yaml"
+if [ -f "$COMPOSE_FILE" ]; then
+    sed -i "s/androidboot.redroid_width=[0-9]*/androidboot.redroid_width=${RW}/" "$COMPOSE_FILE" 2>/dev/null || true
+    sed -i "s/androidboot.redroid_height=[0-9]*/androidboot.redroid_height=${RH}/" "$COMPOSE_FILE" 2>/dev/null || true
+    echo "[$(date '+%F %T')] 容器初始分辨率（手机端）：${RW}x${RH}"
+else
+    echo "[$(date '+%F %T')] 警告：compose 文件不存在，分辨率设置未应用"
+fi
+
+# 生成动态切换脚本
+SWITCH_SCRIPT="${TRIM_APPDEST}/scripts/switch_resolution.sh"
+cat > "$SWITCH_SCRIPT" << 'SWITCH_EOF'
+#!/bin/bash
+# 安卓容器分辨率动态切换脚本
+# 用法：bash switch_resolution.sh <pc|phone|tablet|宽x高>
+# 切换即时生效，无需重启容器（通过 adb shell wm size）
+
+RES_CONF="/var/apps/androidemu/var/resolution.conf"
+[ -f "$RES_CONF" ] || RES_CONF="/var/apps/androidemu/var/resolution.conf"
+
+# 读取配置
+get_res() {
+    local key="$1"
+    grep "^${key}=" "$RES_CONF" 2>/dev/null | head -n1 | cut -d= -f2
+}
+
+TARGET=""
+case "${1:-}" in
+    pc|PC)         TARGET=$(get_res PC) ;;
+    phone|PHONE)   TARGET=$(get_res PHONE) ;;
+    tablet|TABLET) TARGET=$(get_res TABLET) ;;
+    *x*|*X*)       TARGET="$1" ;;
+    *)
+        echo "用法：bash $0 <pc|phone|tablet|宽x高>"
+        echo "示例：bash $0 phone"
+        echo "      bash $0 1080x1920"
+        echo ""
+        echo "当前配置："
+        echo "  PC:     $(get_res PC)"
+        echo "  PHONE:  $(get_res PHONE)"
+        echo "  TABLET: $(get_res TABLET)"
+        exit 1
+        ;;
+esac
+
+[ -z "$TARGET" ] && { echo "错误：未找到对应分辨率配置"; exit 1; }
+
+# 通过 ADB 切换分辨率（容器内 adb 5555，宿主 socat 转发到 5556）
+echo "正在切换分辨率为 ${TARGET} ..."
+adb connect 127.0.0.1:5556 >/dev/null 2>&1
+sleep 1
+adb -s 127.0.0.1:5556 shell wm size "${TARGET}" 2>&1
+RESULT=$?
+adb disconnect 127.0.0.1:5556 >/dev/null 2>&1
+
+if [ $RESULT -eq 0 ]; then
+    echo "✓ 分辨率已切换为 ${TARGET}（即时生效）"
+else
+    echo "✗ 切换失败，请确认容器已启动且 ADB 可用"
+    echo "  备用方法：docker exec androidemu-android wm size ${TARGET}"
+fi
+SWITCH_EOF
+chmod +x "$SWITCH_SCRIPT" 2>/dev/null || true
+echo "[$(date '+%F %T')] 分辨率切换脚本已生成：$SWITCH_SCRIPT"
+
+### 4.6) 访问模式（2.0.2）：按安装向导选择写入画面服务的 PUBLIC_IP / USE_TLS /
+###      EXTERNAL_SIGNALING_PORT（局域网直连/公网端口映射/内网穿透·反向代理）。
+###      仅写配置不重建容器（随后的 start_pull_bg 统一启动时生效）。
+if [ -f "${TRIM_APPDEST}/scripts/net_mode.sh" ]; then
+### 2.0.11：访问方式支持「自动检测」（auto）——由 detect_net.sh 判断在家/公网/CGNAT 并应用
+WIZ_ACCESS="${wizard_access_mode:-auto}"
+if [ "$WIZ_ACCESS" = "auto" ] || [ -z "$WIZ_ACCESS" ]; then
+    if [ -f "${TRIM_APPDEST}/scripts/detect_net.sh" ]; then
+        bash "${TRIM_APPDEST}/scripts/detect_net.sh" --apply || true
+    else
+        bash "${TRIM_APPDEST}/scripts/net_mode.sh" lan --no-restart || true
+    fi
+else
+    bash "${TRIM_APPDEST}/scripts/net_mode.sh" "$WIZ_ACCESS" "${wizard_wan_host:-}" "${wizard_wan_port:-}" --no-restart || true
+fi
+fi
+
+### 4.7) 数据存储位置（2.0.53）：manifest 未设 install_type，飞牛安装对话框会先让用户选择
+###      存储空间；这里把「首次安装」的容器数据改为跟随应用所在存储空间（bind 挂载）。
+###      已有数据（命名卷非空）时保持原状、绝不迁移，目标不可写时同样回退为命名卷。
+if [ -f "${TRIM_APPDEST}/scripts/data_location.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/data_location.sh" || true
+fi
+
+### 5) 后台拉取镜像并在就绪后自动启动容器（不阻塞安装；拉取以低 IO/CPU 优先级
+###    运行，避免占满系统资源导致 NAS 网页服务断连）。安装流程到此结束，秒级完成。
+if [ -f "${TRIM_APPDEST}/scripts/start_pull_bg.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/start_pull_bg.sh" >/dev/null 2>&1 || true
+fi
+
+### 3.0.3：确保容器已创建 —— 飞牛应用中心的"启动"做的是 compose start（要求容器已存在），
+### 全新安装时若镜像已缓存而我们还没建容器，会报 service "webrtc" has no container to start
+### 导致应用卡在"启动中"。这里幂等地补一次 compose up -d（镜像未就绪时失败也无害，
+### 后台拉取完成后 start_pull_bg/pull_image 会再建）。
+if [ -f "${TRIM_APPDEST}/docker/docker-compose.yaml" ]; then
+    ( cd "${TRIM_APPDEST}/docker" && docker compose -p androidemu up -d ) >/dev/null 2>&1 || true
+fi
+
+
+### 3.0.3：启动统一网关（Python 单进程 + 自带守护/自愈）
+### 飞牛应用中心会在重启后自动调用 cmd/main start，所以不需要 systemd。
+### gateway.py start 是幂等的：已健康则不重启，并会清理上一版遗留的网关进程（含 2.x 的
+### gw_socket.sh + gw_relay.py），不会出现"新旧守护互相掐"的旧故障。
+### 3.0.5：改走同名薄壳 gw_socket.sh —— 安装回调环境里 Python subprocess.Popen 会报
+### PermissionError(13)（安装日志实证），薄壳会用 bash 原生 nohup+setsid 兜底拉起。
+if [ -f "${TRIM_APPDEST}/scripts/gw_socket.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/gw_socket.sh" start
+    echo "[$(date '+%F %T')] 已启动 Python 统一网关服务（用户级别，自带守护）"
+fi
+
+
+### 3.0.0：启动 Python 音频修复（一次性修复 + 周期守护）
+### 3.0.5：守护改走同名薄壳 audio_watchdog.sh（同样是 Python 起不来时用 bash 兜底）
+if [ -f "${TRIM_APPDEST}/scripts/androidemu_daemon.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/androidemu_daemon.sh" fix || true
+fi
+if [ -f "${TRIM_APPDEST}/scripts/audio_watchdog.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/audio_watchdog.sh" start
+    echo "[$(date '+%F %T')] 已启动 Python 音频修复与守护"
+fi
+
+### 3.0.1：标记安装成功，防止 trap 清理
+_INSTALL_SUCCESS=1
+exit 0
+
+### 2.0.22：确保本应用只有「一个 RED 安卓容器 + 一个穿云投屏容器」。
+### 清掉同名/历史/重复容器（只匹配本应用前缀，绝不动其它应用的容器）。
+for _N in $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^(androidemu|androidvm-rd|androidemu_arm)' | grep -v -E '^androidemu-(android|webrtc)$'); do
+    docker rm -f "$_N" 2>/dev/null || true
+    echo "[$(date '+%F %T')] 已清理重复/历史容器：$_N"
+done
+
+### 2.0.22：自动把云手机 Agent 部署进安卓容器并连上本机信令（无需任何手工命令）。
+### 幂等：agent 已在运行则直接返回；安卓未 boot 时脚本内部会等待或交给守护重试。
+if [ -f "${TRIM_APPDEST}/scripts/agent_autodeploy.sh" ]; then
+    nohup bash "${TRIM_APPDEST}/scripts/agent_autodeploy.sh" >/dev/null 2>&1 &
+fi
+    # ============================================================
+    # 3.5.9 性能优化：CPU 调度器动态调整
+    # 设置 governor 为 ondemand（动态调频），并限制最低频率为最大频率的 40%，
+    # 确保轻载时 CPU 不会降频过低导致响应延迟，同时重载时自动升到最高频。
+    # 仅在支持 cpufreq 的设备上生效；不支持则静默跳过。
+    # ============================================================
+    _cpu_governor_setup() {
+        local _gov_file="/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+        local _max_file="/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"
+        [ -f "$_gov_file" ] || return 0
+        [ -f "$_max_file" ] || return 0
+        local _max_freq=$(cat "$_max_file" 2>/dev/null)
+        [ -n "$_max_freq" ] || return 0
+        # 最低频率 = 最大频率的 40%（保证四核性能下限）
+        local _min_freq=$(( _max_freq * 40 / 100 ))
+        for _cpu in /sys/devices/system/cpu/cpu[0-9]*; do
+            [ -d "$_cpu/cpufreq" ] || continue
+            echo "ondemand" > "$_cpu/cpufreq/scaling_governor" 2>/dev/null || true
+            echo "$_min_freq" > "$_cpu/cpufreq/scaling_min_freq" 2>/dev/null || true
+        done
+        echo "  CPU governor: ondemand, min_freq: ${_min_freq} KHz (max: ${_max_freq} KHz)"
+    }
+    _cpu_governor_setup || true
+

@@ -1,0 +1,17 @@
+appname                    = androidemu
+version                    = 3.8.6
+display_name               = 安卓模拟器（国内版）
+desc                       = 在飞牛 fnOS 上用 Docker 运行安卓 12 容器，支持浏览器云手机画面远程操控、GPU 直通（无 GPU 自动回退软件渲染）、ADB 调试。应用自身免费，画面服务的设备数授权为上游第三方付费，免费版功能完整，付费仅加设备数和相关增值服务，与飞牛无关。使用前提：宿主内核需支持 binder（x86 请先装 binder_linux 驱动，多数 ARM 已内置），建议内存 ≥4GB，首次安装需联网拉取约 2GB 镜像。云手机画面默认账号 admin、密码 admin123，登录后请修改。项目链接：https://github.com/lin1740/fnos-android-emulator ；官网：https://www.lin1740.de5.net/
+platform                   = all
+source                     = thirdparty
+os_min_version             = 1.1.8
+maintainer                 = zhouziyang、hqw700
+distributor                = 键盘敲粥香
+distributor_url            = https://www.lin1740.de5.net
+desktop_uidir              = ui
+desktop_applaunchname      = androidemu.Application
+service_port               = 8443
+checkport                  = false
+# 本应用不需要用户选择文件/目录授权，隐藏该设置以最小化权限面
+disable_authorization_path = true
+checksum                   = 2973a0f966af08cea91b09ba4a8319bf
