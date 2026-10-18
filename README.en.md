@@ -2,7 +2,7 @@
 
 [中文](README.md) | **English**
 
-![version](https://img.shields.io/badge/version-v3.8.9-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
+![version](https://img.shields.io/badge/version-v3.9.0-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
 
 📚 **User Manual & FAQ**: See sections below
 
@@ -246,7 +246,7 @@ cat /var/apps/androidemu/var/gms_install.log
 
 The log records each step's execution status and result.
 
-### FAQ
+### GMSFAQ
 
 **Q: GMS image pull fails, what should I do?**
 
@@ -1585,6 +1585,19 @@ TLS per network mode (`scripts/net_mode.sh`):
 3. After enabling TLS, **don't forget the agent**: it must switch to wss and trust the certificate — run `bash scripts/agent_helper.sh deploy <dir> --tls`, otherwise devices go offline.
 
 ## Changelog
+
+### 3.9.0
+1. Fixed install-wizard port settings having no effect — the web/TURN ports filled in the wizard are now written into the container's real port mappings, so the new ports work right after install
+2. Fixed being unable to connect after changing ports — port changes now also update the app's reverse-proxy port, so both the App Center entry and direct access by the new port work
+3. Fixed data loss when reinstalling after uninstalling with data kept — data volumes became external volumes that are never removed by uninstall; data is restored automatically on reinstall
+4. Fixed incomplete cleanup when choosing to delete images — data volumes and all related images (including accelerator-mirror aliases) are now removed precisely
+5. Fixed upload throughput being halved for large files — the gateway now streams request bodies through as they arrive instead of buffering whole files first; upload speed roughly doubles and memory no longer grows with file size
+6. Fixed the "Paste" bubble popping up on long-press or right-click — native context menus and selection outside input fields are suppressed; inputs still type and paste normally
+7. Fixed system language and timezone not taking effect — when the UI is not Simplified Chinese, the app now sets the locale and restarts the Android framework once so Chinese and UTC+8 apply immediately
+8. Improved resource protection — CPU and memory limits are now computed from the host's actual hardware (high-end machines are not throttled, low-end ones are protected), so a single app under long heavy load can no longer take the containers down
+9. Improved responsiveness and frame pacing — SurfaceFlinger low-latency composition and GPU backpressure are enabled, giving smoother scrolling with fewer dropped frames
+10. Improved security self-check and submission material — security.status now reports host root processes, container privilege and ADB listening state, and the Permissions document maps all 7 fnOS review items
+11. Added port-occupancy pre-check — install now detects occupied ports with localized hints, preventing containers that fail to start due to port-binding failures
 
 ### 3.8.9
 

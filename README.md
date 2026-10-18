@@ -2,7 +2,7 @@
 
 **中文** | [English](README.en.md)
 
-![version](https://img.shields.io/badge/version-v3.8.9-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
+![version](https://img.shields.io/badge/version-v3.9.0-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
 
 📚 **使用手册与常见问题**：见本文档下方各章节
 
@@ -256,7 +256,7 @@ cat /var/apps/androidemu/var/gms_install.log
 
 日志中会记录每一步的执行情况和结果。
 
-### 常见问题
+### GMS常见问题
 
 **Q: GMS 镜像拉取失败怎么办？**
 
@@ -1611,6 +1611,19 @@ docker rm -f androidemu-android androidemu-webrtc 2>/dev/null
 ---
 
 ## 更新记录
+
+### 3.9.0
+1. 修复了安装向导端口设置不生效的问题 — 向导填写的画面/TURN 端口会真正写入容器端口映射，安装后按新端口即可访问
+2. 修复了修改端口后无法连接的问题 — 端口变更会同步更新应用反代端口，应用中心入口与直连新端口均可正常使用
+3. 修复了保留数据卸载后重装数据丢失的问题 — 数据卷改为外部卷，卸载不再被连带删除，重装后数据自动恢复
+4. 修复了选择删除镜像时清理不彻底的问题 — 精确清除数据卷与所有相关镜像（含各加速源别名）
+5. 修复了大文件上传速率减半的问题 — 网关改为边收边转的流式转发，上传速率提升约一倍、内存不再随文件增长
+6. 修复了画面中长按或右键弹出「粘贴」气泡的问题 — 屏蔽原生上下文菜单与非输入区域选中，输入框仍可正常输入和粘贴
+7. 修复了系统语言与时区不生效的问题 — 检测到界面非简体中文时自动设置并重启一次安卓框架，中文与东八区时间立即生效
+8. 优化了资源占用保护 — 按宿主实际 CPU/内存动态设置两个容器的上限，高配不限死、低配拦得住跑飞
+9. 优化了画面跟手与掉帧表现 — 启用 SurfaceFlinger 低延迟合成与 GPU 背压参数，滑动更跟手、掉帧更少
+10. 优化了安全自查与上架材料 — security.status 增加宿主 root 进程、容器特权、ADB 监听等核对项，《权限说明》补充 7 项自检对照
+11. 新增端口占用预检 — 安装时检测端口占用并给出中文提示，避免装完容器因端口绑定失败而起不来
 
 ### 3.8.9
 
