@@ -2,7 +2,7 @@
 
 **中文** | [English](README.en.md)
 
-![version](https://img.shields.io/badge/version-v3.9.0-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
+![version](https://img.shields.io/badge/version-v3.9.1-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
 
 📚 **使用手册与常见问题**：见本文档下方各章节
 
@@ -56,7 +56,7 @@
 - **串口控制台**：默认关闭以减少性能损耗，开发者可手动开启用于调试（见下文）
 - **穿云投屏 Agent 接入**：支持接入多台安卓设备/真机，统一管理
 - **简体中文 + 中国时区**：容器默认 `zh_CN` + `Asia/Shanghai`
-- **应用本体非 root 运行**：gateway.py 等后台进程以 `docker-androidemu` 用户运行，符合上架审核要求
+- **应用本体非 root 运行**：Go 网关（gateway_amd64/arm64）等后台进程以 `docker-androidemu` 用户运行，符合上架审核要求
 - **X86 / ARM 双平台**：自动检测架构和 GPU 能力，X86 用硬件加速，ARM 自动切软件渲染
 - **性能优化**：webrtc/turn 进程高优先级调度、精简后台服务、CPU 动态调频（见下文）
 - **60fps 高帧率**：redroid 容器和 webrtc 编码均提升至 60fps，编码长边 1280，码率 4-16Mbps 动态调整，画面更流畅、触摸滑动更跟手
@@ -93,7 +93,7 @@
 - **【v3.8.9】容器反复重启修复（keystore）**：`/data/misc/keystore/persistent.sqlite` 属主/权限被破坏时，keystore2 崩溃并连带 system_server 每约 10 秒崩溃一次，表现为「正在启动手机…」无限循环、内存锯齿。现改为**先修复属主并保留数据**、修不好才重建该库；开机前即纠正属主且不重启容器；`flock` 单实例避免并发冲突；文件不存在（Android 9/10）视为不适用并跳过
 - **【v3.8.9】飞牛网关与 8443 页面 UI 一致**：网关侧原本额外注入移动端自适应 CSS 与全屏处理，直连 8443 没有，导致同一前端在两条入口上界面不同（手机端直连会横向溢出）。现将这份样式下沉到容器内 `index.html`，两条入口拿到的页面完全一致
 - **【v3.8.9】大文件上传修复（Expect: 100-continue）**：文件中心/终端上传较大 APK 时，客户端先发 `Expect: 100-continue` 并等待临时响应，网关原先不回应导致上传卡死/超时。现按 RFC 7231 立即回 `100 Continue`，并剥掉客户端原始 `Content-Length`/`Expect`，避免上游收到重复头
-- **【v3.8.9】升级自动更新穿云投屏容器**：此前 `pull_policy: missing` + 「镜像已存在即跳过」导致升级从不拉取新 `:latest`。升级时现主动刷新浮动标签镜像，并做镜像可用性冒烟校验（不合格不采用、失败不阻断升级）
+- **【v3.8.9】升级自动更新穿云投屏容器**：此前 `pull_policy: missing` + 「镜像已存在即跳过」导致升级从不拉取新 `:latest`。升级时现主动刷新浮动标签镜像，并做镜像可用性冒烟校验（不合格不采用、失败不阻断升级）→【3.9.1 起策略变更】镜像改为按 digest 随包锁定，升级不再刷新 latest（见更新记录 3.9.1 第 12 条）
 - **【v3.8.9】NVIDIA 显卡支持与 GPU 配置修正**：完整识别 NVIDIA 设备节点（`nvidiactl`/`nvidia0`/`nvidia-uvm`/`nvidia-modeset`）并挂载完整用户态驱动栈（libcuda、GBM 分配器、EGL/GLES/GLX、编码库、`nvidia-vaapi-driver`）；仅 NVIDIA 且未开启 `nvidia_drm.modeset` 时自动回退软件渲染保证开机；同时修正两处工程缺陷——`redroid_gpu_node` 因 sed 分隔符与路径 `/` 冲突而**从未写入**，以及切回软件渲染时 NVIDIA 直通行因正则只匹配行尾 `/dev/nvidia` 而**残留**（会导致 compose 引用不存在设备、容器创建失败）
 - **【v3.8.8】穿云投屏 0.4.1 升级**：同步上游最新版，修复无实体屏幕云手机（redroid）接入异常、加固被控端稳定性、息屏智能降频、专属 TURN 动态下发，外网穿透更灵活
 - **【v3.8.8】OPUS 音频编码器修复**：通过注入 OMX.google.opus.encoder 配置到 redroid 容器，修复穿云投屏默认 OPUS 编码初始化失败导致的无声音、连接崩溃问题，音频稳定可用
@@ -811,8 +811,8 @@ WebRTC 接收 H.264 流 ←── TURN/STUN 中继 ←── scrcpy 编码 ←�
 
 ### 2. 应用本体非 root 运行
 
-- gateway.py、audio_fix.py 等后台进程均以 `docker-androidemu` 用户运行
-- 通过 `_drop_privileges()` 函数实现自动降权（uid=0 时自动切换）
+- Go 网关（gateway_amd64/arm64）、audio_fix.py 等后台进程均以 `docker-androidemu` 用户运行
+- 网关启动时检测到 uid=0 会自动降权（等效旧版 `_drop_privileges()`）
 - config/privilege 声明 `run-as=package`
 
 ### 3. 网络模式（3.8.9：bridge + 宿主端口映射）
@@ -999,21 +999,21 @@ A: 这是飞牛 nginx 网关找不到后端服务时的默认提示，**不是�
 
 **最常见原因：刚安装/刚启动，后端服务还没起来**
 
-安卓容器首次启动需要 1-2 分钟（下载镜像、初始化、启动系统服务），此时 gateway.py 或 webrtc 容器尚未就绪，飞牛网关直接返回 502。**等待 1-2 分钟后刷新页面即可**。
+安卓容器首次启动需要 1-2 分钟（下载镜像、初始化、启动系统服务），此时 Go 网关或 webrtc 容器尚未就绪，飞牛网关直接返回 502。**等待 1-2 分钟后刷新页面即可**。
 
 **按版本区分：**
 
 - **v3.6.8 及以下版本**：显示纯文本「Bad Gateway」是正常现象，旧版本没有友好状态页，上游未就绪时就是这个样子。等容器启动完成后刷新即可正常。
-- **v3.7.0 及以上版本**：正常情况下上游未就绪时会显示友好状态页（带容器状态表格和刷新按钮）。如果仍然显示纯文本「Bad Gateway」，说明 gateway.py 进程根本没启动，需要排查：
+- **v3.7.0 及以上版本**：正常情况下上游未就绪时会显示友好状态页（带容器状态表格和刷新按钮）。如果仍然显示纯文本「Bad Gateway」，说明网关进程根本没启动，需要排查：
 
 第 1 步：检查 8443 端口是否在监听
 ```bash
 ss -tln | grep 8443
 ```
 
-第 2 步：检查 gateway.py 进程是否在运行
+第 2 步：检查网关进程是否在运行
 ```bash
-ps aux | grep gateway.py | grep -v grep
+ps aux | grep -E "gateway_(amd64|arm64)" | grep -v grep
 ```
 
 第 3 步：如果端口没在监听或进程不存在，在应用中心点击「停用」再「启用」，或直接重启应用。
@@ -1062,28 +1062,24 @@ A: 使用WebSocket投屏（局域网或外网环境）时，若出现「连接�
   4. 外网用户可使用页面右上角提示中的MJPEG降级画面查看
   5. 如仍无法解决，请查看容器日志或通过反馈渠道联系我们
 
-### Q: 为什么穿云投屏的 8443 端口只能用 HTTP，不能用 HTTPS？
+### Q: 8443 直连的 HTTPS 现在是什么策略？想改回明文怎么开？
 
-A: **不是做不到，是当前刻意配成明文（`USE_TLS=false`）**。信令程序本身支持 TLS（二进制含 `ListenAndServeTLS`），镜像里也带了 `create_certs.sh` 与 `server.crt/key/p12`，只是默认没开。原因有三个：
+A: **3.9.1 起，8443 直连在局域网与公网环境均默认启用 HTTPS**（`USE_TLS=true`，任何环境优先加密）。
 
-1. **证书是自签的，且 CN 写死 `localhost`**。`/app/certs/create_certs.sh` 用 `openssl x509 -req -signkey` 自签，访问 `https://<NAS_IP>:8443` 会同时触发「证书不受信任」和「证书名称不匹配」两个错误；手机 WebView 往往直接拦截或白屏，比 HTTP 更难用。
-2. **TLS 已经由飞牛统一网关终结**。从应用中心点开走的是 fnOS 网关（443/65535 入口），浏览器→网关是 HTTPS，网关→8443 是本机回环明文。8443 再套一层自签 TLS 没有收益。`gateway.py` 会读 compose 里的 `USE_TLS=false` 自动切明文上游（启动日志会显示「上游 明文」）。
-3. **容器内的 Agent 只连 `ws://`（最关键）**。安卓容器里的穿云投屏 Agent 用明文 WebSocket 连信令；一旦信令改 wss，Agent 不信任那张自签证书，日志会报 x509 错误、**设备直接不上线**，画面就没了。
+背景：信令程序本身支持 TLS，早期默认明文是权衡的结果——证书是自签的（`/app/certs/create_certs.sh` 用 `openssl x509 -req -signkey` 自签，CN=localhost），访问 `https://<NAS_IP>:8443` 会触发「证书不受信任」警告，且从应用中心进入时 TLS 由飞牛统一网关终结，8443 再套一层自签收益有限。3.9.1 起 Agent 已支持 wss 并自动信任自签证书（不会再因证书掉线），浏览器侧只剩首次的人为确认，因此按用户要求改为全环境默认加密。
 
-各网络模式的 TLS 取值（`scripts/net_mode.sh`）：
+各网络模式的 TLS 取值与独立开关（`scripts/net_mode.sh`）：
 
-| 模式 | `USE_TLS` | 适用场景 |
+| 模式/命令 | `USE_TLS` | 适用场景 |
 |------|-----------|----------|
-| `lan` | `false` | 局域网直连（默认） |
-| `lanhttp` | `false` | 局域网且明确关闭 TLS，免证书提示 |
-| `wan` | `true` | 公网/域名访问 |
-| `proxy` | `false` | 内网穿透/反向代理（前面已有代理终结 TLS） |
+| `lan` / `lanhttp` | `true` | 局域网直连（默认 HTTPS）；可被 `https off` 覆盖为 `false` |
+| `wan` | `true` | 公网/域名访问（默认 HTTPS）；可被 `https off` 覆盖为 `false` |
+| `proxy` | `false` | 内网穿透/反向代理（TLS 由前置代理终结，开关不生效） |
+| `https on` / `https off` | 独立开关 | 不改模式只切 8443 直连 TLS；持久化于 `var/tls.conf`，升级/改端口后保留 |
 
-**想让 8443 也跑 HTTPS**，推荐顺序：
-
-1. 保持 8443 明文，TLS 交给飞牛网关或前置反代（挂真证书）——这也是当前设计的意图；
-2. 把 `/app/certs/server.crt|key` 换成**匹配你域名的真实 CA 证书**（如 Let's Encrypt），再在 compose 里设 `USE_TLS=true`，访问 `https://<域名>:8443` 就不会有警告；
-3. 改 TLS 后**别忘了 Agent**：需改用 wss 并信任证书，执行 `bash scripts/agent_helper.sh deploy <目录> --tls`，否则设备会掉线。
+- **改回明文**：执行 `bash scripts/net_mode.sh https off`（proxy 模式恒为明文，由反向代理终结 TLS）。
+- **想要无警告的真 HTTPS**：把 `/app/certs/server.crt|key` 换成匹配你域名的真实 CA 证书（如 Let's Encrypt）。
+- 切换后 webrtc 容器自动重建、网关自动重启、agent 信令自动跟随（ws ⇄ wss），设置持久化于 `var/tls.conf`，升级/改端口后保留。
 
 ### Q: 容器反复重启
 
@@ -1605,12 +1601,39 @@ docker rm -f androidemu-android androidemu-webrtc 2>/dev/null
 - **网关资源改写正则要容忍子目录**：上游前端资源从 `/assets/<name>.js` 换成 `/assets/js/chunk-*.js` 时，扁平正则会让 `?v=` 缓存戳失效（旧 chunk 被缓存）；3.8.9 起字符类含 `/`，是严格超集
 - **`docker logs` 恒为空是设计结果，不是故障**：compose 设了 `androidboot.console=0`（3.3.6 为省性能关闭串口控制台），Android 启动日志只进**容器内 logcat**（实测 docker logs 0 字节、logcat 1.4 万行）。因此任何"grep docker logs 找启动错误"的检测都会永久失效——3.8.9 之前 webrtc_watchdog 的 GPU 自动回退就是这么失效的（且回退后还重建错了容器）。启动问题请用 `bash scripts/boot_guard.sh once` 与 `var/boot_diag.status`
 - **开机卡死要有持续守护，不能只靠一次性检查**：`fix_gpu_perms.sh` 只在安装流程跑一次，错过窗口（容器还没起 / 崩溃还没发生）就不再补救；3.8.9 起由 `boot_guard.sh` 持续巡检，判定依据是「boot 卡住超阈值 **且** logcat 有 GPU/DRM 证据」，两个条件同时满足才自动回退软件渲染并重建 **redroid** 容器（一次性标记防循环）
-- **镜像版本必须单一可信源，禁止在多处写死**：`app/docker/runtime.conf` 是「用哪个 Android 版本 / 哪个上游镜像」的唯一配置点（`ANDROID_VER` 支持 9~16，镜像名按 redroid 官方命名自动拼出；穿云投屏只跟 `latest`）。所有脚本经 `scripts/rtconf.sh` 取值，`tune_compose.sh` 负责把配置写进 compose 的 `image:` 行。**换版本只改这一个文件**（`bash scripts/rtconf.sh show` 可查看当前生效值，`ANDROIDEMU_ANDROID_VER=13` 之类的环境变量可临时覆盖）。这样新增 Android 版本不需要改任何代码，也不会把某个版本写死在某个脚本里
+- **镜像版本必须单一可信源，禁止在多处写死**：`app/docker/runtime.conf` 是「用哪个 Android 版本 / 哪个上游镜像」的唯一配置点（`ANDROID_VER` 支持 9~16，镜像名按 redroid 官方命名自动拼出；穿云投屏镜像按 `WEBRTC_DIGEST` **随包 digest 锁定**——上游只发 `:latest` 浮动标签，锁定后上游推送新镜像不影响已装用户，配置与镜像版本始终对应；跟随上游更新 = 换 digest 随新版应用包发布，`ANDROIDEMU_WEBRTC_DIGEST` 环境变量可临时覆盖）。所有脚本经 `scripts/rtconf.sh` 取值，`tune_compose.sh` 负责把配置写进 compose 的 `image:` 行，`pull_image.sh` 按 digest 拉取后回打 CANON tag、`upgrade_init` 在锁定时跳过 latest 刷新。**换版本只改这一个文件**（`bash scripts/rtconf.sh show` 可查看当前生效值，`ANDROIDEMU_ANDROID_VER=13` 之类的环境变量可临时覆盖）。这样新增 Android 版本不需要改任何代码，也不会把某个版本写死在某个脚本里
 - **版本相关能力要按「能力探测」启停，而不是按版本号打补丁**：例如音频 Codec2 修复先判断平台是否使用 Codec2 框架（`ro.build.version.sdk >= 29` 或探测到 Codec2 库/属性），不适用时明确说明并跳过，而不是误报成"缺少 Opus 编码器库"；`su` 加固按候选路径探测（`/system/xbin/su`、`/system/bin/su`、`/sbin/su`）；houdini 下载地址按实际 Android 版本拼装。**尚未覆盖**的版本相关资产（GMS 载体包、houdini 各版本包）需按版本单独提供，缺失时脚本会明确跳过而不是硬套
 
 ---
 
 ## 更新记录
+
+### 3.9.1
+1. 修复了 net_mode 切换网络模式时环境变量写入错误服务、静默失效的问题 — 五个网络变量改回 webrtc 服务并加写后校验（重复键/未写入自动走 awk 重写）
+2. 修复了 8443 开启 HTTPS 后网关仍按明文连上游的问题 — compose 注释里的 "USE_TLS=false" 字样导致误判，现只认 environment 真实配置行（Go/Python 网关同步修）
+3. 修复了 compose 权限收敛导致网关 503 的问题 — 配置写入后统一 644，确保网关用户可读
+4. 修复了网关偶发 Bad Gateway 的问题 — 守护健康判定改为实际连通性检查，升级后自动替换旧实例
+5. 修复了走网关时设备列表与缩略图为空的问题 — 设备列表改为透传上游真实数据，跳转地址补齐应用前缀
+6. 修复了残留容器/网络导致无法安装或启用的问题 — 安装前自动清理上次失败安装的残留，卸载时重试删除网络
+7. 修复了局域网访问时 WebRTC 握手失败、连不上的问题 — 局域网 IP 探测改为优先默认路由源地址，不再把 docker 网桥写进 PUBLIC_IP/ICE
+8. 修复了部分机器中继端口段被占用导致画面服务起不来的问题 — 安装/升级/切换网络模式时预检中继段，仅在冲突时自动改用空闲段并同步容器内端口段，无冲突时保持 50000-50100 不变
+9. 修复了网关清理逻辑把其它守护进程误判为残留的问题 — 3.9.1 起只按网关可执行文件识别本应用网关进程，避免 boot_guard 等守护被误杀
+10. 修复了安全自查文件把容器内 root 进程误计为宿主 root 进程的问题 — 只统计宿主侧进程（容器内 entrypoint/agent 不再计入）
+11. 修复了未知厂商 GPU 无法选中 renderD 渲染节点、退回 card 显示节点的问题 — 无厂商信息时同样优先 renderD（card 需 DRM master，是花屏/黑屏的典型成因）
+12. 修复了语言与时区偶发不生效的问题 — 新增 fix_locale.sh 统一处理：语言或时区任一不符即修正（此前只判断语言、不校验时区），关闭自动时区避免被网络改回；默认 24 小时制（首次初始化强制写入，之后尊重用户手动改为 12 小时制）；boot_guard 与 agent_autodeploy 两条启动路径都会调用，同一次开机只尝试一次
+13. 修复了 TLS 开关切换后网关仍按旧协议连上游、导致应用中心入口短时 502 的问题 — 切换后自动重启网关，agent 协议同步跟随（ws/wss）；同时中继段预检会尊重用户自定义段，开机巡检不再每分钟重复读取时区
+14. 优化了网关架构 — 网关由 Python 重写为 Go 原生实现，流式转发与 WebSocket 更稳、内存占用更低
+15. 优化了页面一致性 — 两条入口（应用中心/直连端口）页面渲染统一，修复容器显示不一致等问题
+16. 优化了 ARM 翻译层策略 — 谷歌翻译层（ndk）优先，检测到翻译崩溃才自动切 Intel houdini（仅一次），仍崩则自动回退并停止切换，不再反复横跳
+17. 优化了直连加密策略 — 8443 直连在局域网与公网环境均默认启用 HTTPS（自签证书，浏览器首次需确认；agent 自动走 wss）；确需明文可执行 net_mode.sh https off（proxy 模式恒为明文，由反向代理终结 TLS）
+18. 优化了穿云投屏镜像版本策略 — 镜像按 digest 随包锁定，上游更新 latest 不再影响已装用户（配置与镜像版本始终对应），上游有更新时随新版应用包发布
+19. 优化了 GPU 兼容判定 — 按 GPU 家族校验对应 Mesa 驱动（Mali/panfrost、Adreno/msm、VideoCore/v3d、Vivante/etnaviv、Tegra、Rockchip、AMD/radeonsi、Intel/iris），缺驱动预先回退软件渲染避免黑屏；NVIDIA 独占且缺用户态库时同样回退
+20. 优化了设备上线自愈 — 开机守护发现「安卓已开机但容器内无 agent 且 agent 守护未运行」时自动拉起 agent 部署（此前只在安装/升级/启动入口触发，手工部署或守护被杀后会一直显示离线）
+21. 新增配置安全编辑机制 — 端口、网络、显卡等设置修改不再直接改文本，避免配置写坏导致应用起不来或设置静默失效（内部工具 editcompose，awk 方案保留为回退）
+22. 新增翻译层应用名单 — 名单内应用走 Intel houdini、其余保持谷歌 ndk，两个翻译层并存、按应用各取所长
+23. 新增 GPU 花屏巡检与手动切换 — boot_guard 在开机成功后仍巡检渲染异常特征（buffer 出队失败、EGL surface 失效、fence 超时等），超阈值自动回退软件渲染（一次性）；新增 scripts/switch_render.sh 可随时在 GPU 直通/软件渲染间切换
+
+> 详细说明见包内《应用介绍》的「v3.9.1 更新说明」；应用中心详情页的「更新内容」与本列表同源。
 
 ### 3.9.0
 1. 修复了安装向导端口设置不生效的问题 — 向导填写的画面/TURN 端口会真正写入容器端口映射，安装后按新端口即可访问
@@ -1736,7 +1759,7 @@ docker rm -f androidemu-android androidemu-webrtc 2>/dev/null
 - 原作者：键盘敲粥香（lin1740）
 - 许可证：[Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
   > 简要说明：Apache License 2.0 允许任何人免费使用、复制、修改、合并、发布、分发、再许可和销售本软件的副本，前提是保留版权声明、许可证副本和 NOTICE 文件（如有），并声明对原文件的修改。本软件按"现状"提供，不提供任何明示或默示的担保。该许可证包含明确的专利授权条款。
-- 包含：docker-compose 配置、安装/升级脚本、gateway.py 网关、状态页、性能优化脚本、Go 守护进程（androidemu_daemon，负责音频修复和分辨率自动切换）等（均为本项目自行开发，适配飞牛 fnOS 平台）
+- 包含：docker-compose 配置、安装/升级脚本、Go 网关（gateway_amd64/arm64）、状态页、性能优化脚本、中继端口预检（turn_ports）、语言时区修正（fix_locale）、GPU 渲染模式切换（switch_render）等（均为本项目自行开发，适配飞牛 fnOS 平台）
 - 项目源码链接：见飞牛应用中心本应用详情页的「发布者」蓝色链接，或应用介绍中的项目链接
 - 说明：本应用未自行开发 UI 界面，画面管理页面依赖穿云投屏（scrcpy-over-webrtc）的原生 UI，该 UI 不在本项目修改范围内
 
