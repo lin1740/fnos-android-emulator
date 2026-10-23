@@ -2,7 +2,7 @@
 
 [中文](README.md) | **English**
 
-![version](https://img.shields.io/badge/version-v3.9.0-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
+![version](https://img.shields.io/badge/version-v3.9.1-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
 
 📚 **User Manual & FAQ**: See sections below
 
@@ -56,7 +56,7 @@ Based on Android container + Scrcpy over WebRTC (screen service) dual-container 
 - **Serial Console**: Disabled by default to reduce performance overhead, developers can manually enable for debugging (see below)
 - **Scrcpy Agent Integration**: Support connecting multiple Android devices/real phones, unified management
 - **Simplified Chinese + China Timezone**: Container defaults to `zh_CN` + `Asia/Shanghai`
-- **Non-root App Process**: gateway.py and other background processes run as `docker-androidemu` user , compliant with app store audit requirements
+- **Non-root App Process**: the Go gateway (gateway_amd64/arm64) and other background processes run as the `docker-androidemu` user, compliant with app store audit requirements
 - **X86 / ARM Dual Platform**: Auto-detect architecture and GPU capabilities, X86 uses hardware acceleration, ARM auto-switches to software rendering
 - **Performance Optimization**: webrtc/turn process high-priority scheduling, streamlined background services, CPU dynamic frequency scaling (see below)
 - **60fps High Frame Rate**: Both redroid container and webrtc encoding upgraded to 60fps, encoding long edge 1280, bitrate 4-16Mbps dynamic adjustment, smoother video and more responsive touch/swipe
@@ -785,7 +785,7 @@ This app has passed fnOS official 7-point self-check (basic info, permission dec
 
 ### 2. Non-root App Process 
 
-- gateway.py, audio_fix.py and other background processes all run as `docker-androidemu` user
+- The Go gateway (gateway_amd64/arm64), audio_fix.py and other background processes all run as the `docker-androidemu` user
 - Auto-downgrade via `_drop_privileges()` function (auto-switch when uid=0)
 - config/privilege declares `run-as=package`
 
@@ -977,21 +977,21 @@ A: This is the default prompt from fnOS nginx gateway when it can't reach the ba
 
 **Most common cause: Just installed/just started, backend service not ready yet**
 
-The Android container takes 1-2 minutes on first boot (pulling image, initializing, starting system services). During this time gateway.py or the webrtc container is not ready yet, and fnOS gateway directly returns 502. **Wait 1-2 minutes then refresh the page.**
+The Android container takes 1-2 minutes on first boot (pulling image, initializing, starting system services). During this time the Go gateway or the webrtc container is not ready yet, and fnOS gateway directly returns 502. **Wait 1-2 minutes then refresh the page.**
 
 **By version:**
 
 - **v3.6.8 and below**: Showing plain text "Bad Gateway" is normal. Older versions don't have a friendly status page, this is what you see when upstream is not ready. Refresh after the container finishes starting.
-- **v3.7.0 and above**: Normally shows a friendly status page (with container status table and refresh button) when upstream is not ready. If you still see plain text "Bad Gateway", it means the gateway.py process didn't start at all. Troubleshoot:
+- **v3.7.0 and above**: Normally shows a friendly status page (with container status table and refresh button) when upstream is not ready. If you still see plain text "Bad Gateway", it means the gateway process didn't start at all. Troubleshoot:
 
 Step 1: Check if port 8443 is listening
 ```bash
 ss -tln | grep 8443
 ```
 
-Step 2: Check if gateway.py process is running
+Step 2: Check if the gateway process is running
 ```bash
-ps aux | grep gateway.py | grep -v grep
+ps aux | grep -E "gateway_(amd64|arm64)" | grep -v grep
 ```
 
 Step 3: If port is not listening or process doesn't exist, click "Stop" then "Start" in the App Center, or restart the app.
@@ -1561,30 +1561,51 @@ Key technical conclusions verified during development, for secondary development
 
 ---
 
-### Q: Why can port 8443 only be used over HTTP, not HTTPS?
+### Q: What is the TLS policy for direct port 8443 access? How do I switch back to plaintext?
 
-A: **It can do HTTPS — it is deliberately configured as plaintext (`USE_TLS=false`).** The signaling binary does support TLS (it contains `ListenAndServeTLS`) and the image ships `create_certs.sh` plus `server.crt/key/p12`; TLS is simply off by default. Three reasons:
+A: **Since 3.9.1, direct 8443 access defaults to HTTPS on both LAN and WAN** (`USE_TLS=true` — encryption first in every environment).
 
-1. **The certificate is self-signed and its CN is hardcoded to `localhost`.** `/app/certs/create_certs.sh` signs with `openssl x509 -req -signkey`, so `https://<NAS_IP>:8443` triggers both "untrusted certificate" and "name mismatch"; mobile WebViews usually block it outright or show a blank page — worse than plain HTTP.
-2. **TLS is already terminated by the fnOS unified gateway.** Opening from the app center goes through the fnOS gateway (443/65535 entry): browser→gateway is HTTPS, gateway→8443 is plaintext over loopback. Adding another self-signed TLS layer on 8443 buys nothing. `gateway.py` reads `USE_TLS=false` from the compose file and automatically uses a plaintext upstream (the startup log shows "上游 明文").
-3. **The in-container agent only speaks `ws://` (the decisive one).** The casting agent inside the Android container connects to signaling over plaintext WebSocket. Switch signaling to wss and the agent does not trust that self-signed certificate, logs an x509 error, and **the device simply never comes online** — no picture.
+Background: the signaling binary supports TLS, and the early plaintext default was a deliberate trade-off — the certificate is self-signed (`/app/certs/create_certs.sh` signs with `openssl x509 -req -signkey`, CN hardcoded to `localhost`), so `https://<NAS_IP>:8443` triggers an "untrusted certificate" warning, and when entering via the app center the fnOS unified gateway already terminates TLS. Since 3.9.1 the agent speaks wss and trusts the self-signed certificate automatically (devices no longer drop offline over certificates), so per user request HTTPS is now the default everywhere. Only the first browser visit needs a manual confirmation.
 
-TLS per network mode (`scripts/net_mode.sh`):
+TLS per network mode plus the dedicated toggle (`scripts/net_mode.sh`):
 
-| Mode | `USE_TLS` | Use case |
+| Mode / command | `USE_TLS` | Use case |
 |------|-----------|----------|
-| `lan` | `false` | Direct LAN access (default) |
-| `lanhttp` | `false` | LAN with TLS explicitly off (no cert prompt) |
-| `wan` | `true` | Public/domain access |
-| `proxy` | `false` | Tunnel / reverse proxy (TLS terminated upstream) |
+| `lan` / `lanhttp` | `true` | Direct LAN access (HTTPS by default); can be overridden to `false` by `https off` |
+| `wan` | `true` | Public/domain access (HTTPS by default); can be overridden to `false` by `https off` |
+| `proxy` | `false` | Tunnel / reverse proxy (TLS terminated upstream; toggle has no effect) |
+| `https on` / `https off` | dedicated toggle | Switches TLS on 8443 without changing the mode; persisted in `var/tls.conf` and survives upgrades/port changes |
 
-**To actually run HTTPS on 8443**, in order of preference:
-
-1. Keep 8443 plaintext and terminate TLS at the fnOS gateway or a reverse proxy with a real certificate — this is the intended design;
-2. Replace `/app/certs/server.crt|key` with a **real CA-signed certificate matching your domain** (e.g. Let's Encrypt), set `USE_TLS=true` in the compose file, then `https://<domain>:8443` works without warnings;
-3. After enabling TLS, **don't forget the agent**: it must switch to wss and trust the certificate — run `bash scripts/agent_helper.sh deploy <dir> --tls`, otherwise devices go offline.
+**Switch back to plaintext**: run `bash scripts/net_mode.sh https off` (proxy mode is always plaintext, TLS terminated upstream). **For warning-free HTTPS**, replace `/app/certs/server.crt|key` with a **real CA-signed certificate matching your domain** (e.g. Let's Encrypt). After a toggle the webrtc container is recreated, the gateway restarts automatically and the agent follows ws/wss; settings persist in `var/tls.conf`.
 
 ## Changelog
+
+### 3.9.1
+1. Fixed net_mode writing network environment variables to the wrong service and silently failing — the five network variables are written back to the `webrtc` service with post-write verification (duplicate keys / missing writes automatically rewritten via awk)
+2. Fixed the gateway still connecting to the upstream in plaintext after HTTPS was enabled on 8443 — the string "USE_TLS=false" inside a compose comment caused misdetection; now only real `environment:` configuration lines are honored (fixed in both Go and Python gateways)
+3. Fixed gateway 503 caused by compose permission tightening — permissions unified to 644 after config writes so the gateway user can read the file
+4. Fixed sporadic gateway Bad Gateway — daemon health checks now do real connectivity probes and stale instances are replaced after upgrades
+5. Fixed empty device list and thumbnails when going through the gateway — the device list now passes through upstream data verbatim and redirect URLs carry the app prefix
+6. Fixed being unable to install/enable due to leftover containers/networks — leftovers from a previous failed install are cleaned automatically before installing, and network deletion is retried on uninstall
+7. Fixed WebRTC handshake failure when accessing over the LAN — LAN IP detection now prefers the default-route source address and no longer writes a docker bridge address into PUBLIC_IP/ICE
+8. Fixed the casting service failing to start on machines where the TURN relay port range is occupied — install/upgrade/network-mode switching now pre-checks the relay range and only relocates to a free range on conflict (container-side ports synced), leaving 50000-50100 untouched when there is no conflict
+9. Fixed the gateway residue sweep misidentifying other daemons as stale gateways — gateway processes are now identified strictly by the gateway executable, so boot_guard and similar daemons are no longer killed
+10. Fixed security.status counting container-internal root processes as host root processes — only host-side processes are counted now (container entrypoint/agent excluded)
+11. Fixed unknown-vendor GPUs never selecting the renderD node and falling back to the card display node — renderD is now preferred even without vendor info (the card node needs DRM master and is a classic cause of corrupted/black frames)
+12. Fixed locale/timezone occasionally not applying — new fix_locale.sh handles it uniformly: corrects when either language or timezone mismatches (previously only language was checked), disables automatic timezone so the network cannot revert it, and defaults to 24-hour format (forced on first setup, later user changes are respected); both boot_guard and agent_autodeploy invoke it, with one attempt per boot
+13. Fixed the gateway keeping the old upstream protocol after a TLS toggle (brief 502 on the App Center entry) — the gateway now restarts on toggle and the agent follows ws/wss automatically; relay-range precheck now respects user-customized ranges and boot patrol no longer re-reads locale every minute
+14. Improved the gateway architecture — rewritten from Python to native Go: more robust streaming relay and WebSocket, lower memory footprint
+15. Improved page consistency — both entries (App Center / direct port) now render identically, fixing container display inconsistencies
+16. Improved the ARM translation-layer strategy — Google's translation layer (ndk) is preferred; on detected translation crashes the container switches to Intel houdini once; if houdini also crashes it falls back and stops switching automatically, no more flip-flopping
+17. Improved direct-access encryption — 8443 direct access now defaults to HTTPS on both LAN and WAN (self-signed certificate, one-time browser confirmation; the agent switches to wss automatically); run `net_mode.sh https off` only if plaintext is required (proxy mode is always plaintext, TLS terminated upstream)
+18. Improved the casting-image version strategy — the image is pinned by digest per app release; upstream pushes to `latest` no longer affect installed users (config and image version always match), and following upstream updates happens via a new app package
+19. Improved GPU compatibility checks — validates the Mesa driver required by each GPU family (Mali/panfrost, Adreno/msm, VideoCore/v3d, Vivante/etnaviv, Tegra, Rockchip, AMD/radeonsi, Intel/iris) and pre-falls back to software rendering when missing to avoid black screens; NVIDIA-only setups without the userspace stack fall back too
+20. Improved device-online self-healing — when the boot guard finds Android booted but no agent in the container and no agent watchdog running, it now launches agent deployment (previously only install/upgrade/startup entries triggered it; manual deployments or a killed watchdog left the device permanently offline)
+21. Added safe config editing — port/network/GPU changes no longer rewrite text directly, preventing broken configs or silently ignored settings (internal editcompose tool, awk kept as fallback)
+22. Added the translation-layer app list — apps on the list run on Intel houdini, everything else stays on Google ndk; both translation layers coexist and each app gets the better fit
+23. Added GPU corruption patrol and manual render switching — boot_guard now keeps watching for rendering-error signatures after boot (dequeueBuffer failures, invalid EGL surfaces, fence timeouts) and falls back to software rendering once past threshold; new scripts/switch_render.sh switches between GPU passthrough and software rendering at any time
+
+> See the "v3.9.1 更新说明" section in the packaged 应用介绍 for details; the App Center "What's new" text shares the same source as this list.
 
 ### 3.9.0
 1. Fixed install-wizard port settings having no effect — the web/TURN ports filled in the wizard are now written into the container's real port mappings, so the new ports work right after install
@@ -1710,7 +1731,7 @@ This application pulls the following public images via Docker at runtime, withou
 - Author: 键盘敲粥香 (lin1740)
 - License: [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
   > Brief: The Apache License 2.0 allows anyone to freely use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of this software, provided that copyright notices, license copies, and NOTICE files (if any) are retained, and modifications to original files are stated. The software is provided "AS IS" without any express or implied warranty. This license includes explicit patent grant terms.
-- Includes: docker-compose configs, install/upgrade scripts, gateway.py, status page, performance optimization scripts, Go daemon (androidemu_daemon, responsible for audio fix and resolution auto-switching), etc. (all self-developed by this project, adapted for fnOS platform)
+- Includes: docker-compose configs, install/upgrade scripts, the Go gateway (gateway_amd64/arm64), status page, performance optimization scripts, relay-port precheck (turn_ports), locale/timezone fix (fix_locale), GPU render-mode switch (switch_render), etc. (all self-developed by this project, adapted for fnOS platform)
 - Project source code link: See the "Publisher" blue link on the app detail page in fnOS App Center, or the project link in the app description
 - Note: This application does not develop its own UI; the screen management page relies on scrcpy-over-webrtc's native UI, which is not within this project's modification scope
 
