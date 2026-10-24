@@ -2,7 +2,7 @@
 
 **中文** | [English](README.en.md)
 
-![version](https://img.shields.io/badge/version-v3.9.1-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
+![version](https://img.shields.io/badge/version-v3.9.2-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
 
 📚 **使用手册与常见问题**：见本文档下方各章节
 
@@ -1572,6 +1572,21 @@ rm -rf /tmp/androidemu_*
 docker rm -f androidemu-android androidemu-webrtc 2>/dev/null
 ```
 
+### Q: 视频为什么不走硬件解码？播放器提示「硬解失败已切换软解」
+这是容器化安卓的架构性现状，不是故障：redroid 官方镜像内不含硬件视频编解码 HAL，解码器列表里全部是软件实现（`OMX.google.*` / `c2.android.*`），播放器尝试硬解必然失败后自动转软解。实测主流核显设备软解 40~60fps（1080p 级别流畅），抖音、飞牛影视等应用正常使用。硬件编解码已在技术上打通（宿主侧 VAAPI daemon 源码随包附带，见 `app/hwenc/`），待上游发布容器内 Codec2 组件后将以可选插件形式提供。
+
+### Q: 重启容器或重启 NAS 后，开启音频连接失败 / 没声音
+3.9.1 及之前版本存在音频修复守护的锁竞争缺陷（容器重启后 Opus 编码器修复可能长时间无法执行），3.9.2 已修复：守护会等待重试并在必要时无锁执行修复，容器重启后音频编码器自动恢复。如仍遇到，升级到 3.9.2+ 即愈；也可手动执行 `bash /vol1/@appcenter/androidemu/scripts/audio_watchdog.sh fix` 立即修复。
+
+### Q: 应用的 root 检测会命中吗？容器内是 root 吗？
+容器内系统层以 root 运行（容器化安卓的技术必需，仅限容器命名空间内），但 3.9.2 起自动应用「新手机」去 root 画像：删除镜像自带 su、构建属性调整为 user/release-keys/非 debuggable（开机巡检自动执行、重启持久）。绝大多数应用的 root 检测（找 su 文件/Magisk 特征）不会命中；对安装的应用不提供 root；宿主侧无任何 root 常驻进程。
+
+### Q: 支持哪些安卓版本？GMS 支持哪些版本？
+安装向导「安卓系统版本」下拉支持 Android 10~16（默认 12，升级自动保持已选版本）。GMS 按镜像 tag 逐步覆盖：Android 12 双架构已发布（x86_64 为官方源重建）、11-x86_64 已发布（OpenGApps）、arm64 的 10~16 与 x86_64 的 13 载体陆续构建中；未覆盖的版本-架构组合自动跳过 GMS 不阻塞安装。
+
+### Q: GPU 加速支持哪些硬件？OpenGL/Vulkan 呢？
+OpenGL ES 渲染：主流 ARM SoC（Mali/Adreno/VideoCore）与 x86 AMD/Intel 均为硬件加速（实测 Mali Panfrost GLES 3.1、AMD radeonsi GLES 3.2）；x86 NVIDIA 装专有驱动时容器内无 DRI 节点，自动回退软件渲染。Vulkan：镜像内置 9 个厂商 HAL（intel/hasvk/radeon/nouveau/panfrost/freedreno/broadcom/virtio/lvp），现代硬件自动启用硬件 Vulkan（实测 Mali Panfrost 激活），旧设备回退软件 Vulkan。视频编解码见上一条（全软件）。
+
 ### 技术说明与开发踩坑
 
 以下是开发过程中验证过的关键技术结论，供二次开发参考：
@@ -1607,6 +1622,16 @@ docker rm -f androidemu-android androidemu-webrtc 2>/dev/null
 ---
 
 ## 更新记录
+
+### 3.9.2
+1. 修复了应用介绍与实际行为不一致的问题 — 移除「局域网直连默认明文」的过时描述（3.9.1 起全环境默认 HTTPS，自签证书首次访问需确认）
+2. 优化了安装/升级日志的准确表述 — 统一网关服务已在 3.9.1 重写为 Go，移除日志中残留的「Python 网关」字样，避免用户看日志时被误导排查
+3. 新增「视频解码方式」说明 — 应用介绍明示容器化安卓为软件解码（redroid 架构限制，无硬件视频解码器），播放器提示「硬解失败已切换软解」属正常现象，避免用户误解为故障
+4. 新增「安卓系统版本」安装向导 — 镜像在前、版本下拉选择（Android 10~16，默认 12），升级自动保持已选版本；GMS 载体按「版本-架构」tag 逐步覆盖（已发布 12 双架构、11-x86_64），未覆盖的组合自动跳过不阻塞
+5. 新增信令端口自愈巡检 — 开机巡检发现 8443 端口未监听而 webrtc 容器仍在运行时（容器内画面服务崩溃的场景），自动重启 webrtc 容器恢复服务，每次开机限一次防循环
+6. 修复了音频修复守护锁竞争死锁的问题 — 音频守护与统一守护共用同一锁文件且「抢不到即跳过」，容器重启后可能连续数分钟无法完成 Opus 编码器修复（表现为重启后开音频连接失败）；现改为等待重试，仍抢不到则无锁执行幂等修复
+7. 修复了降权后丢失 docker 组权限的问题 — 降权逻辑保留目标用户全部附加组；修复 ARM 等设备上（应用用户主组非 docker）音频守护无法访问 Docker、重启后永远报「容器未运行」的问题
+8. 新增容器「新手机」去 root 画像（de_root.sh）— 删除镜像自带 su、build 属性调整为 user/release-keys/非 debuggable（幂等，开机巡检自动执行），应用的 root 检测不再命中；对安装的应用不提供 root，管理通道不受影响
 
 ### 3.9.1
 1. 修复了 net_mode 切换网络模式时环境变量写入错误服务、静默失效的问题 — 五个网络变量改回 webrtc 服务并加写后校验（重复键/未写入自动走 awk 重写）
@@ -1679,7 +1704,8 @@ docker rm -f androidemu-android androidemu-webrtc 2>/dev/null
 
 > **关于独立 Docker 容器版**：本项目目前以飞牛应用中心 FPK 包形式发布，暂不提供独立 Docker Compose 部署方案。独立 Docker 容器版本计划在应用中心上架稳定后另行提供，敬请期待。
 
-1. **音频**：v3.8.9 已彻底修复 OPUS 音频编码器（启用 Codec2），默认启用，需在连接设置中手动开启音频。注意：音量大小与宿主系统实际音量匹配（容器内设100但宿主系统只设50，则按50输出）
+1. **音频**：v3.8.9 已彻底修复 OPUS 音频编码器（启用 Codec2），默认开启；3.9.2 修复了容器重启后音频修复守护锁竞争失效的问题（重启后自动自愈）。注意：音量大小与宿主系统实际音量匹配（容器内设100但宿主系统只设50，则按50输出）
+7. **视频硬件编解码**：容器内不含硬件视频编解码 HAL（redroid 架构限制），视频播放与推流编码均为软件实现；宿主侧硬件方案源码随包附带（`app/hwenc/`），将以可选插件形式提供
 2. **外网访问**：飞牛反向代理只透传 TCP，WebRTC 媒体流（UDP）无法通过，自动降级为 WebSocket 投屏
 3. **飞牛 APP**：部分版本 WebView 对 WebSocket 代理支持有限，建议用手机浏览器
 4. **ARM 应用兼容性**：含反模拟器检测或复杂 JIT 的 ARM64 应用可能闪退（属翻译层能力边界）
