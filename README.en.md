@@ -2,7 +2,7 @@
 
 [中文](README.md) | **English**
 
-![version](https://img.shields.io/badge/version-v3.9.1-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
+![version](https://img.shields.io/badge/version-v3.9.2-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
 
 📚 **User Manual & FAQ**: See sections below
 
@@ -1580,6 +1580,15 @@ TLS per network mode plus the dedicated toggle (`scripts/net_mode.sh`):
 
 ## Changelog
 
+### 3.9.2
+1. Fixed inconsistency between the app description and actual behavior — removed the outdated "direct LAN connection defaults to plaintext" wording (HTTPS is the default everywhere since 3.9.1)
+2. Improved accuracy of install/upgrade logs — the unified gateway was rewritten in Go in 3.9.1; removed leftover "Python gateway" wording
+3. Added a "video decoding" note — the app description now states that containerized Android uses software decoding (redroid architectural limitation); "hardware decode failed, switched to software" messages from players are normal
+4. Added an "Android version" install wizard step — image first, version dropdown (Android 10-16, default 12), preserved across upgrades; GMS carriers roll out per "version-arch" tag (12 both arches and 11-x86_64 published; uncovered combos skip GMS without blocking)
+5. Added signaling-port self-healing — if port 8443 stops listening while the webrtc container is still running (crashed streaming service), the container is restarted automatically once per boot
+6. Fixed an audio-repair watchdog lock-contention deadlock — after a container restart the Opus encoder repair could stall for minutes (audio connections failing); the watchdog now waits and retries, then runs the idempotent repair without the lock if needed
+7. Fixed dropped supplementary groups after privilege drop — groups are now preserved; fixes audio daemon unable to reach Docker on devices where the app user's primary group is not docker (e.g. ARM), which made restarts permanently report "container not running"
+8. Added a "factory-fresh phone" de-rooted profile (de_root.sh) — removes the bundled su and adjusts build properties to user/release-keys/non-debuggable (idempotent, run by the boot watchdog); root-detection in apps no longer matches; installed apps get no root, management channels unaffected
 ### 3.9.1
 1. Fixed net_mode writing network environment variables to the wrong service and silently failing — the five network variables are written back to the `webrtc` service with post-write verification (duplicate keys / missing writes automatically rewritten via awk)
 2. Fixed the gateway still connecting to the upstream in plaintext after HTTPS was enabled on 8443 — the string "USE_TLS=false" inside a compose comment caused misdetection; now only real `environment:` configuration lines are honored (fixed in both Go and Python gateways)
@@ -1651,7 +1660,8 @@ TLS per network mode plus the dedicated toggle (`scripts/net_mode.sh`):
 
 > **About Standalone Docker Container Version**: This project is currently published as an fnOS App Center FPK package. Standalone Docker Compose deployment is not yet available. The standalone Docker container version is planned for release after the app is stable on the App Center. Stay tuned.
 
-1. **Audio**: v3.8.9 has fully fixed the OPUS audio encoder (via Codec2), enabled by default; need to manually enable audio in connection settings. Note: output volume matches host system volume (if container is at 100% but host is at 50%, output is 50%)
+1. **Audio**: v3.8.9 has fully fixed the OPUS audio encoder (via Codec2), enabled by default; 3.9.2 fixed an audio-repair watchdog lock-contention issue (audio now self-heals after container restarts). Note: output volume matches host system volume (if container is at 100% but host is at 50%, output is 50%)
+7. **Video hardware codec**: the container has no hardware video codec HAL (redroid architectural limitation) — playback and streaming encode are software-based; the host-side hardware solution source is bundled (`app/hwenc/`) and will ship as an optional plugin
 2. **External network access**: fnOS reverse proxy only passes TCP, WebRTC media stream (UDP) can't pass, auto-downgrades to WebSocket casting
 3. **fnOS APP**: Some versions WebView has limited WebSocket proxy support, recommend mobile browser
 4. **ARM app compatibility**: ARM64 apps with anti-emulator detection or complex JIT may crash (translation layer capability boundary)
