@@ -527,7 +527,7 @@ Cloud Phone officially provides a standalone **Android APP client**, offering a 
 
 ADB 5556 **binds to 127.0.0.1 by default** (security: ADB has no password), accessible from the NAS itself only. To connect from another LAN device (e.g. your PC), first manually open the port:
 
-> ⚠️ **Security note**: the container image is a userdebug build (`ro.debuggable=1`), so **anyone who can reach port 5556 effectively has in-container root** (`adb shell` is root directly, no `su` needed). Open it only when you need to debug, only on a trusted LAN, and **switch `ADB_BIND` back to `127.0.0.1` when you are done**. Never map 5556 to the public internet (see section 7 of the bundled Permission Statement and section 9 of the audit compliance notes below).
+> ⚠️ **Security note**: the container ships with a "fresh-phone profile" — user build, release-keys, `ro.debuggable=0`, no su/magisk; normal apps' root detection will not trigger. adb (port 5556) runs as shell (non-root) but is still a management entry from host into the container — only expose it on a trusted LAN and **switch back to `ADB_BIND=127.0.0.1`** after use; never map 5556 to the public internet.
 
 ### 1. Open ADB Port 5556
 
@@ -630,6 +630,18 @@ Android serial console (`androidboot.console=0`) disabled by default, reducing p
 ### 5. GPU Hardware Acceleration
 
 - **X86 devices**: Auto-detect `/dev/dri`, uses `gpu_mode=host` hardware acceleration when GPU present, 60fps
+
+**GPU platform support matrix** (dual-machine tested + driver source-level conclusions):
+
+| Platform | OpenGL | Vulkan | HW decode | HW encode |
+|---|---|---|---|---|
+| Intel (iHD) | ✅ | ✅ | ✅ | ✅ |
+| AMD amdgpu cards (Polaris+) | ✅ | ✅ | ✅ | ✅ |
+| AMD legacy (radeon KMD, GCN APU) | ✅ | ❌ | ❌ (driver-level; switching to amdgpu KMD resolves it, advanced option) | ✅ |
+| ARM Mali (Panfrost) | ✅ | ✅ | V4L2 route | upstream pending |
+| NVIDIA | ✅ | ✅ | ✅ NVDEC | ✅ NVENC |
+
+> Platforms without HW decode/encode automatically fall back to software; functionality is unaffected with higher CPU usage. Host VAAPI capability is auto-detected at install time (vainfo).
 - **ARM devices**: Auto uses `gpu_mode=guest` software rendering, 60fps (unified high frame rate; low-end devices can revert to 30fps in compose if laggy)
 
 ### 6. Domestic App Optimization 
