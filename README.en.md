@@ -676,6 +676,50 @@ deploy:
 
 ---
 
+## Hardware Passthrough & Acceleration
+
+This app passes the host GPU's graphics and video capabilities straight into the Android container (GPU host mode: `/dev/dri` device passthrough + shared host mesa/driver stack), automatically choosing the route per platform and falling back when unsupported — zero user intervention.
+
+### 1. Video HW decode/encode (three-layer architecture)
+
+```
+In-container player/app -> C2 plugin (forwarding) -> Host daemon (VAAPI/NVDEC) -> GPU hardware
+```
+
+- **Host daemon**: resident after install; talks to hardware via standard VAAPI (covers Intel iHD/i965, AMD radeonsi/r600 backends, auto-detected) and a dedicated NVIDIA route (NVDEC/NVENC + nvidia-vaapi-driver);
+- **In-container C2 plugin**: pure forwarding layer, GPU-brand agnostic — one plugin serves every GPU host;
+- **Auto-detection**: vainfo probes encode (EncSlice/EncPicture) and decode (H264 VLD) at install; hardware routes are enabled only when supported, otherwise the software codecs take over (no black-screen/garble risk).
+
+**Video HW decode/encode support list** (host side, daemon-tested + driver source-level conclusions):
+
+| Host GPU | HW decode | HW encode | Notes |
+|---|---|---|---|
+| Intel iGPU/dGPU (iHD, HD 500-series+) | ✅ | ✅ | newer iGPUs auto-select iHD |
+| Intel legacy iGPUs (i965, HD 2000-series+) | ✅ | some models | same VAAPI standard interface |
+| AMD dGPUs RX 400 ~ RX 7000 (amdgpu) | ✅ | ✅ | RDNA2+ adds AV1 decode |
+| AMD R9 285~390 / R7 260X (switchable to amdgpu) | ✅ | ✅ | grub driver switch required (advanced) |
+| AMD early GCN (R9 270/280 etc., radeon KMD) | ❌ | ✅ | driver-level limitation (source-confirmed) |
+| AMD legacy (HD 2000~6000, TeraScale) | ✅ H264 | some models | old-card UVD path |
+| AMD APUs (Kaveri etc., GCN APU) | ❌ | ✅ | same logic as dGPUs; amdgpu switch fixes decode |
+| NVIDIA (NVDEC/NVENC, GTX 10-series+) | ✅ | ✅ | 1050 Ti verified upstream; full userland driver stack mounted since 3.8.9 |
+| ARM Mali (Panfrost) | V4L2 route (in progress) | upstream pending | graphics rendering tested ✅ |
+
+> The above is host-side capability. The in-container plugin is built per Android major version (Android 12 build ready; 12L/13 producible with the same pipeline). Unsupported combos fall back to software decode — functionality is unaffected with higher CPU usage.
+
+### 2. Audio path (no hardware acceleration needed)
+
+Audio uses Codec2 software encoding (OPUS) — OPUS costs <2% of a single core, and consumer audio hardware has no universal hardware encoder, so audio does not depend on GPU passthrough. 3.8.9 fixed the OPUS init issue with an audio_fix.py daemon (30s patrol auto-restore); the no-audio/connection-crash issues are fully resolved.
+
+### 3. OpenGL / Vulkan passthrough
+
+- **OpenGL (EGL/GLES)**: the container loads the host mesa driver stack directly — Intel/AMD (mesa) ✅, ARM Mali (Panfrost) ✅ tested, NVIDIA via GPU host mode ✅;
+- **Vulkan**: follows the host ICD — ARM Mali (panvk) ✅ verified on the ARM machine; Intel/AMD/NVIDIA per driver support;
+- **No GPU / unsupported platforms**: automatic `swiftshader` software rendering keeps boot and display working (stable since 3.8.x).
+
+### 4. Capability self-check
+
+The status page shows the current GPU mode (hardware/software), VAAPI codec capabilities and the rendering route in real time; the "Fix GPU/Display" button self-heals common passthrough issues.
+
 ## Serial Console (Developer Debugging)
 
 Serial console disabled by default to reduce performance overhead. To enable for debugging:

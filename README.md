@@ -642,19 +642,8 @@ webrtc 信令服务和 TURN 中继服务均以 `nice=-10` 启动（高于默认�
 
 - **X86 设备**：自动检测 `/dev/dri`，有 GPU 时使用 `gpu_mode=host` 硬件加速，60fps
 
-**GPU 平台支持矩阵**（双实机实测 + 驱动源码级结论）：
+> GPU/Vulkan/视频硬编解码的完整支持名单见下方「[硬件直通与硬件加速能力](#硬件直通与硬件加速能力)」章节。
 
-| 平台 | OpenGL | Vulkan | 视频硬解 | 视频硬编 |
-|---|---|---|---|---|
-| Intel（iHD 驱动） | ✅ | ✅ | ✅ | ✅ |
-| AMD amdgpu 卡（Polaris+） | ✅ | ✅ | ✅ | ✅ |
-| AMD legacy（radeon 内核驱动，GCN APU 类） | ✅ | ❌ | ❌（驱动架构性不支持；切 amdgpu 内核驱动可解，进阶选项） | ✅ |
-| ARM Mali（Panfrost） | ✅ | ✅ | 走 V4L2 路线 | 待上游 |
-| NVIDIA | ✅ | ✅ | ✅ NVDEC | ✅ NVENC |
-
-> 不支持硬解/硬编的平台自动回退软解/软渲染，功能不受影响，仅 CPU 占用更高。宿主侧 VAAPI 能力安装时自动检测（vainfo），检测通过才启用硬件路线。
-
-- **ARM 设备**：自动使用 `gpu_mode=guest` 软件渲染，60fps（统一高帧率，低配设备如感觉卡顿可在 compose 中改回 30fps）
 
 ### 6. 国内 APP 专项优化
 
@@ -687,6 +676,52 @@ deploy:
 > 修改后需重启容器生效：`docker compose -f /vol1/@appcenter/androidemu/app/docker/docker-compose.yaml restart`
 
 ---
+
+## 硬件直通与硬件加速能力
+
+本应用将宿主 GPU 的图形与视频能力直接透传给安卓容器（GPU host 模式：`/dev/dri` 设备直通 + 共享宿主 mesa/驱动栈），并按平台能力自动选择路线、自动回退，无需用户干预。
+
+### 1. 视频硬编解码（三层架构）
+
+```
+容器内播放器/应用 → C2 插件（转发层） → 宿主 daemon（VAAPI/NVDEC） → GPU 硬件
+```
+
+- **宿主 daemon**：安装后常驻，通过标准 VAAPI 接口（覆盖 Intel iHD/i965、AMD radeonsi/r600 全部后端，自动探测）与 NVIDIA 专路（NVDEC/NVENC + nvidia-vaapi-driver）对接硬件；
+- **容器内 C2 插件**：纯转发层，与 GPU 品牌无关——一份插件通吃所有 GPU 宿主；
+- **自动探测**：安装时以 vainfo 检测编码（EncSlice/EncPicture）与解码（H264 VLD）能力，检测通过才启用硬件路线，否则自动回退软件编解码器（无黑屏/花屏风险）。
+
+**视频硬编解码支持名单**（宿主侧，daemon 实测 + 驱动源码级结论）：
+
+| 宿主 GPU | 视频硬解 | 视频硬编 | 备注 |
+|---|---|---|---|
+| Intel 核显/独显（iHD 驱动，HD 500 系+） | ✅ | ✅ | 新核显自动走 iHD |
+| Intel 老核显（i965 驱动，HD 2000 系+） | ✅ | 部分型号 | 同走 VAAPI 标准接口 |
+| AMD 独显 RX 400 ~ RX 7000 全系（amdgpu） | ✅ | ✅ | RDNA2+ 连 AV1 解码都支持 |
+| AMD R9 285~390 / R7 260X（可切 amdgpu） | ✅ | ✅ | 需 grub 切驱动（进阶选项） |
+| AMD GCN 早期卡（R9 270/280 等，radeon 驱动） | ❌ | ✅ | 驱动架构性限制（源码级确认） |
+| AMD legacy（HD 2000~6000，TeraScale） | ✅ H264 | 部分型号 | 老卡 UVD 通道 |
+| AMD APU（Kaveri 等 GCN APU） | ❌ | ✅ | 同独显逻辑，切 amdgpu 可解硬解 |
+| NVIDIA（NVDEC/NVENC，GTX 10 系+） | ✅ | ✅ | 上游真机验证 1050Ti；3.8.9 起挂载完整用户态驱动栈 |
+| ARM Mali（Panfrost） | 走 V4L2 路线（对接开发中） | 待上游 | 图形渲染已实测 ✅ |
+
+> 以上为宿主侧能力。容器内插件按安卓大版本分别构建（Android 12 版已就绪，12L/13 同脚本可产出）；不支持硬解/硬编的组合自动回退软解，功能不受影响，仅 CPU 占用更高。
+
+### 2. 音频路径（无需硬件加速）
+
+音频采用 Codec2 软件编码（OPUS）——OPUS 编码对 CPU 占用极低（单核 <2%），音频硬件上不存在通用的硬编码器，因此音频不依赖 GPU 直通。3.8.9 修复了 OPUS 初始化问题并配 audio_fix.py 守护（30 秒巡检自动补回），无声音/连接崩溃问题已根治。
+
+### 3. OpenGL / Vulkan 直通
+
+- **OpenGL（EGL/GLES）**：容器内直接加载宿主 mesa 驱动栈——Intel/AMD（mesa）✅、ARM Mali（Panfrost）✅ 实测、NVIDIA 经 GPU host 模式 ✅；
+- **Vulkan**：跟随宿主 ICD——ARM Mali（panvk）✅ ARM 实机验证、Intel/AMD/NVIDIA 视驱动支持；
+- **无 GPU / 不支持的平台**：自动回退 `swiftshader` 软件渲染保证开机与显示（3.8.x 起稳定运行）。
+
+### 4. 能力自检
+
+状态页实时显示当前 GPU 模式（硬件/软件）、VAAPI 编解码能力、渲染路线；「修复GPU/画面」按钮可一键自助修复常见直通问题。
+
+
 
 ## 串口控制台（开发者调试）
 
