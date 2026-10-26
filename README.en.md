@@ -676,6 +676,27 @@ deploy:
 
 ---
 
+
+## App Compatibility (honest tiers)
+
+This app runs Android apps on an x86_64 container with an ARM translation layer. Compatibility has clear boundaries:
+
+### ✅ Supported
+Most utility, productivity, media and system apps (x86-native or regular ARM translation paths). The mass-crash issue caused by the previous global background restriction has been fixed.
+
+### ⚠️ Partially supported
+- **Slow cold start for large apps**: ARM apps may take 20-40 s to launch on low-end CPUs (translation overhead), then run normally
+- **Apps requiring GMS**: only work when Google services are installed during setup
+
+### ❌ Not supported (known boundaries)
+| Type | Example | Reason |
+|---|---|---|
+| Tinker hotfix framework apps | WeChat, QQ | They extract ARM libs into the data dir at runtime and dlopen directly, bypassing the translation path (requires Intel houdini linker hooks; its runtime adaptation is not yet working) |
+| Anti-emulator apps | Coolapk | Detects the container/emulator and exits |
+| Apps with their own unstable SDKs | Bilibili (some builds) | Its crash-reporting SDK misbehaves in containers |
+
+> These are common boundaries of all x86 Android container solutions (Android-x86 / BlissOS alike). This app targets idle/automation/tool scenarios; social apps are out of scope.
+
 ## Hardware Passthrough & Acceleration
 
 This app passes the host GPU's graphics and video capabilities straight into the Android container (GPU host mode: `/dev/dri` device passthrough + shared host mesa/driver stack), automatically choosing the route per platform and falling back when unsupported — zero user intervention.
