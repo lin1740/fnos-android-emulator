@@ -692,7 +692,7 @@ Most utility, productivity, media and system apps (x86-native or regular ARM tra
 | Type | Example | Reason |
 |---|---|---|
 | Hardened/obfuscated apps | Coolapk (new builds) | Uses NetEase Yidun hardening; its native verification lib fails symbol resolution under translation |
-| Vendor-ecosystem apps | Huawei AppGallery | Login and installation depend on the HMS Core ecosystem (absent on non-Huawei devices) |
+| Pending verification | Huawei AppGallery | Works cross-device on regular phones (no HMS required); container failure cause TBD (suspected hardening/native incompatibility) |
 | Anti-emulator apps | Coolapk | Detects the container/emulator and exits |
 | Apps with their own unstable SDKs | Bilibili (some builds) | Its crash-reporting SDK misbehaves in containers |
 
