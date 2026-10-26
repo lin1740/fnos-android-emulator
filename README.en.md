@@ -682,7 +682,7 @@ deploy:
 This app runs Android apps on an x86_64 container with an ARM translation layer. Compatibility has clear boundaries:
 
 ### ✅ Supported
-Most utility, productivity, media and system apps (x86-native or regular ARM translation paths). The mass-crash issue caused by the previous global background restriction has been fixed.
+Most utility, productivity, media and system apps (x86-native or regular ARM translation paths). The mass-crash issue caused by the previous global background restriction has been fixed; **WeChat (including its Tinker hotfix mechanism) now runs normally after the missing 32-bit ARM library set was added**.
 
 ### ⚠️ Partially supported
 - **Slow cold start for large apps**: ARM apps may take 20-40 s to launch on low-end CPUs (translation overhead), then run normally
@@ -691,7 +691,8 @@ Most utility, productivity, media and system apps (x86-native or regular ARM tra
 ### ❌ Not supported (known boundaries)
 | Type | Example | Reason |
 |---|---|---|
-| Tinker hotfix framework apps | WeChat, QQ | They extract ARM libs into the data dir at runtime and dlopen directly, bypassing the translation path (requires Intel houdini linker hooks; its runtime adaptation is not yet working) |
+| Hardened/obfuscated apps | Coolapk (new builds) | Uses NetEase Yidun hardening; its native verification lib fails symbol resolution under translation |
+| Vendor-ecosystem apps | Huawei AppGallery | Login and installation depend on the HMS Core ecosystem (absent on non-Huawei devices) |
 | Anti-emulator apps | Coolapk | Detects the container/emulator and exits |
 | Apps with their own unstable SDKs | Bilibili (some builds) | Its crash-reporting SDK misbehaves in containers |
 
