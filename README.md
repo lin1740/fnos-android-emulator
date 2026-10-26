@@ -1896,3 +1896,4 @@ OpenGL ES 渲染：主流 ARM SoC（Mali/Adreno/VideoCore）与 x86 AMD/Intel �
 - [redroid 项目] — Android in Docker
 - [穿云投屏 scrcpy-over-webrtc] — WebRTC 画面服务
 - 飞牛 fnOS 开发社区
+- QQ 用户「还得你老汪」— 提供 ARM 实机设备，支持双平台真机测试与适配验证

@@ -1854,3 +1854,4 @@ This application pulls the following public images via Docker at runtime, withou
 - [redroid project] — Android in Docker
 - [Scrcpy scrcpy-over-webrtc] — WebRTC screen service
 - fnOS development community
+- QQ user 「还得你老汪」 (HaiDeNiLaoWang) — provided the ARM test device for dual-platform real-hardware testing
