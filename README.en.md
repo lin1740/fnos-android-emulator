@@ -31,7 +31,6 @@ Based on Android container + Scrcpy over WebRTC (screen service) dual-container 
 - [Tech Stack & Translation Layers](#tech-stack--translation-layers)
 - [Audit Compliance Notes](#audit-compliance-notes)
 - [FAQ](#faq)
-- [Changelog](#changelog)
 - [Known Limitations](#known-limitations)
 - [Feedback Links & Channels](#feedback-links--channels)
 - [Support the Publisher & Contributors](#support-the-publisher--contributors)
@@ -44,56 +43,37 @@ Based on Android container + Scrcpy over WebRTC (screen service) dual-container 
 
 ## Features
 
-- **Android 12 System**: x86_64 architecture, image ships with **libndk_translation** (Google's official NDK translation layer) enabled by default, supports x86_64/arm64-v8a/x86/armeabi-v7a/armeabi ABIs, most ARM apps can be installed and run directly
-- **Browser Remote Control**: No client installation needed, open browser to control Android desktop
-- **Dual Screen Casting Modes**:
-  - WebRTC casting (low latency, high framerate, recommended for LAN)
-  - WebSocket casting (good compatibility, auto-switch for external network/penetration environments)
-- **fnOS Unified Gateway Adaptation**: One-click open via fnOS App Center, auto-inject login state, no secondary login required
-- **ADB Debugging**: `adb connect <NAS_IP>:5556` to connect
-- **File Management**: Manage files directly in the Android container within the Scrcpy interface
-- **Terminal Access**: Built-in Android shell terminal
-- **Serial Console**: Disabled by default to reduce performance overhead, developers can manually enable for debugging (see below)
-- **Scrcpy Agent Integration**: Support connecting multiple Android devices/real phones, unified management
-- **Simplified Chinese + China Timezone**: Container defaults to `zh_CN` + `Asia/Shanghai`
-- **Non-root App Process**: the Go gateway (gateway_amd64/arm64) and other background processes run as the `docker-androidemu` user, compliant with app store audit requirements
-- **X86 / ARM Dual Platform**: Auto-detect architecture and GPU capabilities, X86 uses hardware acceleration, ARM auto-switches to software rendering
-- **Performance Optimization**: webrtc/turn process high-priority scheduling, streamlined background services, CPU dynamic frequency scaling (see below)
-- **60fps High Frame Rate**: Both redroid container and webrtc encoding upgraded to 60fps, encoding long edge 1280, bitrate 4-16Mbps dynamic adjustment, smoother video and more responsive touch/swipe
-- **Safe Installation/Update Interruption**: Auto-cleanup of temporary data if installation or update is cancelled midway, preventing placeholder issues that block future installations 
-- **Auto Container Detection**: Gateway auto-detects Android container status, container automatically comes online after startup, no manual operation needed
-- **Installation Pre-check **: Auto-detects binder driver, memory (<1GB blocks), Docker availability, disk space (<2GB blocks), GPU capability before installation. Gives clear reasons on failure instead of generic "script execution error with unknown reason"
-- **Optional GMS Installation**: Choose whether to install Google Services Framework (GMS) and Google Play Store in the installation wizard. If selected, the system automatically detects architecture (x86_64/arm64) and pulls corresponding files from the GMS image to install into the standard container. If not selected, the system remains pure Android, lightweight and stable
-- **Container Health Check **: Real-time monitoring of boot status, uptime, OOM kills, surfaceflinger/agent processes. Auto-detects "boot timeout", "killed by OOM", "screen service abnormal" etc.
-- **One-Click Fix **: Status page provides three buttons - "Fix GPU/Screen", "Restart Android Container", "Restart Screen Service" - no SSH command line needed for common issues
-- **Friendly Status Page **: When upstream service is unavailable, shows a beautiful status page (container status table, troubleshooting tips, refresh button) instead of plain text "Bad Gateway"
-- **Connection Stability Optimization **: WebSocket auto-reconnect (exponential backoff 1s→30s) + 25s heartbeat keepalive, TURN relay config optimization (no-loopback-peers, bps-capacity, max-allocate-lifetime=3600)
-- **Immersive Fullscreen **: Desktop object-fit:contain, mobile cover, multi-selector compatible with different scrcpy-over-webrtc versions, click fullscreen button for true fullscreen
-- **VAAPI Hardware Codec Dynamic Detection **: Auto-detects GPU VAAPI encoding (vainfo with EncSlice/EncPicture) and decoding (H264 VLD) support, enables hardware acceleration only when supported, auto-fallback to Google software codecs to avoid black screen/garbled video
-- **NVIDIA GPU Support **: Auto-detects NVIDIA GPU and mounts devices and drivers, smart GPU selection priority Intel > AMD > NVIDIA
-- **Dual Translation Layer Auto-Management **: Built-in libndk_translation (default) and libhoudini (auto-download), switch via bind mount over /system/lib*/libnb.so; auto mode detects ARMv8.1 instruction SIGILL crashes and switches to houdini, 5-minute anti-loop restart cooldown
-- **Boot Performance Optimization **: lmkd threshold increased (max 315MB→3072MB) to reduce frequent process kills during boot, dex2oat uses verify-only mode for faster first boot, elevated system_server/surfaceflinger process priority
-- **Domestic App Performance Optimization **: System-level optimizations for high-resource domestic apps (Douyin/Kuaishou etc.): background process limit (4), disable auto-sync/background data/network scanning, CPU/GPU deep optimization, animation half-speed (0.5), lmkd memory management optimization
-- **Go Merged Daemon **: Audio fix + resolution auto-switch merged into single androidemu_daemon process, reducing Go runtime memory footprint (~5-8MB saved)
-- **Optional Resource Limits **: Pre-configured commented CPU/memory limits in docker-compose.yaml, users can enable based on NAS performance
-- **[v3.8.9] seccomp Hardening (Android main container)**: Docker disables the default seccomp filter under `privileged`, yet redroid requires privileged; this release attaches a custom seccomp filter to that container, denying syscalls that would otherwise act on the whole NAS — loading/unloading kernel modules, kexec, `reboot` (would reboot the NAS), swapon/swapoff, changing the system time, and raw I/O port access (`insmod` inside the container now returns Operation not permitted). Verified not to affect boot, casting/audio, ADB or APK installs
-- **[v3.8.9] Security Self-check Artifact**: every deployment writes `security.status` into the app data directory (seccomp state, in-container `su` mode, ADB listen address, SELinux state) for users and reviewers to verify
-- **[v3.8.9] Security Documentation Update**: the bundled Permission Statement now documents the verified SELinux findings (fnOS kernel loads no SELinux LSM — the host uses AppArmor), the scope of the seccomp hardening and the residual risk, with reproducible verification commands
-- **[v3.8.9] Declared Dependency App (binder)**: the manifest now declares `install_dep_apps = binder_linux_driver`, so the App Center page shows a "Dependencies" card and asks the user to install and enable the dependency app "binder_linux" first; if it is missing or disabled, the App Center blocks installing/enabling this app and says so. On x86 and on kernels without built-in binder, that dependency app loads the kernel module and mounts binderfs (fnOS 6.18.18 and later already build binder in; the dependency app then only pulls it up and verifies)
-- **[v3.8.9] WebRTC Network Architecture Fix**: The scrcpy-over-webrtc container is switched from host to bridge network with published port mapping (8443/3478/TURN relay range), fixing the WebRTC ICE handshake failure / device-offline issue caused by the redroid container being unable to reach host ports; the agent connects to signaling/TURN via the container address, and browser-side TLS is terminated by the fnOS unified gateway (USE_TLS disabled inside the container)
-- **[v3.8.9] TURN Relay Range Fixed at 50000-50100**: the relay range stays `50000-50100` (compose `ports` and the in-container `COTURN_MIN_PORT`/`COTURN_MAX_PORT` must match — coturn does no port translation). It **does not change between versions**: the earlier "auto-avoidance / 25000-25099" experiment was reverted because it rewrites the port mapping and breaks port-forwarding rules that existing users already configured. To change it, use `bash scripts/set_ports.sh` and update your router/tunnel accordingly
-- **[v3.8.9] OPUS Audio Encoder Fix (Codec2)**: Enables the Codec2 software codec (debug.stagefright.ccodec=1, c2software=1, restart media service) so the default OPUS codec used by scrcpy-over-webrtc initializes correctly; adds a new audio_fix.py daemon (30-second watchdog auto-reapply), fully fixing no-audio and connection crashes
-- **[v3.8.9] DEFAULT_SETTINGS Single-Quote Fix**: Fixes the docker-compose env var wrapped in single quotes, which made /api/default_settings return invalid JSON and the frontend fail to parse it
-- **[v3.8.9] Security Hardening**: The deploy flow automatically makes the container image's bundled userdebug `su` non-executable (re-applied after every container rebuild); the ADB debug port binds to 127.0.0.1 by default, preventing unauthorized privilege escalation
-- **[v3.8.9] Domestic App Performance Optimization (Runtime-first)**: After deployment, asynchronously runs bg-dexopt-job once (compensating boot-time dex2oat=verify to improve domestic app runtime performance); runs only once per boot, delayed, and never blocks any feature; periodically reclaims app cache when idle
-- **[v3.8.8] Scrcpy-over-WebRTC 0.4.1 Upgrade**: Sync with latest upstream release — fixes headless cloud phone (redroid) connection crashes, strengthens agent stability, smart screen-off frequency reduction, dynamic TURN server allocation for more flexible external network access
-- **[v3.8.8] OPUS Audio Encoder Fix**: Injects OMX.google.opus.encoder config into the redroid container, fixes the default OPUS codec initialization failure that caused no audio and connection crashes; audio now works reliably
-- **[v3.8.8] External Network Notice Auto-Hide**: The "external network access" notice introduced in scrcpy-over-webrtc 0.4.1 has no close button; this version injects JS to auto-detect and fade it out after 3 seconds, no longer blocking the screen
-- **[v3.8.8] TUN Device Support**: Auto-detects and creates host /dev/net/tun device and mounts it into the Android container, compatible with VPN/proxy apps (e.g. enterprise remote access, legitimate VPN services), prevents app crashes due to missing virtual network device
-- **[v3.8.8] Security Tightening**: Testing showed no-new-privileges and ro.secure=1/adb.secure=1/selinux=enforcing break in-container processes and the scrcpy connection, so all were reverted; containers keep only least privilege (webrtc only CAP_SYS_NICE) and the app itself runs non-root
+**System & performance**
+- Android 12 (x86_64) with Google libndk_translation built in; x86/ARM dual-platform auto adaptation
+- 60fps screen casting; GPU acceleration (Intel/AMD/NVIDIA auto-detected, software fallback when absent)
+- Startup optimization: readiness check <=30s, dex precompile, dynamic CPU governor
+- VAAPI HW codec auto-detection (enabled only when supported, sw fallback otherwise)
+- Memory/background optimization (no global background ban, mainstream apps run normally)
 
----
+**Access & control**
+- Browser-based remote control (no client): WebRTC low-latency / WebSocket compatibility, auto-switch
+- fnOS unified gateway integration: one-click from App Center, login state injected
+- ADB debugging (5556), file manager, terminal, serial console (off by default)
+- Cloud-phone agent support for managing multiple devices
 
+**Install & operations**
+- Pre-install checks: binder driver, memory (<1GB blocks), Docker, disk (<2GB blocks), GPU capability
+- Optional GMS install (wizard choice, separate carrier image, auto cleanup; auto retry on failure)
+- Multi-tier domestic mirrors: fnOS CDN -> NJU GHCR -> DaoCloud
+- Interruption-safe install/upgrade (temporary data cleaned on cancel)
+- Container health checks + one-click repair on the status page
+- Connection stability: exponential-backoff reconnect + heartbeat; fixed TURN relay port range
+
+**Security**
+- App itself runs non-root (Go gateway under a low-privilege user)
+- Container "fresh-phone profile": user build, release-keys, ro.debuggable=0, no su/magisk
+- seccomp hardening: blocks kernel module load, kexec, reboot, clock changes affecting the whole NAS
+- Least privilege: webrtc keeps only CAP_SYS_NICE; security.status audit trail generated per deploy
+
+**Compatibility**
+- Dual translation-layer management: libndk_translation by default, houdini selectable per app list
+- Simplified Chinese + China timezone by default; domestic connectivity checking (no false "no network")
+- Optional LAN direct access (container gets a LAN IP so fnOS App can auto-discover the NAS; WAN access unaffected)
 
 ## Port Reference
 
@@ -1655,86 +1635,6 @@ TLS per network mode plus the dedicated toggle (`scripts/net_mode.sh`):
 | `https on` / `https off` | dedicated toggle | Switches TLS on 8443 without changing the mode; persisted in `var/tls.conf` and survives upgrades/port changes |
 
 **Switch back to plaintext**: run `bash scripts/net_mode.sh https off` (proxy mode is always plaintext, TLS terminated upstream). **For warning-free HTTPS**, replace `/app/certs/server.crt|key` with a **real CA-signed certificate matching your domain** (e.g. Let's Encrypt). After a toggle the webrtc container is recreated, the gateway restarts automatically and the agent follows ws/wss; settings persist in `var/tls.conf`.
-
-## Changelog
-
-### 3.9.2
-1. Fixed inconsistency between the app description and actual behavior — removed the outdated "direct LAN connection defaults to plaintext" wording (HTTPS is the default everywhere since 3.9.1)
-2. Improved accuracy of install/upgrade logs — the unified gateway was rewritten in Go in 3.9.1; removed leftover "Python gateway" wording
-3. Added a "video decoding" note — the app description now states that containerized Android uses software decoding (redroid architectural limitation); "hardware decode failed, switched to software" messages from players are normal
-4. Added an "Android version" install wizard step — image first, version dropdown (Android 10-16, default 12), preserved across upgrades; GMS carriers roll out per "version-arch" tag (12 both arches and 11-x86_64 published; uncovered combos skip GMS without blocking)
-5. Added signaling-port self-healing — if port 8443 stops listening while the webrtc container is still running (crashed streaming service), the container is restarted automatically once per boot
-6. Fixed an audio-repair watchdog lock-contention deadlock — after a container restart the Opus encoder repair could stall for minutes (audio connections failing); the watchdog now waits and retries, then runs the idempotent repair without the lock if needed
-7. Fixed dropped supplementary groups after privilege drop — groups are now preserved; fixes audio daemon unable to reach Docker on devices where the app user's primary group is not docker (e.g. ARM), which made restarts permanently report "container not running"
-8. Added a "factory-fresh phone" de-rooted profile (de_root.sh) — removes the bundled su and adjusts build properties to user/release-keys/non-debuggable (idempotent, run by the boot watchdog); root-detection in apps no longer matches; installed apps get no root, management channels unaffected
-9. Added "desktop icon auto-sync" — apps installed via the panel/push no longer land only in the app drawer: the boot watchdog automatically places missing icons on the home screen (idempotent, zero disturbance)
-10. Hardened the houdini translation-layer download chain — added several GitHub accelerator mirrors with automatic failover; fixes ARM apps failing to open/crashing when the mirror rate-limit blocked the automatic translation-layer switch
-### 3.9.1
-1. Fixed net_mode writing network environment variables to the wrong service and silently failing — the five network variables are written back to the `webrtc` service with post-write verification (duplicate keys / missing writes automatically rewritten via awk)
-2. Fixed the gateway still connecting to the upstream in plaintext after HTTPS was enabled on 8443 — the string "USE_TLS=false" inside a compose comment caused misdetection; now only real `environment:` configuration lines are honored (fixed in both Go and Python gateways)
-3. Fixed gateway 503 caused by compose permission tightening — permissions unified to 644 after config writes so the gateway user can read the file
-4. Fixed sporadic gateway Bad Gateway — daemon health checks now do real connectivity probes and stale instances are replaced after upgrades
-5. Fixed empty device list and thumbnails when going through the gateway — the device list now passes through upstream data verbatim and redirect URLs carry the app prefix
-6. Fixed being unable to install/enable due to leftover containers/networks — leftovers from a previous failed install are cleaned automatically before installing, and network deletion is retried on uninstall
-7. Fixed WebRTC handshake failure when accessing over the LAN — LAN IP detection now prefers the default-route source address and no longer writes a docker bridge address into PUBLIC_IP/ICE
-8. Fixed the casting service failing to start on machines where the TURN relay port range is occupied — install/upgrade/network-mode switching now pre-checks the relay range and only relocates to a free range on conflict (container-side ports synced), leaving 50000-50100 untouched when there is no conflict
-9. Fixed the gateway residue sweep misidentifying other daemons as stale gateways — gateway processes are now identified strictly by the gateway executable, so boot_guard and similar daemons are no longer killed
-10. Fixed security.status counting container-internal root processes as host root processes — only host-side processes are counted now (container entrypoint/agent excluded)
-11. Fixed unknown-vendor GPUs never selecting the renderD node and falling back to the card display node — renderD is now preferred even without vendor info (the card node needs DRM master and is a classic cause of corrupted/black frames)
-12. Fixed locale/timezone occasionally not applying — new fix_locale.sh handles it uniformly: corrects when either language or timezone mismatches (previously only language was checked), disables automatic timezone so the network cannot revert it, and defaults to 24-hour format (forced on first setup, later user changes are respected); both boot_guard and agent_autodeploy invoke it, with one attempt per boot
-13. Fixed the gateway keeping the old upstream protocol after a TLS toggle (brief 502 on the App Center entry) — the gateway now restarts on toggle and the agent follows ws/wss automatically; relay-range precheck now respects user-customized ranges and boot patrol no longer re-reads locale every minute
-14. Improved the gateway architecture — rewritten from Python to native Go: more robust streaming relay and WebSocket, lower memory footprint
-15. Improved page consistency — both entries (App Center / direct port) now render identically, fixing container display inconsistencies
-16. Improved the ARM translation-layer strategy — Google's translation layer (ndk) is preferred; on detected translation crashes the container switches to Intel houdini once; if houdini also crashes it falls back and stops switching automatically, no more flip-flopping
-17. Improved direct-access encryption — 8443 direct access now defaults to HTTPS on both LAN and WAN (self-signed certificate, one-time browser confirmation; the agent switches to wss automatically); run `net_mode.sh https off` only if plaintext is required (proxy mode is always plaintext, TLS terminated upstream)
-18. Improved the casting-image version strategy — the image is pinned by digest per app release; upstream pushes to `latest` no longer affect installed users (config and image version always match), and following upstream updates happens via a new app package
-19. Improved GPU compatibility checks — validates the Mesa driver required by each GPU family (Mali/panfrost, Adreno/msm, VideoCore/v3d, Vivante/etnaviv, Tegra, Rockchip, AMD/radeonsi, Intel/iris) and pre-falls back to software rendering when missing to avoid black screens; NVIDIA-only setups without the userspace stack fall back too
-20. Improved device-online self-healing — when the boot guard finds Android booted but no agent in the container and no agent watchdog running, it now launches agent deployment (previously only install/upgrade/startup entries triggered it; manual deployments or a killed watchdog left the device permanently offline)
-21. Added safe config editing — port/network/GPU changes no longer rewrite text directly, preventing broken configs or silently ignored settings (internal editcompose tool, awk kept as fallback)
-22. Added the translation-layer app list — apps on the list run on Intel houdini, everything else stays on Google ndk; both translation layers coexist and each app gets the better fit
-23. Added GPU corruption patrol and manual render switching — boot_guard now keeps watching for rendering-error signatures after boot (dequeueBuffer failures, invalid EGL surfaces, fence timeouts) and falls back to software rendering once past threshold; new scripts/switch_render.sh switches between GPU passthrough and software rendering at any time
-
-> See the "v3.9.1 更新说明" section in the packaged 应用介绍 for details; the App Center "What's new" text shares the same source as this list.
-
-### 3.9.0
-1. Fixed install-wizard port settings having no effect — the web/TURN ports filled in the wizard are now written into the container's real port mappings, so the new ports work right after install
-2. Fixed being unable to connect after changing ports — port changes now also update the app's reverse-proxy port, so both the App Center entry and direct access by the new port work
-3. Fixed data loss when reinstalling after uninstalling with data kept — data volumes became external volumes that are never removed by uninstall; data is restored automatically on reinstall
-4. Fixed incomplete cleanup when choosing to delete images — data volumes and all related images (including accelerator-mirror aliases) are now removed precisely
-5. Fixed upload throughput being halved for large files — the gateway now streams request bodies through as they arrive instead of buffering whole files first; upload speed roughly doubles and memory no longer grows with file size
-6. Fixed the "Paste" bubble popping up on long-press or right-click — native context menus and selection outside input fields are suppressed; inputs still type and paste normally
-7. Fixed system language and timezone not taking effect — when the UI is not Simplified Chinese, the app now sets the locale and restarts the Android framework once so Chinese and UTC+8 apply immediately
-8. Improved resource protection — CPU and memory limits are now computed from the host's actual hardware (high-end machines are not throttled, low-end ones are protected), so a single app under long heavy load can no longer take the containers down
-9. Improved responsiveness and frame pacing — SurfaceFlinger low-latency composition and GPU backpressure are enabled, giving smoother scrolling with fewer dropped frames
-10. Improved security self-check and submission material — security.status now reports host root processes, container privilege and ADB listening state, and the Permissions document maps all 7 fnOS review items
-11. Added port-occupancy pre-check — install now detects occupied ports with localized hints, preventing containers that fail to start due to port-binding failures
-
-### 3.8.9
-
-1. Fixed containers restarting repeatedly — corrupted keystore DB ownership made system_server crash every ~10 seconds ("Phone is starting…" loop); ownership is now repaired with data preserved, corrected before boot without restarting the container
-2. Fixed the UI mismatch between the fnOS unified gateway and direct port 8443 — mobile-responsive styles and fullscreen handling moved into the page itself so both entry points look identical
-3. Fixed APK/file uploads from the file center and terminal — large uploads now handle `Expect: 100-continue` correctly instead of hanging
-4. Fixed the casting container not auto-updating after an app-center upgrade — upgrades now refresh the `:latest` image and run a smoke check
-5. Fixed redroid12 not supporting NVIDIA GPUs — full detection of NVIDIA devices and the user-space driver stack, with a software-rendering fallback when needed
-6. Fixed `redroid_gpu_node` never being written and NVIDIA passthrough lines lingering in software mode — corrected the config write and cleanup logic that could break container creation
-7. Fixed WebRTC handshake failures and devices never coming online — the casting container is back on the bridge network with explicit port mappings
-8. Fixed no audio and connection crashes — the Codec2 software codec is enabled so OPUS initializes properly
-9. Fixed invalid JSON from `/api/default_settings` and leftover daemons after uninstall
-10. Optimized domestic app performance — `bg-dexopt-job` runs asynchronously after boot and app caches are reclaimed when idle
-11. Optimized smoothness — GPU mode now 60fps / 1280 long edge / 10Mbps, with matching downscaling in software mode
-12. Optimized GPU detection — capability-based probing instead of a per-architecture hardcoded decision
-13. Optimized the install/upgrade wizard — first-boot time and startup diagnostics documented, port step removed from upgrades
-14. Optimized the app-center description — trimmed free/third-party paid wording while keeping project links
-15. Added a boot guard — diagnoses startup failures, grants GPU access, and falls back to software rendering with a container rebuild when needed
-16. Added seccomp filtering and a `security.status` self-check file — blocks module loading, host reboot, time changes and similar dangerous syscalls
-17. Added the dependent-app declaration (`install_dep_apps = binder_linux_driver`), the `audio_fix.py` audio daemon and `scripts/set_ports.sh`
-18. Removed the port step from the upgrade wizard — use `scripts/set_ports.sh` instead
-19. Changed the TURN relay range to stay at 50000-50100 — auto-avoidance reverted to avoid breaking existing port forwards
-20. Changed image/version config and container permissions — `runtime.conf` is the single source of truth (Android 12 by default); `su` is non-executable and ADB listens on 127.0.0.1 only
-
-> See the bundled *Application Introduction* ("v3.8.9 更新说明") for details; the app-center "What's new" entry is generated from the same list.
-
----
 
 ## Known Limitations
 
