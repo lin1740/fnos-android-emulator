@@ -1628,6 +1628,9 @@ docker rm -f androidemu-android androidemu-webrtc 2>/dev/null
 ### Q: 支持哪些安卓版本？GMS 支持哪些版本？
 安装向导「安卓系统版本」下拉支持 Android 10~16（默认 12，升级自动保持已选版本）。GMS 按镜像 tag 逐步覆盖：Android 12 双架构已发布（x86_64 为官方源重建）、11-x86_64 已发布（OpenGApps）、arm64 的 10~16 与 x86_64 的 13 载体陆续构建中；未覆盖的版本-架构组合自动跳过 GMS 不阻塞安装。
 
+### Q: 安装了新应用，为什么桌面上看不到？
+A: 本系统使用原生 Android 桌面（Launcher3），**新安装的应用默认只出现在应用抽屉里，不自动添加到主屏**——在桌面空白处**上滑**即可打开应用抽屉找到全部应用，长按应用图标可将其固定到桌面。这是原生桌面的标准行为，后续版本将评估预置桌面布局方案。
+
 ### Q: GPU 加速支持哪些硬件？OpenGL/Vulkan 呢？
 OpenGL ES 渲染：主流 ARM SoC（Mali/Adreno/VideoCore）与 x86 AMD/Intel 均为硬件加速（实测 Mali Panfrost GLES 3.1、AMD radeonsi GLES 3.2）；x86 NVIDIA 装专有驱动时容器内无 DRI 节点，自动回退软件渲染。Vulkan：镜像内置 9 个厂商 HAL（intel/hasvk/radeon/nouveau/panfrost/freedreno/broadcom/virtio/lvp），现代硬件自动启用硬件 Vulkan（实测 Mali Panfrost 激活），旧设备回退软件 Vulkan。视频编解码见上一条（全软件）。
 
