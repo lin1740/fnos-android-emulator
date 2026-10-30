@@ -800,13 +800,14 @@ androidemu goes through **3 core translation/conversion layers** from hardware t
 - Transmits to browser via **WebRTC** (TURN/STUN relay + P2P)
 - Browser decodes and displays; **audio is enabled** (v3.8.9 fix: enables the Codec2 software codec so scrcpy-over-webrtc's default OPUS codec initializes correctly, kept alive by the audio_fix.py watchdog; audio streams reliably)
 
-### Layer 4: ABI Instruction-Set Translation Layer (libndk_translation, enabled by default)
+### Layer 4: ABI Instruction-Set Translation Layer (libndk_translation)
 
-- redroid image ships with **libndk_translation** (Google's official NDK translation solution), implementing ARM-to-x86 binary translation via the Native Bridge mechanism
-- Verified config: `ro.dalvik.vm.native.bridge=libnb.so` (symlink to `libndk_translation.so`)
-- Supported ABIs: `x86_64, arm64-v8a, x86, armeabi-v7a, armeabi` (five architectures, ARM apps run directly)
-- Image does **not** include libhoudini (Intel solution) or QEMU translator (only related property files, not an actual translator)
-- X86 devices: Android x86_64 native + libndk_translation for ARM apps
+- x86 images ship with Google's **libndk_translation**, translating ARM instructions to x86 via the Native Bridge mechanism
+- Current config (Android 12 image): `ro.dalvik.vm.native.bridge=libnb.so` (pointing at `libndk_translation.so`), `ro.enable.native.bridge.exec=1`
+- **Only 64-bit ARM (arm64-v8a) actually works**: the Android 12 image ships only the 64-bit translator; the 32-bit parts of `/system/lib/libndk_translation.so` and `libnb.so` are absent
+- `armeabi-v7a` (32-bit ARM) **installs but cannot run**: the app installs and shows an icon, then fails at launch because the 32-bit translator is missing (`dlopen` reports `is for EM_ARM (40) instead of EM_386`, or the process crashes during init). Apps that only ship 32-bit builds (JD, Xiaohongshu, Toutiao) fall into this category; use a 64-bit APK instead
+- A 32-bit translator does exist elsewhere: the complete 32-bit + 64-bit translator set has been extracted from Google's official **Android 11 (API 30) x86_64** image (`libndk_translation.so`, 22 proxy libs, `lib/arm` and `lib64/arm64` guest libs, `bin/arm{,_64}/linker`, `ndk_translation.rc` and `binfmt_misc` configs), and 32-bit apps (JD, Xiaohongshu) launch normally on an Android 11 container. **Cross-version injection does not work**: putting the Android 11 translator into an Android 12 container boots and installs fine, but app processes crash during init (`SIGSEGV` in `AppProcessPostInit`). This capability is not shipped in the package yet; if you need 32-bit support, select Android 11 in the installer
+- Image does **not** include libhoudini (Intel's other closed-source solution, must be obtained separately) or QEMU translator (only related property files, not an actual translator)
 - ARM devices: Android arm64 native, no translation layer needed
 
 ### Full Data Flow
