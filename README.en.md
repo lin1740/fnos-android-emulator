@@ -680,7 +680,9 @@ Most utility, productivity, media and system apps (x86-native or regular ARM tra
 
 ## Hardware Passthrough & Acceleration
 
-This app passes the host GPU's graphics and video capabilities straight into the Android container (GPU host mode: `/dev/dri` device passthrough + shared host mesa/driver stack), automatically choosing the route per platform and falling back when unsupported — zero user intervention.
+This app passes the host GPU's **graphics** capabilities into the Android container (GPU host mode: `/dev/dri` device passthrough + shared host mesa/driver stack), choosing the route per platform and falling back when unsupported — no user intervention needed.
+
+> **Video HW encode/decode is not available today**: the subsection below records host-side capability findings and a possible future route; it does not mean this app enables hardware video codecs. Current releases do all video playback and streaming encode in software. `app/hwenc/` contains upstream reference source only, not compiled and not started.
 
 ### 1. Video HW decode/encode (three-layer architecture)
 
@@ -688,11 +690,11 @@ This app passes the host GPU's graphics and video capabilities straight into the
 In-container player/app -> C2 plugin (forwarding) -> Host daemon (VAAPI/NVDEC) -> GPU hardware
 ```
 
-- **Host daemon**: resident after install; talks to hardware via standard VAAPI (covers Intel iHD/i965, AMD radeonsi/r600 backends, auto-detected) and a dedicated NVIDIA route (NVDEC/NVENC + nvidia-vaapi-driver);
-- **In-container C2 plugin**: pure forwarding layer, GPU-brand agnostic — one plugin serves every GPU host;
-- **Auto-detection**: vainfo probes encode (EncSlice/EncPicture) and decode (H264 VLD) at install; hardware routes are enabled only when supported, otherwise the software codecs take over (no black-screen/garble risk).
+- **Host daemon** (designed, not enabled): talks to hardware via standard VAAPI (Intel iHD/i965, AMD radeonsi/r600) and a dedicated NVIDIA route (NVDEC/NVENC + nvidia-vaapi-driver); source ships in the package but is not built and does not run;
+- **In-container C2 plugin** (not built): designed as a pure forwarding layer, GPU-brand agnostic; it needs a Codec2 component built on the AOSP side, not just a device node;
+- **Auto-detection** (not implemented): would probe encode (EncSlice/EncPicture) and decode (H264 VLD) with vainfo and fall back to software codecs when unsupported.
 
-**Video HW decode/encode support list** (host side, daemon-tested + driver source-level conclusions):
+**Host-side capability assessment** (from driver behaviour and upstream real-hardware runs — **not a feature this app currently ships**):
 
 | Host GPU | HW decode | HW encode | Notes |
 |---|---|---|---|
@@ -706,7 +708,7 @@ In-container player/app -> C2 plugin (forwarding) -> Host daemon (VAAPI/NVDEC) -
 | NVIDIA (NVDEC/NVENC, GTX 10-series+) | ✅ | ✅ | 1050 Ti verified upstream; full userland driver stack mounted since 3.8.9 |
 | ARM Mali (Panfrost) | V4L2 route (in progress) | upstream pending | graphics rendering tested ✅ |
 
-> The above is host-side capability. The in-container plugin is built per Android major version (Android 12 build ready; 12L/13 producible with the same pipeline). Unsupported combos fall back to software decode — functionality is unaffected with higher CPU usage.
+> The above describes what the host GPU itself can do. The in-container plugin has not been built, so all video currently runs in software — playback still works, only CPU usage is higher. Whether this lands depends on the upstream Codec2 component and the GPU's encode capability; no schedule is set.
 
 ### 2. Audio path (no hardware acceleration needed)
 
@@ -806,7 +808,7 @@ androidemu goes through **3 core translation/conversion layers** from hardware t
 - Current config (Android 12 image): `ro.dalvik.vm.native.bridge=libnb.so` (pointing at `libndk_translation.so`), `ro.enable.native.bridge.exec=1`
 - **Only 64-bit ARM (arm64-v8a) actually works**: the Android 12 image ships only the 64-bit translator; the 32-bit parts of `/system/lib/libndk_translation.so` and `libnb.so` are absent
 - `armeabi-v7a` (32-bit ARM) **installs but cannot run**: the app installs and shows an icon, then fails at launch because the 32-bit translator is missing (`dlopen` reports `is for EM_ARM (40) instead of EM_386`, or the process crashes during init). Apps that only ship 32-bit builds (JD, Xiaohongshu, Toutiao) fall into this category; use a 64-bit APK instead
-- A 32-bit translator does exist elsewhere: the complete 32-bit + 64-bit translator set has been extracted from Google's official **Android 11 (API 30) x86_64** image (`libndk_translation.so`, 22 proxy libs, `lib/arm` and `lib64/arm64` guest libs, `bin/arm{,_64}/linker`, `ndk_translation.rc` and `binfmt_misc` configs), and 32-bit apps (JD, Xiaohongshu) launch normally on an Android 11 container. **Cross-version injection does not work**: putting the Android 11 translator into an Android 12 container boots and installs fine, but app processes crash during init (`SIGSEGV` in `AppProcessPostInit`). This capability is not shipped in the package yet; if you need 32-bit support, select Android 11 in the installer
+- A 32-bit translator does exist elsewhere: the complete 32-bit + 64-bit translator set has been extracted from Google's official **Android 11 (API 30) x86_64** image (`libndk_translation.so`, 22 proxy libs, `lib/arm` and `lib64/arm64` guest libs, `bin/arm{,_64}/linker`, `ndk_translation.rc` and `binfmt_misc` configs), and 32-bit apps (JD, Xiaohongshu) launch normally on an Android 11 container. **Cross-version injection does not work**: putting the Android 11 translator into an Android 12 container boots and installs fine, but app processes crash during init (`SIGSEGV` in `AppProcessPostInit`). This capability is not shipped and not scheduled; the approach above is theoretically workable and would be evaluated in a later release
 - Image does **not** include libhoudini (Intel's other closed-source solution, must be obtained separately) or QEMU translator (only related property files, not an actual translator)
 - ARM devices: Android arm64 native, no translation layer needed
 
@@ -1642,7 +1644,7 @@ TLS per network mode plus the dedicated toggle (`scripts/net_mode.sh`):
 > **About Standalone Docker Container Version**: This project is currently published as an fnOS App Center FPK package. Standalone Docker Compose deployment is not yet available. The standalone Docker container version is planned for release after the app is stable on the App Center. Stay tuned.
 
 1. **Audio**: v3.8.9 has fully fixed the OPUS audio encoder (via Codec2), enabled by default; 3.9.2 fixed an audio-repair watchdog lock-contention issue (audio now self-heals after container restarts). Note: output volume matches host system volume (if container is at 100% but host is at 50%, output is 50%)
-7. **Video hardware codec**: the container has no hardware video codec HAL (redroid architectural limitation) — playback and streaming encode are software-based; the host-side hardware solution source is bundled (`app/hwenc/`) and will ship as an optional plugin
+7. **Video hardware codec**: not available today. The container has no hardware video codec HAL (redroid architectural limitation), so playback and streaming encode are software-based; the host-side reference source is bundled (`app/hwenc/`, not built, not started) and no schedule is set
 2. **External network access**: fnOS reverse proxy only passes TCP, WebRTC media stream (UDP) can't pass, auto-downgrades to WebSocket casting
 3. **fnOS APP**: Some versions WebView has limited WebSocket proxy support, recommend mobile browser
 4. **ARM app compatibility**: ARM64 apps with anti-emulator detection or complex JIT may crash (translation layer capability boundary)

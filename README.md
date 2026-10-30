@@ -677,7 +677,9 @@ deploy:
 
 ## 硬件直通与硬件加速能力
 
-本应用将宿主 GPU 的图形与视频能力直接透传给安卓容器（GPU host 模式：`/dev/dri` 设备直通 + 共享宿主 mesa/驱动栈），并按平台能力自动选择路线、自动回退，无需用户干预。
+本应用把宿主 GPU 的**图形**能力直通给安卓容器（GPU host 模式：`/dev/dri` 设备直通 + 共享宿主 mesa/驱动栈），按平台能力自动选路线、自动回退，无需用户干预。
+
+> **视频硬编解码当前不提供**：本文这一小节记录的是宿主侧能力评估与后续路线，不代表本应用已启用硬件视频编解码。当前版本视频播放与推流编码一律走软件实现，`app/hwenc/` 内只有上游参考源码，默认不编译、不启动。
 
 ### 1. 视频硬编解码（三层架构）
 
@@ -685,11 +687,11 @@ deploy:
 容器内播放器/应用 → C2 插件（转发层） → 宿主 daemon（VAAPI/NVDEC） → GPU 硬件
 ```
 
-- **宿主 daemon**：安装后常驻，通过标准 VAAPI 接口（覆盖 Intel iHD/i965、AMD radeonsi/r600 全部后端，自动探测）与 NVIDIA 专路（NVDEC/NVENC + nvidia-vaapi-driver）对接硬件；
-- **容器内 C2 插件**：纯转发层，与 GPU 品牌无关——一份插件通吃所有 GPU 宿主；
-- **自动探测**：安装时以 vainfo 检测编码（EncSlice/EncPicture）与解码（H264 VLD）能力，检测通过才启用硬件路线，否则自动回退软件编解码器（无黑屏/花屏风险）。
+- **宿主 daemon**（设计，未启用）：通过标准 VAAPI 接口（Intel iHD/i965、AMD radeonsi/r600 后端）与 NVIDIA 专路（NVDEC/NVENC + nvidia-vaapi-driver）对接硬件，源码随包附带，默认不编译、不常驻；
+- **容器内 C2 插件**（未构建）：设计为纯转发层，与 GPU 品牌无关；需要 AOSP 侧构建 Codec2 组件，不是挂个设备节点就能解决的；
+- **自动探测**（未实现）：设计上以 vainfo 检测编码（EncSlice/EncPicture）与解码（H264 VLD）能力，能力不足时回退软件编解码器。
 
-**视频硬编解码支持名单**（宿主侧，daemon 实测 + 驱动源码级结论）：
+**宿主侧能力评估**（基于驱动与上游真机验证，**不是本应用当前已交付的功能**）：
 
 | 宿主 GPU | 视频硬解 | 视频硬编 | 备注 |
 |---|---|---|---|
@@ -703,11 +705,11 @@ deploy:
 | NVIDIA（NVDEC/NVENC，GTX 10 系+） | ✅ | ✅ | 上游真机验证 1050Ti；3.8.9 起挂载完整用户态驱动栈 |
 | ARM Mali（Panfrost） | 走 V4L2 路线（对接开发中） | 待上游 | 图形渲染已实测 ✅ |
 
-> 以上为宿主侧能力。容器内插件按安卓大版本分别构建（Android 12 版已就绪，12L/13 同脚本可产出）；不支持硬解/硬编的组合自动回退软解，功能不受影响，仅 CPU 占用更高。
+> 以上仅描述宿主 GPU 自身具备的能力。容器内插件尚未构建，因此当前所有视频一律软解——不影响播放，只是 CPU 占用更高。后续是否落地取决于上游 Codec2 组件与本机 GPU 编码能力，暂不排期。
 
 ### 2. 音频路径（无需硬件加速）
 
-音频采用 Codec2 软件编码（OPUS）——OPUS 编码对 CPU 占用极低（单核 <2%），音频硬件上不存在通用的硬编码器，因此音频不依赖 GPU 直通。3.8.9 修复了 OPUS 初始化问题并配 audio_fix.py 守护（30 秒巡检自动补回），无声音/连接崩溃问题已根治。
+音频采用 Codec2 软件编码（OPUS）——OPUS 编码对 CPU 占用极低（单核 <2%），音频硬件上不存在通用的硬编码器，因此音频不依赖 GPU 直通。3.8.9 修复了 OPUS 初始化问题并配 audio_fix.py 守护（30 秒巡检自动补回），无声音/连接崩溃问题已不再复现。
 
 ### 3. OpenGL / Vulkan 直通
 
@@ -820,7 +822,7 @@ androidemu 从硬件到浏览器画面共经过 **3 个核心翻译/转换层**�
 - 当前配置（Android 12 镜像）：`ro.dalvik.vm.native.bridge=libnb.so`（指向 `libndk_translation.so`），`ro.enable.native.bridge.exec=1`
 - **实际可用的是 64 位 ARM（arm64-v8a）**：Android 12 的官方镜像只带 64 位翻译层，`/system/lib/libndk_translation.so` 与 `libnb.so` 的 32 位部分均不存在
 - `armeabi-v7a`（32 位 ARM）**能安装但无法运行**：应用可以正常装上、显示图标，启动时因缺少 32 位翻译层失败（`dlopen` 报 `is for EM_ARM (40) instead of EM_386`，或进程初始化阶段崩溃）。京东、小红书、今日头条这类只发 32 位包的应用属于此列，换 64 位安装包即可
-- 32 位翻译层并非无解：已从 Google 官方 **Android 11（API 30）x86_64** 镜像中提取完整的 32 位 + 64 位翻译层（`libndk_translation.so`、22 个 proxy 库、`lib/arm` 与 `lib64/arm64` guest 库、`bin/arm{,_64}/linker`、`ndk_translation.rc` 与 `binfmt_misc` 配置），在 Android 11 容器上实测可正常运行 32 位应用（京东、小红书均可启动）。**跨版本不成立**：把 Android 11 的翻译层塞进 Android 12 容器，能开机、能装包，但应用进程初始化即崩溃（`libndk_translation.so` 的 `AppProcessPostInit` 触发 SIGSEGV）。该能力目前未随包提供，需要 32 位支持时可先在安装向导里选择 Android 11
+- 32 位翻译层并非无解：已从 Google 官方 **Android 11（API 30）x86_64** 镜像中提取完整的 32 位 + 64 位翻译层（`libndk_translation.so`、22 个 proxy 库、`lib/arm` 与 `lib64/arm64` guest 库、`bin/arm{,_64}/linker`、`ndk_translation.rc` 与 `binfmt_misc` 配置），在 Android 11 容器上实测可正常运行 32 位应用（京东、小红书均可启动）。**跨版本不成立**：把 Android 11 的翻译层塞进 Android 12 容器，能开机、能装包，但应用进程初始化即崩溃（`libndk_translation.so` 的 `AppProcessPostInit` 触发 SIGSEGV）。该能力目前不随包提供、也未排期，属于后续评估项——理论上按上面的方式可行，落地要等后续版本
 - 镜像内**不包含** libhoudini（Intel 的另一套方案，闭源，需自行获取）与 QEMU translator（仅有相关属性文件，非实际翻译器）
 - ARM 设备：Android arm64 原生运行，无需翻译层
 
@@ -1620,7 +1622,7 @@ docker rm -f androidemu-android androidemu-webrtc 2>/dev/null
 ```
 
 ### Q: 视频为什么不走硬件解码？播放器提示「硬解失败已切换软解」
-这是容器化安卓的架构性现状，不是故障：redroid 官方镜像内不含硬件视频编解码 HAL，解码器列表里全部是软件实现（`OMX.google.*` / `c2.android.*`），播放器尝试硬解失败后会自动转软解。主流核显设备软解可跑 40~60fps（1080p 级别流畅），抖音、飞牛影视等应用正常使用。硬件编解码已在技术上打通（宿主侧 VAAPI daemon 源码随包附带，见 `app/hwenc/`），待上游发布容器内 Codec2 组件后将以可选插件形式提供。
+这是容器化安卓的架构性现状，不是故障：redroid 官方镜像内不含硬件视频编解码 HAL，解码器列表里全部是软件实现（`OMX.google.*` / `c2.android.*`），播放器尝试硬解失败后会自动转软解。主流核显设备软解可跑 40~60fps（1080p 级别流畅），抖音、飞牛影视等应用正常使用。硬件编解码目前不提供：`app/hwenc/` 里只有上游参考源码，默认不编译不启动；后续是否落地取决于上游 Codec2 组件与设备 GPU 的编码能力，暂不排期。
 
 ### Q: 重启容器或重启 NAS 后，开启音频连接失败 / 没声音
 3.9.1 及之前版本存在音频修复守护的锁竞争缺陷（容器重启后 Opus 编码器修复可能长时间无法执行），3.9.2 已修复：守护会等待重试并在必要时无锁执行修复，容器重启后音频编码器自动恢复。如仍遇到，升级到 3.9.2+ 即愈；也可手动执行 `bash /vol1/@appcenter/androidemu/scripts/audio_watchdog.sh fix` 立即修复。
@@ -1676,7 +1678,7 @@ OpenGL ES 渲染：主流 ARM SoC（Mali/Adreno/VideoCore）与 x86 AMD/Intel �
 > **关于独立 Docker 容器版**：本项目目前以飞牛应用中心 FPK 包形式发布，暂不提供独立 Docker Compose 部署方案。独立 Docker 容器版本计划在应用中心上架稳定后另行提供，敬请期待。
 
 1. **音频**：OPUS 音频编码器（Codec2）自 v3.8.9 起已修复，默认开启；3.9.2 修复了容器重启后音频修复守护锁竞争失效的问题（重启后自动自愈）。注意：音量大小与宿主系统实际音量匹配（容器内设100但宿主系统只设50，则按50输出）
-7. **视频硬件编解码**：容器内不含硬件视频编解码 HAL（redroid 架构限制），视频播放与推流编码均为软件实现；宿主侧硬件方案源码随包附带（`app/hwenc/`），将以可选插件形式提供
+7. **视频硬件编解码**：当前不提供。容器内不含硬件视频编解码 HAL（redroid 架构限制），播放与推流编码一律软件实现；宿主侧参考源码随包附带（`app/hwenc/`，不编译不启动），后续是否落地暂不排期
 2. **外网访问**：飞牛反向代理只透传 TCP，WebRTC 媒体流（UDP）无法通过，自动降级为 WebSocket 投屏
 3. **飞牛 APP**：部分版本 WebView 对 WebSocket 代理支持有限，建议用手机浏览器
 4. **ARM 应用兼容性**：含反模拟器检测或复杂 JIT 的 ARM64 应用可能闪退（属翻译层能力边界）
