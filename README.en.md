@@ -1667,12 +1667,9 @@ TLS per network mode plus the dedicated toggle (`scripts/net_mode.sh`):
 ---
 
 ## Support the Publisher & Contributors
-<img width="4096" height="2926" alt="a61d0506ea65c87e4dd005f21325eda6" src="https://github.com/user-attachments/assets/1ad0e1e8-e03e-4966-a94d-24dff71981ba" />
-
-If you find this app useful or are satisfied with the publisher, please consider supporting via donation to help the publisher and other contributors continue maintaining the app. Any amount or no donation is appreciated; please note "donation" in payment remarks, thanks.
+If you find this app useful or are satisfied with the publisher, visit the official website: https://www.lin1740.de5.net/ , click "Appreciate / Support" and scan the corresponding QR code to complete a donation. Your generous support is much appreciated — it helps the publisher and other contributors continue maintaining the app. Any amount or no donation is appreciated; please note "donation" in payment remarks, thanks.
 Or give a star to support the project.
 
-> Note: Above donation codes are only for this project's maintenance and development support, please do not misappropriate or use for other purposes, thanks for understanding.
 
 ---
 
