@@ -2,7 +2,7 @@
 
 [中文](README.md) | **English**
 
-![version](https://img.shields.io/badge/version-v3.9.2-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
+![version](https://img.shields.io/badge/version-v3.9.4-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
 
 📚 **User Manual & FAQ**: See sections below
 
@@ -71,6 +71,8 @@ Based on Android container + Scrcpy over WebRTC (screen service) dual-container 
 - Least privilege: webrtc keeps only CAP_SYS_NICE; security.status audit trail generated per deploy
 
 **Compatibility**
+
+- Pure 32-bit ARM apps (armeabi-v7a): supported since v3.9.4 with the built-in 32-bit translation bridge and program entry — apps that ship 32-bit-only packages now install and run (previously they crashed on launch)
 - Dual translation-layer management: libndk_translation by default, houdini selectable per app list
 - Simplified Chinese + China timezone by default; domestic connectivity checking (no false "no network")
 - Optional LAN direct access (container gets a LAN IP so fnOS App can auto-discover the NAS; WAN access unaffected)
@@ -84,14 +86,14 @@ This application uses the following ports. Only 8443 is automatically reverse-pr
 | 8443 | TCP | scrcpy-over-webrtc Web UI + signaling | Auto (fnOS reverse proxy) | Requires manual reverse proxy / tunnel |
 | 3478 | TCP+UDP | TURN/STUN relay (required for WebRTC casting) | Auto (host port mapping) | Requires manual port mapping / tunnel |
 | 5556 | TCP | ADB debugging (external adb connect) | **Localhost only by default** (manual open required for LAN) | Requires manual port mapping / tunnel |
-| 50000-50100 | UDP | WebRTC media (TURN relay port range) | Auto (host port mapping) | Must also be forwarded if media goes through TURN relay |
+| 50000-50029 | UDP | WebRTC media (TURN relay port range, narrowed to 30 ports since v3.9.4) | Auto (host port mapping) | Must also be forwarded if media goes through TURN relay |
 
 > **Notes:**
 > - The fnOS App Center `service_port` only declares 8443 for the unified gateway reverse proxy — it does not mean the app only listens on this one port.
-> - Since v3.8.9 the webrtc container is back on the default `bridge` network: 8443/3478/50000-50100 are published via Docker port mapping (`host` mode is deprecated — in practice it broke ICE negotiation for the agent inside the redroid container, leaving devices offline).
+> - Since v3.8.9 the webrtc container is back on the default `bridge` network: 8443/3478/50000-50029 are published via Docker port mapping (`host` mode is deprecated — in practice it broke ICE negotiation for the agent inside the redroid container, leaving devices offline).
 > - ADB 5556 is forwarded by a host socat process to the Android container's port 5555 — not a Docker mapping.
-> - 8443, 3478, and 50000-50100 work automatically on the LAN with no configuration.
-> - **The TURN relay range is fixed at 50000-50100 and never self-adjusts**: compose `ports` and the in-container `COTURN_MIN_PORT`/`COTURN_MAX_PORT` must match (coturn does no port translation), so the range **does not change between versions**. The earlier "auto-avoidance / 25000-25099" experiment was reverted — it rewrites the port mapping and breaks port-forwarding rules existing users already configured. To change it, use `bash /vol1/@appcenter/androidemu/scripts/set_ports.sh` and update your router or tunnel accordingly.
+> - 8443, 3478, and 50000-50029 work automatically on the LAN with no configuration.
+> - **The TURN relay range defaults to 50000-50029 (30 ports) since v3.9.4**: compose `ports` and the in-container `COTURN_MIN_PORT`/`COTURN_MAX_PORT` must match (coturn does no port translation). Reason: each published port keeps 2 resident docker-proxy processes on the host (IPv4+IPv6, ~6.5MB each) — 101 ports cost ~1.3GB of RAM while home use needs only a couple of relay slots; 30 ports still support ~15 concurrent relay sessions. **Legacy default ranges (50000-50100) recorded in old data dirs are migrated automatically on upgrade**; users who set a custom range via `set_ports.sh` keep theirs. When relaying media externally, forward UDP 50000-50029 (or your custom range).
 > - For external access: 8443 goes through a reverse proxy; if using WebRTC casting externally, port 3478 (TCP+UDP) must also be reachable, otherwise you get a black screen or endless loading. If the direct candidates don't work and media switches to TURN relay, UDP 50000-50100 (the coturn relay port range inside the container) must be reachable as well.
 
 
@@ -359,7 +361,7 @@ remote_port = 3478
 
 After configuration, access via `http://<your-domain>:8443`, all features including WebRTC casting, file management, and terminal are available.
 
-> Note: the TURN server (coturn) inside the container relays media over **UDP 50000-50100** (see the port mapping in `docker-compose.yaml`). When the direct ICE candidates (STUN/srflx) are unreachable, media falls back to TURN relay, so that UDP port range must be reachable too (forward the range if your tunnel tool supports port ranges, otherwise use plain port mapping or a firewall/route rule).
+> Note: the TURN server (coturn) inside the container relays media over **UDP 50000-50029** since v3.9.4 (was 50000-50100) (see the port mapping in `docker-compose.yaml`). When the direct ICE candidates (STUN/srflx) are unreachable, media falls back to TURN relay, so that UDP port range must be reachable too (forward the range if your tunnel tool supports port ranges, otherwise use plain port mapping or a firewall/route rule).
 
 **How to fix slow WS casting connection:**
 1. Wait 10-30 seconds patiently, WebRTC will timeout and auto-fallback to WS
