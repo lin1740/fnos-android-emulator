@@ -2,7 +2,7 @@
 
 **中文** | [English](README.en.md)
 
-![version](https://img.shields.io/badge/version-v3.9.2-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
+![version](https://img.shields.io/badge/version-v3.9.4-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
 
 📚 **使用手册与常见问题**：见本文档下方各章节
 
@@ -104,15 +104,15 @@
 | 8443 | TCP | 穿云投屏 Web 界面 + 信令 | 自动可用（飞牛反代） | 需自行配置反向代理/内网穿透 |
 | 3478 | TCP+UDP | TURN/STUN 中继（WebRTC 投屏必需） | 自动可用（宿主端口映射） | 需自行端口映射或内网穿透 |
 | 5556 | TCP | ADB 调试（外部 adb connect） | **默认仅本机可用**（需手动开放后局域网可用） | 需自行端口映射或内网穿透 |
-| 50000-50100 | UDP | WebRTC 媒体流（TURN 中继端口段） | 自动可用（宿主端口映射） | 如经 TURN 中继传媒体则需一并放通本端口段 |
+| 50000-50029 | UDP | WebRTC 媒体流（TURN 中继端口段，3.9.4 起收窄为 30 个端口） | 自动可用（宿主端口映射） | 如经 TURN 中继传媒体则需一并放通本端口段（老版本为 50000-50100，升级自动迁移） |
 
 > **注意**：
 > - 飞牛应用中心的 `service_port` 仅声明 8443，用于统一网关反代，不代表软件只监听这一个端口。
-> - 自 3.8.9 起 webrtc 容器由 `host` 网络模式改回默认 `bridge` 网络：8443/3478/50000-50100 由 Docker 端口映射发布（`host` 模式实测会导致 redroid 容器内 Agent 的 ICE 协商不通、设备不上线，已弃用）。
+> - 自 3.8.9 起 webrtc 容器由 `host` 网络模式改回默认 `bridge` 网络：8443/3478/50000-50029 由 Docker 端口映射发布（`host` 模式实测会导致 redroid 容器内 Agent 的 ICE 协商不通、设备不上线，已弃用）。
 > - ADB 5556 由宿主机 socat 进程转发到安卓容器的 5555，非 Docker 映射。
-> - 8443、3478、50000-50100 在局域网内自动可用，无需配置。
-> - **TURN 中继端口段固定为 50000-50100，不做自动避让**：compose 的 `ports` 与容器内 `COTURN_MIN_PORT/COTURN_MAX_PORT` 必须一致（coturn 不支持端口转换），因此该端口段**不随版本变动**。此前试行的「自动避让 / 25000-25099」方案已撤销——它会改动端口映射，破坏老用户已经配好的路由器转发规则。如需调整，请用 `bash /vol1/@appcenter/androidemu/scripts/set_ports.sh` 统一修改，并同步路由器或穿透工具。
-> - 需要外网访问时，8443 走反向代理即可；WebRTC 投屏若在外网使用，必须同时让 3478（TCP+UDP）可达，否则会黑屏或一直转圈；若两端直连候选不通、媒体改为经 TURN 中继传输，还需让 UDP 中继段（固定 50000-50100）一并可达（容器内 coturn 的中继端口段）。
+> - 8443、3478、50000-50029 在局域网内自动可用，无需配置。
+> - **TURN 中继端口段自 3.9.4 起收窄为 50000-50029（30 个端口）**：compose 的 `ports` 与容器内 `COTURN_MIN_PORT/COTURN_MAX_PORT` 必须一致（coturn 不支持端口转换）。收窄原因：每个已发布端口在宿主常驻 2 个转发进程（IPv4/IPv6 各一、单个约 6.5MB），101 个端口合计约 1.3GB 常驻内存而家用通常只需一两路观看；30 个端口可支持约 15 路并发中继。**老版本数据目录中未定制过的旧默认段（50000-50100）会在升级时自动迁移到新段**，自行用 `set_ports.sh` 指定过端口段的用户不受影响、原段保留；外网如经中继传媒体，需同步放通 UDP 50000-50029（老用户若保留旧段则放通旧段）。如需手动调整，仍用 `bash /vol1/@appcenter/androidemu/scripts/set_ports.sh` 统一修改。
+> - 需要外网访问时，8443 走反向代理即可；WebRTC 投屏若在外网使用，必须同时让 3478（TCP+UDP）可达，否则会黑屏或一直转圈；若两端直连候选不通、媒体改为经 TURN 中继传输，还需让 UDP 中继段（3.9.4 起为 50000-50029，老版本为 50000-50100）一并可达（容器内 coturn 的中继端口段）。
 
 
 
@@ -329,7 +329,7 @@ http://<NAS_IP>:8443
 如果你有公网 IP 或使用内网穿透（如 frp、ZeroTier、Tailscale 等）：
 - ✅ 将 8443 端口映射到外网，可直接使用 WebRTC 投屏
 - ✅ 需要在「投屏设置」中将「外网访问地址（WebRTC 媒体流）」设置为你的公网域名或 IP
-- ✅ TURN 中继服务器已内置，确保 UDP 3478 端口可达；若媒体需要经 TURN 中继传输（直连候选不通时的兜底路径），还需一并放通 UDP 50000-50100（中继端口段）
+- ✅ TURN 中继服务器已内置，确保 UDP 3478 端口可达；若媒体需要经 TURN 中继传输（直连候选不通时的兜底路径），还需一并放通 UDP 50000-50029（中继端口段，3.9.4 起收窄）
 
 #### 外网访问专项说明（重要）
 
@@ -360,7 +360,7 @@ remote_port = 3478
 
 配置后通过 `http://<你的域名>:8443` 访问，WebRTC 投屏、文件管理、终端等全部功能可用。
 
-> 补充：容器内的 TURN（coturn）中继端口段为 **UDP 50000-50100**（见 `docker-compose.yaml` 的端口映射）。两端直连候选（STUN/srflx）不通时，媒体会改走 TURN 中继，此时需让该 UDP 端口段同样可达（frp 等工具若支持端口段可直接转发；不支持时可做端口映射或路由放行）。
+> 补充：容器内的 TURN（coturn）中继端口段为 **UDP 50000-50029**（3.9.4 起收窄，老版本为 50000-50100）（见 `docker-compose.yaml` 的端口映射）。两端直连候选（STUN/srflx）不通时，媒体会改走 TURN 中继，此时需让该 UDP 端口段同样可达（frp 等工具若支持端口段可直接转发；不支持时可做端口映射或路由放行）。
 
 **WS 投屏连接慢的解决方法：**
 1. 耐心等待 10-30 秒，WebRTC 超时后会自动回退到 WS
@@ -657,6 +657,8 @@ deploy:
 
 ### ✅ 支持（正常运行）
 
+纯 32 位 ARM 应用（armeabi-v7a）：自 3.9.4 起内置 32 位翻译桥与程序入口，只提供 32 位安装包的应用可直接安装运行（此前这类应用一启动即闪退）
+
 绝大多数工具类、办公类、影音类、系统类应用（x86 原生或 ARM 翻译常规路径均可运行）。此前版本因全局后台限制导致的大面积闪退已修复；**微信（含 Tinker 热修复机制）在补齐 32 位 ARM 库集后已可正常运行**。
 
 ### ⚠️ 部分支持（可运行但体验受限）
@@ -883,7 +885,7 @@ WebRTC 接收 H.264 流 ←── TURN/STUN 中继 ←── scrcpy 编码 ←�
 | 8443 | TCP | WebRTC 信令+画面 | 账号登录 |
 | 3478 | TCP/UDP | TURN 中继 | TURN 凭据 |
 | 5556 | TCP | ADB 调试 | 默认仅本机，需手动开放 |
-| 50000-50100 | UDP | WebRTC 媒体流 | 会话级鉴权 |
+| 50000-50029 | UDP | WebRTC 媒体流 | 会话级鉴权 |
 
 - 应用侧不做任何自动端口映射（无 UPnP/打洞），公网暴露由用户自行决定
 - 各端口均有独立鉴权机制
@@ -1631,7 +1633,7 @@ docker rm -f androidemu-android androidemu-webrtc 2>/dev/null
 容器内系统层以 root 运行（容器化安卓的技术必需，仅限容器命名空间内），但 3.9.2 起自动应用「新手机」去 root 画像：删除镜像自带 su、构建属性调整为 user/release-keys/非 debuggable（开机巡检自动执行、重启持久）。绝大多数应用的 root 检测（找 su 文件/Magisk 特征）不会命中；对安装的应用不提供 root；宿主侧无任何 root 常驻进程。
 
 ### Q: 支持哪些安卓版本？GMS 支持哪些版本？
-安装向导「安卓系统版本」下拉支持 Android 10~16（默认 12，升级自动保持已选版本）。GMS 按镜像 tag 逐步覆盖：Android 12 双架构已发布（x86_64 为官方源重建）、11-x86_64 已发布（OpenGApps）、arm64 的 10~16 与 x86_64 的 13 载体陆续构建中；未覆盖的版本-架构组合自动跳过 GMS 不阻塞安装。
+自 3.9.4 起**安装向导不再提供「安卓系统版本」选择，系统固定为 Android 12**（12 的适配与验证最充分；除 12 外的版本未经充分适配，不应向用户暴露）。GMS 载体镜像当前仅提供 Android 12 双架构（x86_64 为官方源重建），与固定版本一致；本仓库中其余版本的 GMS 载体保留备用，未来若恢复版本选择可直接启用。
 
 ### Q: 安装了新应用，为什么桌面上看不到？
 3.9.2 起会自动补：开机巡检每 60 秒对比已安装的第三方应用与桌面（Launcher3 `favorites`），发现有应用没上桌面就自动补一格（4×4 网格找空位，不改动已有布局）。所以面板或 ADB 装完应用后，最多 1 分钟图标就会出现在主屏。两种例外：一是桌面网格已经排满，脚本会停手并写日志（`/vol1/@appdata/androidemu/app_desktop.log`），腾出位置后下一轮自动补；二是启动器被系统回收、巡检刚好没赶上，等下一轮即可。仍看不到时可在桌面上滑打开应用抽屉，或长按抽屉里的图标手动固定到桌面。
@@ -1658,7 +1660,7 @@ OpenGL ES 渲染：主流 ARM SoC（Mali/Adreno/VideoCore）与 x86 AMD/Intel �
 - **redroid 容器不能强制 selinux=enforcing**：Docker 容器共享宿主机内核，容器内 SELinux 策略不完整，强制 enforcing 会拦截系统服务，导致容器崩溃、内存掉到 0B；保持默认 Disabled 是上游 redroid 的标准配置
 - **redroid 容器不能 ro.secure=1/adb.secure=1**：会影响穿云投屏通过 ADB 连接安卓容器，导致设备不在线；保持默认 ro.secure=0 是 redroid 容器的标准配置
 - **webrtc 容器不要用 host 网络模式**：3.8.8 曾因「bridge 容器 → 宿主局域网 IP 被 fnOS 拦截」改用 host，但实测 host 模式下 redroid 容器内的 Agent 只能经网桥网关连信令/TURN，ICE 协商路径不通（表现为 WebRTC 握手失败、设备不上线）；3.8.9 已改回 bridge，由宿主端口映射提供 8443/3478/TURN 中继段（固定 50000-50100），Agent 用 compose 服务名 `webrtc` 直连
-- **TURN 中继端口段刻意保持 50000-50100（虽然它落在系统临时端口段内）**：3.8.9 开发期曾把中继段改成 25000-25099 并加「自动避让」，理由是 Linux 临时端口段默认 32768-60999，只要 NAS 上任何进程的一个出网 UDP 连接用到段内端口（实测某 ARM NAS 上 `pxy` 占着 50054/UDP），Docker 逐端口绑定就会失败、整个 webrtc 容器停在 Created 起不来（现象是「装好了但设备一直不上线」，`docker ps` 里容器状态还不像崩溃）。**但该改动已撤销**：改端口段会改动 compose 的端口映射，直接破坏老用户已经配好的路由器转发/穿透规则，代价远大于收益。因此最终决定是**固定 50000-50100、不自动避让**，并在文档中如实说明该风险；确实撞端口时用 `scripts/set_ports.sh` 手动改，并同步路由器。同理，compose 的 `ports` 与容器内 `COTURN_MIN_PORT/COTURN_MAX_PORT` 必须同步改（coturn 不支持端口转换）
+- **TURN 中继端口段的选取曾刻意保持 50000-50100 不避让（3.9.4 起默认段已收窄为 50000-50029，历史原因保留此记录）**：3.8.9 开发期曾把中继段改成 25000-25099 并加「自动避让」，理由是 Linux 临时端口段默认 32768-60999，只要 NAS 上任何进程的一个出网 UDP 连接用到段内端口（实测某 ARM NAS 上 `pxy` 占着 50054/UDP），Docker 逐端口绑定就会失败、整个 webrtc 容器停在 Created 起不来（现象是「装好了但设备一直不上线」，`docker ps` 里容器状态还不像崩溃）。**但该改动已撤销**：改端口段会改动 compose 的端口映射，直接破坏老用户已经配好的路由器转发/穿透规则，代价远大于收益。因此最终决定是**固定 50000-50100、不自动避让**，并在文档中如实说明该风险；确实撞端口时用 `scripts/set_ports.sh` 手动改，并同步路由器。同理，compose 的 `ports` 与容器内 `COTURN_MIN_PORT/COTURN_MAX_PORT` 必须同步改（coturn 不支持端口转换）
 - **FPK 顶层 `scripts/` 目录飞牛不会部署**：实测该机器上 30+ 个应用的安装目录结构都是 `cmd/ config/ etc→ home→ ICON* LICENSE manifest meta→ target→ tmp→ var→ wizard/`，没有 `scripts/`。历史上我们放在 FPK 顶层 `scripts/` 的 Go 版统一守护与 supervisor **从未落地过**（cmd/main 每次启动只记一句「未找到脚本」），3.8.9 起已把这些二进制移出包并清理启动入口；要发布可执行文件必须放进 `app/`（会随 `app.tgz` 落到 `${TRIM_APPDEST}/`）
 - **OPUS 编码器靠 Codec2 启用**：redroid 镜像内 opus 库（/system/lib64/libcodec2_soft_opusenc.so）与 swcodec 的 c2.android.opus.encoder 均存在，但默认未启用 Codec2 软件编解码器；3.8.9 通过 setprop debug.stagefright.ccodec=1 + c2software=1 并重启 media 服务启用（无需再注入 OMX 别名，旧的 media_codecs_google_audio.xml 方案已弃用）
 - **privileged 下 cap_drop 无效，seccomp 才是可用的收敛手段**：实测 `privileged: true` + `cap_drop` 时容器内 CapEff 仍是全量 `0x1ffffffffff`（Docker 记录 CapDrop 但不生效），因此无法用减能力的方式给 privileged 容器收窄权限；但 `security_opt: seccomp=<profile>` 在 privileged 下**会生效**（容器内 `Seccomp: 2`），3.8.9 即用此方式屏蔽内核模块加载/kexec/reboot/swap/改时间等调用
