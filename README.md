@@ -41,18 +41,6 @@
 
 
 
-## 3.9.8 更新内容
-
-1. 修复了卸载时勾选「删除数据」后安卓数据实际未被删除、重装后旧数据再次出现的问题
-2. 修复了安装与升级过程中会多出同名前缀临时容器的问题
-3. 修复了低版本无法通过应用中心升级、提示端口被占用或容器名冲突而中止的问题
-4. 修复了应用停用后画面服务仍被守护拉起、短时间内继续可访问的问题
-5. 修复了虚拟机等无真实 GPU 环境下仍启用 GPU 直通，导致安卓无法开机、面板长期无设备的问题
-6. 修复了渲染回退标记过期后开机卡住无法自动恢复，以及卸载日志随数据一起被删除的问题
-7. 优化了保留数据卸载重装的耗时，不再重复下载 ARM 系统库集；同步修正了安装向导中分辨率默认值与下载进度的说明文案
-
----
-
 ## 功能特性
 
 **系统与性能**
@@ -1382,7 +1370,7 @@ A: 正常 Android 12 启动后内存应在 300MB 以上（单个安卓容器内�
 
 > ⚠️ **先看自动诊断，不要用 `docker logs` 排查**：本应用为省性能关闭了串口控制台（`androidboot.console=0`），因此 **`docker logs androidemu-android` 恒为空是正常的**（实测 0 字节、0 行），`docker logs | grep error` 只会一片空白——这不是故障，也不是"没有日志"。真实启动日志只存在于容器内 logcat。
 > **3.8.9 起新增「开机守护」**（`scripts/boot_guard.sh`）：持续巡检 boot 状态，把诊断（含真实 logcat 证据）写入 `/var/apps/androidemu/var/boot_diag.status`；**并在有明确 GPU/DRM 崩溃证据时自动回退软件渲染并重建容器**（一次性），通常无需人工干预。
-> **3.9.8 起健全了 GPU 检测**：安装时读取 `/sys/class/drm/card*/device/uevent` 的 `DRIVER`，识别到虚拟显卡（`vmwgfx` / `virtio_gpu` / `bochs` / `simpledrm` / `qxl` / `cirrus` / `vboxvideo` 等）或占位节点时**直接预置软件渲染**，不再进入 GPU 直通；开机守护在 90 秒内发现 `surfaceflinger` 反复重启也会提前回退。旧版本残留的「已回退」标记现在会与当前渲染模式做一致性校验，不会再挡死自愈。
+> **GPU 检测**：安装时读取 `/sys/class/drm/card*/device/uevent` 的 `DRIVER`，识别到虚拟显卡（`vmwgfx` / `virtio_gpu` / `bochs` / `simpledrm` / `qxl` / `cirrus` / `vboxvideo` 等）或占位节点时**直接预置软件渲染**，不再进入 GPU 直通；开机守护在 90 秒内发现 `surfaceflinger` 反复重启也会提前回退。旧版本残留的「已回退」标记现在会与当前渲染模式做一致性校验，不会再挡死自愈。
 
 **1. 确认启动状态：**
 ```bash
@@ -1618,9 +1606,8 @@ sudo rm /tmp/你的应用.apk
 
 ### Q: 如何卸载
 
-A: 在飞牛应用中心点击「卸载」，向导里可勾选**「删除数据」**（3.9.8 起已确保真正生效）：勾选后安卓数据卷、应用数据目录与容器会被彻底清除，卸载日志保留在 `/tmp/androidemu-uninstall.log` 便于事后排查；不勾选则保留安卓数据，下次重装继续使用，且 32 位 ARM 系统库集会一并保留复用，无需重新下载。
+A: 在飞牛应用中心点击「卸载」，向导里可勾选**「删除数据」**：勾选后安卓数据卷、应用数据目录与容器会被彻底清除，卸载日志保留在 `/tmp/androidemu-uninstall.log` 便于事后排查；不勾选则保留安卓数据，下次重装继续使用，且 32 位 ARM 系统库集会一并保留复用，无需重新下载。
 
-> 3.9.8 之前，卸载回调以包用户身份运行，删不掉容器 root 写入的文件，「删除数据」会静默失败并留下旧数据；该问题已修复。
 
 ### Q: 安装/更新中途取消后无法重新安装
 
@@ -1652,7 +1639,7 @@ docker rm -f androidemu-android androidemu-webrtc 2>/dev/null
 
 ### Q: GPU 加速支持哪些硬件？OpenGL/Vulkan 呢？
 
-> **3.9.8 起**：虚拟显卡（VMware SVGA / virtio-gpu / VirtualBox 等）及无真实 DRM 驱动的环境不再尝试 GPU 直通，安装阶段直接切换软件渲染（swiftshader，30fps / 长边 960），避免 `surfaceflinger` 反复崩溃导致安卓无法开机、面板长期 0 台在线。
+> 虚拟显卡（VMware SVGA / virtio-gpu / VirtualBox 等）及无真实 DRM 驱动的环境不再尝试 GPU 直通，安装阶段直接切换软件渲染（swiftshader，30fps / 长边 960），避免 `surfaceflinger` 反复崩溃导致安卓无法开机、面板长期 0 台在线。
 OpenGL ES 渲染：主流 ARM SoC（Mali/Adreno/VideoCore）与 x86 AMD/Intel 均为硬件加速（实测 Mali Panfrost GLES 3.1、AMD radeonsi GLES 3.2）；x86 NVIDIA 装专有驱动时容器内无 DRI 节点，自动回退软件渲染。Vulkan：镜像内置 9 个厂商 HAL（intel/hasvk/radeon/nouveau/panfrost/freedreno/broadcom/virtio/lvp），现代硬件自动启用硬件 Vulkan（实测 Mali Panfrost 激活），旧设备回退软件 Vulkan。视频编解码见上一条（全软件）。
 
 ### 技术说明与开发踩坑
