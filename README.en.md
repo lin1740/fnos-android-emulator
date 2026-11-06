@@ -41,18 +41,6 @@ Based on Android container + Scrcpy over WebRTC (screen service) dual-container 
 
 
 
-## What's new in 3.9.8
-
-1. Fixed: choosing "Delete data" on uninstall did not actually remove Android data, so old apps/accounts reappeared after reinstall.
-2. Fixed: install/upgrade left extra `<hash>_androidemu-*` temporary containers behind.
-3. Fixed: upgrading from an older version was blocked by a false port-conflict / container-name-conflict check.
-4. Fixed: the screen service was pulled back up by the watchdog right after the app was disabled.
-5. Fixed: virtual GPUs (no real hardware) still enabled GPU passthrough, leaving Android unbootable and the device list empty.
-6. Fixed: stale software-render markers could block boot recovery; uninstall logs were deleted together with the data directory.
-7. Improved: reinstalling with data retained no longer re-downloads the ~100MB ARM system libs; wizard text for the default phone resolution and download progress was corrected.
-
----
-
 ## Features
 
 **System & performance**
@@ -1349,7 +1337,7 @@ A: **v3.7.0+ users**: Open the app page. If the upstream service is temporarily 
 
 ### Q: Android container memory is very low (<300MB), device stays offline
 
-> **Since 3.9.8**: virtual GPUs (vmwgfx / virtio_gpu / qxl / cirrus / simpledrm, etc.) are detected at install time and software rendering is selected up front; the boot guard also falls back within 90 seconds if `surfaceflinger` keeps restarting. Stale fallback markers are validated against the current render mode.
+> Virtual GPUs (vmwgfx / virtio_gpu / qxl / cirrus / simpledrm, etc.) are detected at install time and software rendering is selected up front; the boot guard also falls back within 90 seconds if `surfaceflinger` keeps restarting. Stale fallback markers are validated against the current render mode.
 
 A: A normal Android 12 should use 300MB+ after boot. If the container is running but memory is only 100-200MB, Android has not finished booting (`boot_completed != 1`), so the agent cannot be deployed and the device never comes online. Troubleshoot:
 
