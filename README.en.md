@@ -888,15 +888,16 @@ Browser display ←──── fnOS Gateway ←──── Docker Container �
 
 ## Container Privilege Level (chosen in the install wizard)
 
-Step 2 of the install wizard, "Privilege Level", lets the user pick how tightly high-risk operations are constrained inside the container. Default is "Required only":
+Step 2 of the install wizard, "Privilege Level", lets the user pick a runtime level. Default is "Required only":
 
 | Level | Content | For |
 |---|---|---|
+| **No root** (strictest) | After install the Android container is **not created and not started**: no privileged container, no in-container root, no root process on the host. The panel still opens, but the phone feature is unavailable (the panel states it is running in no-root mode). Switching back requires a reinstall | When you need proof the app can run with zero root |
 | **Required only** (default) | Keeps the custom seccomp filter: blocks loading/unloading kernel modules, `kexec`, rebooting the host, toggling swap, changing system time, and direct IO port access. Normal Android use (boot, streaming, audio, ADB, installing apps, gaming) is unaffected | Almost everyone |
 | **Full** | Lifts the above filter (`seccomp=unconfined`); those high-risk operations become available inside the container | Debugging on a NAS you own, when you know the consequences |
 
 - The choice is stored in `/vol1/@appdata/androidemu/root-level` and honoured on upgrade and every start — it is not reset by reboots. To change it, reinstall and pick again.
-- **Either way the Android container runs with Docker privileged mode** — a hard requirement of redroid: in an unprivileged container `/sys` is read-only and `system_server`, `installd`, `netd` crash immediately, so Android never boots (measured; even with all capabilities and all devices granted). The wizard states this explicitly and tells users to abort the install if they don't accept it.
+- **With "No root" the Android container is never created**, so no privileged container and no in-container root exist. With the other two levels the Android container must run with Docker privileged mode — a hard requirement of redroid: in an unprivileged container `/sys` is read-only and `system_server`, `installd`, `netd` crash immediately, so Android never boots (measured; even with all capabilities and all devices granted). The wizard states this explicitly and tells users to abort the install if they don't accept it.
 - This app **does not request host root**: it runs as `run-as=package`, and no host-side process of this app runs as root; install, upgrade and uninstall never create any temporary root container (data removal happens inside the app's own Android container and is finished by the package user; GPU device-node permissions are relaxed inside that same container, without touching host device permissions and without any extra container). Root inside the container lives only in that container's namespace and is unrelated to host root.
 - Verify afterwards: `docker exec androidemu-android grep Seccomp /proc/1/status` — `Seccomp: 2` for "Required only", `Seccomp: 0` for "Full".
 
