@@ -925,6 +925,16 @@ The last two rows are processes **inside the container namespace**, not on the h
 
 **If you need zero in-container root**: pick "No root" in step 2 of the wizard. The Android container is then never created, so there is no privileged container and no in-container root at all; the panel still opens and states it is in no-root mode.
 
+**Comparison with sibling apps (already published under the same account)**
+
+| App | `run-as` | Containers | In-container root processes |
+|---|---|---|---|
+| Scrcpy-over-WebRTC (cloudphone) 0.4.3, published | `package` | one `webrtc` container, not privileged | 1: `/bin/bash /custom-entrypoint.sh` (PID1); coturn and signaling run as `appuser` |
+| OpenCode 1.19.x, published | `package` | none (CLI + unix socket) | 0 |
+| This app | `package` | `android` (privileged, required by redroid) + `webrtc` (not privileged) | same single `webrtc` PID1; inside `android`, Android system services (init/netd/vold/installd/ueventd/storaged/zygote), unavoidable when running Android |
+
+The difference is product shape: the first two do not run an Android userspace, so they have no Android system processes. This app does, and `init`/`netd`/`vold` must start as root. The app itself and all of its helper processes (gateway, supervisors, streaming agent, dexopt scheduling) are non-root on the host.
+
 ---
 
 ## Container Privilege Level (chosen in the install wizard)
