@@ -115,6 +115,40 @@ This application uses the following ports. Only 8443 is automatically reverse-pr
 >
 > **Architecture Compatibility**: x86_64 has been thoroughly tested on fnOS. ARM64 (aarch64) is adapted at the code level (auto software rendering, in-container binderfs, architecture detection), but due to limited test devices, ARM users are advised to monitor boot status after installation. Feedback is welcome via the channels below.
 
+### Resource Allocation (computed from host hardware at install time)
+
+CPU and memory limits for the Android container and the streaming container are not fixed values — they are recalculated on install, upgrade and every start:
+
+**CPU (redroid)**
+- 2 cores or fewer: `cpus = core count` (no extra cap, give Android everything available)
+- 3 cores or more: `cpus = core count − 1` (reserve one core for fnOS and the streaming service)
+- Streaming container: `cpus = cores ÷ 2` (minimum 1)
+
+**Memory (redroid)**
+
+| Step | Rule |
+|---|---|
+| Baseline | total RAM × 65% |
+| Host reserve | 3GB when total RAM < 12GB; 4GB when ≥ 12GB |
+| Take smaller | min(baseline, total − reserve) |
+| Floor / ceiling | no less than 2048MB, no more than 12288MB |
+
+Typical results:
+
+| Host | Android container | Streaming | Notes |
+|---|---|---|---|
+| 2C / 4GB | 2C / 2048MB | 1C / 768MB | boots, but heavy apps lag |
+| 4C / 8GB | 3C / 4750MB | 2C / 768MB | fine for daily use |
+| 8C / 16GB | 7C / 10316MB | 4C / 768MB | comfortable |
+| 16C / 32GB | 15C / 12288MB (capped) | 8C / 768MB | Android can't use more |
+
+**What happens below the minimum (measured, not guessed)**
+- **Fewer than 2 cores / virtualization disabled**: Docker refuses to create the container. Typical error: `range of CPUs is from 0.01 to 2.00, as there are only 2 CPUs available` — meaning the resource tuner did not apply and compose still has the template fallback `cpus: "3.0"`. Fix: edit `/vol1/@appcenter/androidemu/docker/docker-compose.yaml`, change `cpus: "3.0"` to `"2.0"` (or delete the line), then retry from App Center.
+- **2GB RAM**: Android is clamped to the 2048MB floor and the host has no headroom. Symptoms: boot takes over 5 minutes, apps freeze on switching, installed apps get killed by lmkd repeatedly, container gets OOM-killed and restarted (watch `RestartCount` in `docker inspect`).
+- **4GB RAM**: boots and works, but with other fnOS services or GMS installed, long sessions may see app crashes.
+- **Less than 4GB free disk**: image ~2GB plus Android data 1.5~2GB; insufficient space causes pull failures or `no space left on device`.
+- **ARM devices**: always software rendering (30fps / 960 long edge); low-end ARM boxes (2GB) only run light apps.
+
 ---
 
 ## Installation Methods
@@ -138,14 +172,31 @@ This application uses the following ports. Only 8443 is automatically reverse-pr
 2. Select "Manual Install" in fnOS App Center, upload fpk file
 3. Wait for installation and image pull to complete
 
-### Image Acceleration
+### Image Acceleration (multi-source fallback)
 
-Installation automatically tries image sources in this order:
-1. fnOS mirror `docker.fnnas.com`
-2. DaoCloud free mirror `docker.m.daocloud.io`
-3. Docker Hub official repository
+Both the Android container image and the streaming image are **no longer tied to a single image name**. On install/upgrade the script first benchmarks the mirrors below, pulls from the fastest one, and falls back to the next on failure:
 
-If all fail, configure image accelerator (registry-mirrors) in fnOS Docker settings and retry.
+| Order | Mirror | Notes |
+|---|---|---|
+| 1 | `docker.fnnas.com` | fnOS official CDN, fastest in CN, occasional 401 |
+| 2 | `docker.m.daocloud.io` | DaoCloud free mirror, stable but rate-limited |
+| 3 | `docker.1ms.run` | third-party accelerator |
+| 4 | `docker.aityp.com` | third-party accelerator |
+| 5 | `dockerproxy.net` | third-party proxy |
+| 6 | `docker.xuanyuan.me` | third-party proxy |
+| 7 | `docker.io` | usually unreachable in CN, last resort |
+
+**The same image exists locally under several names (tag aliases)** — intentional, and they share one image ID, so no extra disk usage:
+
+| Purpose | Android container image | Streaming image |
+|---|---|---|
+| Mirror-normalized name | `docker.fnnas.com/redroid/redroid:12.0.0-latest` | `docker.fnnas.com/buutuu/scrcpy-over-webrtc:latest` |
+| Upstream name | `redroid/redroid:12.0.0-latest` | `buutuu/scrcpy-over-webrtc:latest` |
+| Local cache name | `androidemu-cache/redroid:12` | `androidemu-cache/webrtc:latest` |
+
+- Why keep several names: each pull is tagged with the mirror that served it, so you can tell where an image came from when troubleshooting; upgrade/rollback/uninstall match names exactly so other apps' images are never touched; if one mirror dies you can start from another alias without re-downloading.
+- To pin mirrors: export `ANDROIDEMU_MIRRORS="docker.fnnas.com docker.1ms.run"` (space separated, tried in order) before installing.
+- If every mirror fails, configure a working accelerator in fnOS **Docker → Image Registry → Settings → Mirror Settings** and retry.
 
 > **Download Speed Note**: First-time installation pulls ~2GB Android container image. During peak evening hours (typically 20:00-24:00), international bandwidth is congested and slower download speeds are normal — please be patient or retry during daytime. It is recommended to configure an appropriate mirror accelerator in fnOS **Docker → Image Registry → Settings → Mirror Settings**.
 
@@ -832,6 +883,22 @@ WebRTC receives H.264 ←── TURN/STUN relay ←── scrcpy encodes ←─�
     ▼                                                          ▼
 Browser display ←──── fnOS Gateway ←──── Docker Container ←──── Host Linux Kernel
 ```
+
+---
+
+## Container Privilege Level (chosen in the install wizard)
+
+Step 2 of the install wizard, "Privilege Level", lets the user pick how tightly high-risk operations are constrained inside the container. Default is "Required only":
+
+| Level | Content | For |
+|---|---|---|
+| **Required only** (default) | Keeps the custom seccomp filter: blocks loading/unloading kernel modules, `kexec`, rebooting the host, toggling swap, changing system time, and direct IO port access. Normal Android use (boot, streaming, audio, ADB, installing apps, gaming) is unaffected | Almost everyone |
+| **Full** | Lifts the above filter (`seccomp=unconfined`); those high-risk operations become available inside the container | Debugging on a NAS you own, when you know the consequences |
+
+- The choice is stored in `/vol1/@appdata/androidemu/root-level` and honoured on upgrade and every start — it is not reset by reboots. To change it, reinstall and pick again.
+- **Either way the Android container runs with Docker privileged mode** — a hard requirement of redroid: in an unprivileged container `/sys` is read-only and `system_server`, `installd`, `netd` crash immediately, so Android never boots (measured; even with all capabilities and all devices granted). The wizard states this explicitly and tells users to abort the install if they don't accept it.
+- This app **does not request host root**: it runs as `run-as=package`, and no host-side process of this app runs as root. Root inside the container lives only in that container's namespace and is unrelated to host root.
+- Verify afterwards: `docker exec androidemu-android grep Seccomp /proc/1/status` — `Seccomp: 2` for "Required only", `Seccomp: 0` for "Full".
 
 ---
 
