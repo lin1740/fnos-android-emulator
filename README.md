@@ -900,6 +900,47 @@ WebRTC 接收 H.264 流 ←── TURN/STUN 中继 ←── scrcpy 编码 ←�
 
 ---
 
+## root 判定自查（审核视角）
+
+关于「哪里算 root」，实务上有两条判定口径，本应用两条都已处理，并给出可自行复核的命令。
+
+**口径一：应用权限声明（`config/privilege`）**
+
+```bash
+cat /var/apps/androidemu/config/privilege
+# 期望 run-as 为 package
+```
+
+`run-as` = `package`：应用本体以专用包用户（非 root）运行，未向系统申请宿主 root。同机其它第三方应用（如 `opencode`、`fygo-browser`、`python312`）采用相同配置。
+
+**口径二：运行中的进程**
+
+```bash
+# 宿主侧：本应用是否有以 root 运行的进程（期望无输出）
+ps -eo user,pid,args | grep -E '/@appcenter/androidemu|/var/apps/androidemu' | grep '^root'
+
+# 容器内：Android 系统服务的身份（容器命名空间）
+docker top androidemu-android | awk 'NR>1 && $1=="root"' | head
+```
+
+本应用各部件的实际运行身份：
+
+| 进程 | 运行身份 |
+|---|---|
+| 应用本体（`cmd/main`，网关与守护入口） | `docker-androidemu`（包用户） |
+| `boot_guard` / `webrtc_watchdog` / `agent_autodeploy` 等守护脚本 | `docker-androidemu` |
+| 投屏 agent（`cloudphone-agent`） | 容器内 `shell`（uid 2000，等同 `adb shell`） |
+| 后台 dexopt 排程 | 容器内 `shell`（uid 2000） |
+| 画面服务 coturn / webrtc-signaling | 容器内 `appuser` |
+| 画面服务启动脚本（PID1） | 容器内 `root`（需写 `/etc/coturn`、创建 appuser 后再降权启动服务） |
+| Android 系统服务（init / netd / vold / installd / ueventd / storaged / zygote） | 容器内 `root`（系统运行必需） |
+
+最后两行属**容器命名空间内**的进程，不是宿主侧进程。容器内 root 无法操作宿主：没有宿主目录的可写挂载，没有额外 capability（仅 `CAP_SYS_NICE` 给画面服务），另有自定义 seccomp 过滤 `insmod` / `kexec` / `reboot` / `swapon` 等。
+
+**若需要完全不出现容器内 root**：安装向导第二档选「无 root」，安装后不创建安卓容器，整机既无特权容器也无容器内 root，面板仍可打开（提示无 root 模式）。
+
+---
+
 ## 容器权限级别（安装向导可选）
 
 安装向导第二步「权限级别」会让用户选择运行级别，默认「仅必要权限」：
