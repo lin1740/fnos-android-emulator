@@ -939,6 +939,16 @@ docker top androidemu-android | awk 'NR>1 && $1=="root"' | head
 
 **若需要完全不出现容器内 root**：安装向导第二档选「无 root」，安装后不创建安卓容器，整机既无特权容器也无容器内 root，面板仍可打开（提示无 root 模式）。
 
+**同类应用对照（同一账号下已上架的应用，实测/源码核对）**
+
+| 应用 | `run-as` | 容器 | 容器内 root 进程 |
+|---|---|---|---|
+| 穿云投屏 0.4.3（已上架） | `package` | 仅 1 个 `webrtc`，非特权 | 1 个：`/bin/bash /custom-entrypoint.sh`（PID1）；coturn 与 signaling 以 `appuser` 运行 |
+| OpenCode 1.19.x（已上架） | `package` | 无容器（CLI + unix socket） | 0 |
+| 本应用 | `package` | `android`（特权，redroid 必需）+ `webrtc`（非特权） | `webrtc` 同上 1 个；`android` 内为 Android 系统服务（init/netd/vold/installd/ueventd/storaged/zygote），跑 Android 必然存在 |
+
+差异来自产品形态：前两者不运行 Android 用户态，因此没有 Android 系统进程；本应用要跑安卓，`init`/`netd`/`vold` 等必须由 root 启动。应用自身与其全部辅助进程（网关、守护、投屏 agent、dexopt 排程）在宿主侧均为非 root。
+
 ---
 
 ## 容器权限级别（安装向导可选）
