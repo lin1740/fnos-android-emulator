@@ -911,7 +911,7 @@ WebRTC 接收 H.264 流 ←── TURN/STUN 中继 ←── scrcpy 编码 ←�
 
 - 选择结果会写到 `/vol1/@appdata/androidemu/root-level`，升级和后续启用都会沿用，不会因为重启被重置；想改级别就重新安装并在向导里改选。
 - **无论选哪一级，安卓容器都以 Docker 特权模式运行**——这是 redroid 跑 Android 的硬性前提（非特权容器 `/sys` 只读，`system_server`、`installd`、`netd` 会直接崩溃，系统起不来；已实测，即使给足全部 capability 与设备权限也一样）。向导里已明确提示：不接受这一点请退出安装。
-- 本应用**不申请宿主 root**：应用本体 `run-as=package`，宿主侧不存在以 root 常驻的本应用进程。容器内的 root 只在该容器命名空间内生效，与宿主机 root 是两回事。
+- 本应用**不申请宿主 root**：应用本体 `run-as=package`，宿主侧不存在以 root 常驻的本应用进程；安装、升级、卸载过程也不会创建任何以 root 身份运行的临时容器（删除数据是在应用自带的安卓容器内放开目录权限后，由包用户自行删除）。容器内的 root 只在该容器命名空间内生效，与宿主机 root 是两回事。
 - 选择后可在容器内核对：`docker exec androidemu-android grep Seccomp /proc/1/status`——「仅必要权限」为 `Seccomp: 2`，「全部权限」为 `Seccomp: 0`。
 
 ---
@@ -986,7 +986,7 @@ WebRTC 接收 H.264 流 ←── TURN/STUN 中继 ←── scrcpy 编码 ←�
 - **SELinux 状态**：容器内 `getenforce` 返回 `Disabled`。原因是飞牛默认内核**未加载 SELinux LSM**（实测 `/sys/kernel/security/lsm` = `capability,landlock,lockdown,yama,bpf,apparmor,ima,evm`，宿主 LSM 体系是 AppArmor），容器内也看不到 `/sys/fs/selinux`。因此 SELinux 在本应用层面**无法启用**（不是"没补"，是内核未提供该模块）；强行用 redroid 启动参数指定 enforcing 会拦截容器内系统服务、导致容器无法启动（3.8.8 实测已回退）
 - **容器内 root 的实际边界（如实说明）**：安卓主容器 `androidemu-android` 因 redroid 上游要求必须 `privileged`（非特权方案实测无法进入启动流程，见 [redroid-doc #591](https://github.com/remote-android/redroid-doc/issues/591)）。因此容器内 root **不等于**普通非特权容器的 root：Docker 在 privileged 下会解除默认 seccomp/AppArmor 约束，且 `cap_drop`、device 规则都**不再生效**（实测 CapEff 仍为全量 `0x1ffffffffff`）。本应用的收敛做法是：①直通设备裁剪到 `/dev/dri`、`/dev/binder`、`/dev/net/tun` 三个必需项；②用自定义 seccomp 把最危险的系统调用挡回 `EPERM`（见下条）
 - **3.8.9 seccomp 加固**：`docker-compose.yaml` 的 redroid 服务挂 `security_opt: seccomp=<应用目录>/docker/androidemu-redroid-seccomp.json`（默认放行 + 拒绝下列调用：`init_module`/`finit_module`/`delete_module` 内核模块加载、`kexec_load`/`kexec_file_load` 换内核、`reboot` 重启整机、`swapon`/`swapoff`、`acct`、`iopl`/`ioperm`、`settimeofday`/`clock_settime` 改系统时间）。这些调用在容器内原本可直接作用于整台 NAS（例如容器内重启会重启 NAS、改时间会影响 NAS 上其它服务），现一律被拒。实测：容器内 `Seccomp: 2`、`insmod` 返回 Operation not permitted；Android 正常开机、投屏/音频（Codec2 Opus）/ADB/APK 安装/容器停止与重建全部正常
-- **缩小攻击面的既有措施**：ADB 5556 默认仅绑定 `127.0.0.1`（需在面板手动开放；镜像为 userdebug 构建，即"连上 5556 即容器 root"，用完建议关闭）；容器内 userdebug `su` 每次部署收紧为权限 `000`（容器重建后自动重新施加）；容器内不预置 Magisk；应用本体以 `docker-androidemu` 用户（run-as=package）运行，无任何宿主 root 常驻进程
+- **缩小攻击面的既有措施**：ADB 5556 默认仅绑定 `127.0.0.1`（需在面板手动开放；镜像为 userdebug 构建，即"连上 5556 即容器 root"，用完建议关闭）；容器内 `su` 在六个常见路径（`/system/bin`、`/system/xbin`、`/sbin` 等）均不存在（比收紧权限位更彻底，容器重建后仍保持）；容器内不预置 Magisk；应用本体以 `docker-androidemu` 用户（run-as=package）运行，无任何宿主 root 常驻进程
 - **剩余风险（不粉饰）**：若容器内 root 被取得（例如自行开放 ADB 后从外部连入，或安装了带提权漏洞的来路不明 APK），其能力**不止于容器内部**——privileged 容器的 `/dev` 中包含宿主设备节点（磁盘、`/dev/mem` 等），这是上游 redroid 强制 privileged 带来的固有属性，Docker 层面无法在保留 privileged 的前提下收窄（`cap_drop` 无效，已实测）。3.8.9 的 seccomp 过滤封掉了其中最直接的逃逸/破坏路径，但无法消除该固有属性。因此请：不要把本应用端口直接暴露到公网；ADB 只在局域网按需开放、用完即关；只安装可信来源的 APK
 - **自查命令**（容器运行中，可自行核对）：
   ```bash
