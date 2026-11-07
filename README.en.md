@@ -886,6 +886,47 @@ Browser display ←──── fnOS Gateway ←──── Docker Container �
 
 ---
 
+## Root Self-Check (reviewer's view)
+
+There are two practical ways to judge "is this a root app". Both are covered here, with commands you can run yourself.
+
+**Test 1: declared privilege (`config/privilege`)**
+
+```bash
+cat /var/apps/androidemu/config/privilege
+# expect run-as = package
+```
+
+`run-as` is `package`: the app runs as its own non-root package user and never asks for host root. Other third-party apps on the same NAS (e.g. `opencode`, `fygo-browser`, `python312`) use the same setting.
+
+**Test 2: running processes**
+
+```bash
+# Host side: any process of this app running as root (expect no output)
+ps -eo user,pid,args | grep -E '/@appcenter/androidemu|/var/apps/androidemu' | grep '^root'
+
+# Container side: identity of Android system services (container namespace)
+docker top androidemu-android | awk 'NR>1 && $1=="root"' | head
+```
+
+Actual runtime identity of each component:
+
+| Process | Runs as |
+|---|---|
+| App itself (`cmd/main`, gateway and supervisors) | `docker-androidemu` (package user) |
+| `boot_guard` / `webrtc_watchdog` / `agent_autodeploy` | `docker-androidemu` |
+| Streaming agent (`cloudphone-agent`) | container `shell` (uid 2000, same as `adb shell`) |
+| Background dexopt scheduling | container `shell` (uid 2000) |
+| coturn / webrtc-signaling | container `appuser` |
+| Streaming entrypoint (PID1) | container `root` (must write `/etc/coturn`, create appuser, then drop privileges for the services) |
+| Android system services (init / netd / vold / installd / ueventd / storaged / zygote) | container `root` (required to run Android) |
+
+The last two rows are processes **inside the container namespace**, not on the host. Container root cannot touch the host: no writable host bind mounts, no extra capabilities (only `CAP_SYS_NICE` for the streaming container), and a custom seccomp filter blocks `insmod` / `kexec` / `reboot` / `swapon` and friends.
+
+**If you need zero in-container root**: pick "No root" in step 2 of the wizard. The Android container is then never created, so there is no privileged container and no in-container root at all; the panel still opens and states it is in no-root mode.
+
+---
+
 ## Container Privilege Level (chosen in the install wizard)
 
 Step 2 of the install wizard, "Privilege Level", lets the user pick a runtime level. Default is "Required only":
