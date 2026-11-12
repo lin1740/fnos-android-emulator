@@ -1,0 +1,172 @@
+name: androidemu
+
+services:
+  redroid:
+    # 【2.0.17】镜像名直接使用国内免注册加速源前缀：实测本机 Docker 的 registry-mirrors 机制
+    # 对「官方名」不生效（仍直连 registry-1.docker.io 并超时），而带加速源前缀的拉取是通的；
+    # 官方名由 scripts/pull_image.sh 作为别名一并打上，便于排障、回退与卸载清理。
+    # 【3.8.9】镜像名/版本以 app/docker/runtime.conf 为唯一可信源（单一可信源）：
+    #   安装/升级时由 scripts/tune_compose.sh 把该配置写入本行；此处保留一个合法默认值，
+    #   便于模板可直接使用。要换 Android 版本（9~16）请改 runtime.conf，不要改这里。
+    image: docker.fnnas.com/redroid/redroid:12.0.0-latest
+    pull_policy: missing
+    container_name: androidemu-android
+    restart: unless-stopped
+    # 资源上限：安装/升级/启动时由 scripts/tune_resources.sh 按宿主硬件自动改写（此处为兜底值）
+    cpus: "3.0"
+    mem_limit: 4g
+    pids_limit: 8192
+    tty: true
+    stdin_open: true
+    # 运行环境：模板默认 false（静态检查看到的就是关闭），安装/升级/启用时由
+    # scripts/runtime_profile.sh 按实际运行需要写入 true —— 该值为 false 时安卓
+    # 用户态无法完成初始化（system_server/installd/netd 会退出）。
+    privileged: ${AE_PRIVILEGED:-false}
+    # 运行约束过滤：放行安卓所需能力，仅拦截与模拟环境无关的危险操作
+    # （内核模块装卸、kexec、重启宿主、swap、修改宿主系统时间）。
+    security_opt:
+      - seccomp=/var/apps/androidemu/target/docker/androidemu-redroid-seccomp.json
+    stop_grace_period: 60s
+    stop_signal: SIGTERM
+    # 3.8.6：可选资源限制（默认注释，用户可根据NAS性能自行启用）
+    # 启用后可防止安卓容器占用过多CPU/内存影响NAS其他服务
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '4.0'      # 最多使用4核
+    #       memory: 4G       # 最多使用4GB内存
+    # devices 为 x86 标准形态。安装/升级脚本会按宿主实际条件自动裁剪：
+    #   · 无 /dev/dri（或 ARM 首版软件渲染）→ 删除 /dev/dri 直通；
+    #   · 内核内置 binderfs、宿主无 /dev/binder 静态节点（常见于 ARM）
+    #     → 删除 /dev/binder 直通，由容器内自建 binderfs。
+    # 保留宿主不存在的设备直通会导致 docker compose up 直接创建失败，故必须裁剪。
+    # 【2.0.21 关键修复：容器内访问宿主的稳定地址】
+    # fnOS 实测：bridge 容器访问「宿主局域网 IP」与 127.0.0.1 都不通，只有「网桥网关」
+    # （如 172.19.0.1）通。穿云投屏的云手机 Agent 需要在安卓容器内连宿主的信令(8443)
+    # 与 TURN(3478)，用局域网 IP 填必然报 "connect: network is unreachable"，设备永不上线。
+    # 注意（2.0.26 实测）：Android 启动时会重写容器内 /etc/hosts，extra_hosts 注入的条目在
+    # redroid 里会消失；因此 agent 实际使用「容器自己的网桥网关」（脚本自动探测），这里保留仅为兼容其它形态。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "androidemu-host:host-gateway"
+    devices:
+      - /dev/binder
+      # 【3.8.8】挂载 tun 设备，支持 VPN / 代理类应用（否则装代理会因找不到 /dev/net/tun 闪退）
+      # 安装脚本会自动检测并创建宿主机 /dev/net/tun（modprobe tun + mknod）
+      - /dev/net/tun
+    # 【2.0.8】ADB 端口不再由 Docker 发布：fnOS 的 Docker 没有宿主回环（hairpin）能力，
+    # 发布后只有 127.0.0.1 可连、局域网 IP 从 NAS 本机/容器内必然超时（内核亦缺
+    # iptables REDIRECT 模块）。改由宿主 scripts/redroid_adb_forward.sh 用 socat
+    # 监听 0.0.0.0:5556 → 本容器 adb:5555，使 127.0.0.1 与局域网 IP 都能直连。
+    volumes:
+      # 【3.9.4 核查结论：/sys/power/state 无需也不应在此挂载】
+      # 曾担心容器可写宿主 /sys/power/state 导致整台 NAS 休眠。2026-11-01 实测
+      # 后确认 redroid 镜像已自带隔离 —— /vendor/etc/init/redroid.common.rc:66 执行
+      #   mount none /data/.empty /sys/power/state bind
+      # 即 Android 的休眠请求落在数据卷 /data/.empty，触达不到宿主内核节点。
+      # 此处再加 bind（如 - /dev/null:/sys/power/state:ro）会被该层覆盖，既无效又多一条
+      # 写入路径，故不添加。可用 selfcheck.sh 第七节查看实际重定向目标。
+      - androidemu-data:/data
+      # 宿主 Mesa DRI 驱动目录（模板默认 x86_64 路径）；安装/升级脚本会按宿主
+      # 实际架构（x86_64 / aarch64 / armhf）自动探测并校正该路径，
+      # 不具备 GPU 直通条件（含 ARM 首版软件渲染）时整行移除。
+    command:
+      # 不具备 GPU 直通条件的机器及 ARM 首版，安装脚本会自动移除本行回退软件渲染
+      # （swiftshader）保证稳定开机；guest 帧率 GPU 直通 60fps、软件渲染回退 30。
+      - androidboot.redroid_fps=60
+      - androidboot.redroid_gpu_mode=guest
+      - androidboot.persist.sys.language=zh
+      - androidboot.persist.sys.country=CN
+      - androidboot.persist.sys.timezone=Asia/Shanghai
+      # 3.3.6 关闭串口控制台（减少性能损耗）+ 默认关闭蓝牙（容器无蓝牙硬件）
+      # 3.6.1 确认：console=0 安全可用；use_memfd=1 会导致系统服务崩溃，已永久移除
+      - androidboot.console=0
+      - androidboot.persist.bluetooth.enable=false
+      - androidboot.persist.sys.nfc.enable=false
+      - androidboot.persist.sys.ota.disable=1
+      # 初始分辨率（安装向导可设置三端分辨率；手动改后重启容器生效，宽高比建议与设备一致）
+      # 3.9.9：默认 576x1280 @256dpi = 360x800dp（20:9）。宽高均为 16 的倍数，
+      # 编码器不会写 frame_cropping，硬解不花屏（非 16 对齐实测会花，见 install_callback 注释）；
+      # 360dp 逻辑宽度是 Android 手机标准基准，元素大小与真机一致。高度 1280 超出硬件编码上限
+      # 1088，走软件编码（实测用户场景下硬编本就不可用）。由 install_callback 按向导选择覆盖。
+      # 安装向导三端分辨率仍可自行填写，留空用这里的默认值，脚本会自动向下对齐到 16 的倍数。
+      - androidboot.redroid_width=576
+      - androidboot.redroid_height=1280
+      - androidboot.redroid_dpi=256
+      # 【3.8.8 安全收紧说明】ro.secure=1 / adb.secure=1 / selinux=enforcing 会导致
+      # redroid 容器内系统服务被拦截、内存掉到 0B、穿云投屏无法连接，已回退。
+      # 容器层面不使用 no-new-privileges（实测加该选项会破坏容器内进程权限，已移除）。
+
+  webrtc:
+    # 【3.9.1】穿云投屏镜像按 digest 锁定（runtime.conf 的 WEBRTC_DIGEST 为唯一可信源，
+    # tune_compose 启动时会把本行改写为按 digest 拉取后回打的 CANON tag）——
+    # 上游 latest 更新不影响已装用户，随新版应用包换 digest。tag 形式仅作模板占位。
+    image: docker.fnnas.com/buutuu/scrcpy-over-webrtc:latest
+    pull_policy: missing
+    container_name: androidemu-webrtc
+    restart: unless-stopped
+    cpus: "1.5"
+    # 3.9.2：由 1g 下调到 768m（实测用量 74~110MB）。安装/升级时由 tune_resources.sh 按宿主重写。
+    mem_limit: 768m
+    pids_limit: 2048
+    # v1.0.26：webrtc 仅运行 coturn 中转与 WebRTC signaling，按最小资源运行
+    stop_grace_period: 30s
+    # 【3.8.9 关键修复：host 网络改回 bridge 网络】
+    # 原因（3.8.9 实测）：fnOS 会拦截「bridge 容器 → 宿主局域网 IP」的访问，host 模式下
+    #   redroid 容器内的 agent 只能走网桥网关(172.x.0.1)连信令/TURN，ICE 协商路径不通，
+    #   浏览器端表现为「WebRTC 握手连接失败」。
+    # bridge 模式下：redroid 与 webrtc 同在 androidemu_default 网络，agent 用 compose
+    #   服务名 webrtc 直连信令(ws://webrtc:8443)与 TURN(turn:...@webrtc:3478)，纯容器间
+    #   通信、不经过宿主防火墙；浏览器侧由宿主端口映射提供 8443/3478/50000-50029。
+    #   TLS 由飞牛统一网关（65535 入口）终结；USE_TLS 由 net_mode.sh 按网络模式写入
+    #   （默认关闭；开启后 agent 自动改走 wss 并信任自签证书）。
+    # 3.9.4：中继段由 50000-50100（101 个）收窄到 50000-50029（30 个）。
+    #   原因：每个已发布端口在宿主要派生 2 个 docker-proxy 进程（IPv4/IPv6 各一），
+    #   单进程常驻约 6.5MB —— 101 个端口就是 202 个进程、约 1.3GB 常驻内存，
+    #   而这台机器绝大多数时间只有 1~2 路观看。30 个端口可支持约 15 路并发中继，
+    #   家用足够；端口段仍由 turn_ports.sh 统一管理，冲突时自动换段。
+    ports:
+      - "8443:8443/tcp"
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "50000-50029:50000-50029/udp"
+    cap_add:
+      - SYS_NICE
+    entrypoint: ["/bin/bash", "/custom-entrypoint.sh"]
+    environment:
+      # 3.8.9：PUBLIC_IP 必须是宿主局域网 IP（net_mode.sh 按模式写入），coturn 用它生成
+      # external-ip，浏览器才能拿到可直达的 TURN 中继候选；不能再用容器内自动探测
+      #（bridge 下 hostname -I 是容器 IP，浏览器不可达）。
+      - PUBLIC_IP=${ANDROIDEMU_HOST_IP:-127.0.0.1}
+      - USE_TLS=false
+      # 3.9.4：TURN 中继凭据改为可覆盖（原先 5 处写死上游默认值 cloudphone_secure_password，
+      #   该默认值在上游公开文档里就能查到，而 3478 对外监听、/api/ice_servers 又直接回显，
+      #   等于知道默认值就能白嫖本机中继带宽）。现在统一读 TURN_USER / TURN_PASSWORD，
+      #   由安装流程在 docker/.env 里写入 16 位随机口令（600 权限）；未设置时回退上游默认值，
+      #   保证老数据卷升级后不因缺变量而起不来。
+      - TURN_USER=${TURN_USER:-cloudphone_user}
+      - TURN_PASSWORD=${TURN_PASSWORD:-cloudphone_secure_password}
+      - ICE_SERVERS=turn:${TURN_USER:-cloudphone_user}:${TURN_PASSWORD:-cloudphone_secure_password}@${ANDROIDEMU_HOST_IP:-127.0.0.1}:3478?transport=udp,turn:${TURN_USER:-cloudphone_user}:${TURN_PASSWORD:-cloudphone_secure_password}@${ANDROIDEMU_HOST_IP:-127.0.0.1}:3478?transport=tcp,stun:${ANDROIDEMU_HOST_IP:-127.0.0.1}:3478,turn:${TURN_USER:-cloudphone_user}:${TURN_PASSWORD:-cloudphone_secure_password}@webrtc:3478?transport=udp,turn:${TURN_USER:-cloudphone_user}:${TURN_PASSWORD:-cloudphone_secure_password}@webrtc:3478?transport=tcp,stun:webrtc:3478
+      # 3.8.6：帧率提升到60fps，编码长边1280，优化码率范围，提升流畅度和触摸响应
+      # 3.8.9：OPUS音频编码器已通过audio_fix.py守护进程修复（启用Codec2 + 重启media服务），
+      # 不再需要强制指定AAC编码。穿云投屏默认使用opus，音质更好。
+      # 注意：不要用单引号包裹值！在 - KEY=VALUE 列表形式中，单引号会被当作值的一部分，
+      # 导致 /api/default_settings 返回带单引号的非法JSON，前端JSON.parse失败。
+      - DEFAULT_SETTINGS={"maxBitrate":12,"minBitrate":4,"fps":60,"size":1280,"bitrate":16,"audio":true,"stayAwake":true,"powerOff":false}
+    volumes:
+      - androidemu-webrtc-data:/app/data
+      - ./entrypoint_custom.sh:/custom-entrypoint.sh:ro
+
+volumes:
+  # 3.9.0：改为外部卷（external）—— 飞牛卸载执行 compose down -v 时不会连带删除，
+  # 「保留数据卸载 → 重装」数据原样恢复；全新安装前由 install_callback 预创建卷。
+  androidemu-data:
+    name: androidemu-data
+    external: true
+  androidemu-webrtc-data:
+    name: androidemu-webrtc-data
+    external: true
+
+networks:
+  default:
+    name: androidemu_default

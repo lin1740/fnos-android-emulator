@@ -1,0 +1,22 @@
+appname                    = androidemu
+version                    = 3.9.9
+display_name               = 安卓模拟器（国内版）
+desc                       = 在飞牛 fnOS 上用 Docker 运行安卓容器，浏览器云手机画面远程操控、GPU 直通（无 GPU 自动回退软件渲染）、ADB 调试；安装时可选安装谷歌服务框架（GMS）和 Play 商店。重要前提：安卓容器需宿主系统内核提供 binder（内核内建 binderfs 或已加载 binder 内核模块，无纯软件替代）；x86 机型由依赖应用「binder_linux」负责加载内核模块并挂载 binderfs，ARM 机型通常使用内核内建 binderfs；首次安装需联网拉取约 2-3GB 镜像。云手机画面默认账号 admin、密码 admin123，登录后请及时修改。本应用完全免费开源、非商业，不收取任何费用，不通过任何组件盈利；内置穿云投屏的设备数授权为上游的第三方付费服务（费用由上游收取，与飞牛官方及发布者无关）；免费版功能完整，不付费不影响使用。
+platform                   = all
+# 依赖应用：binder_linux（应用中心 appname = binder_linux_driver）提供内核 binder 支持
+# （x86 由该依赖应用拉起/挂载 binderfs；6.18.18 及以后内核已内建 binder，依赖应用仅作拉起与校验）。
+# 依赖未安装或未启用时，应用中心会阻止安装/启用并给出提示。
+install_dep_apps           = binder_linux_driver
+source                     = thirdparty
+os_min_version             = 1.1.8
+maintainer                 = zhouziyang、hqw700
+distributor                = 键盘敲粥香
+distributor_url            = https://www.lin1740.de5.net
+desktop_uidir              = ui
+desktop_applaunchname      = androidemu.Application
+service_port               = 8443
+checkport                  = false
+# 本应用不需要用户选择文件/目录授权，隐藏该设置以最小化权限面
+disable_authorization_path = true
+# 应用中心「更新内容」展示用（保持单行）
+checksum                   = 2973a0f966af08cea91b09ba4a8319bf

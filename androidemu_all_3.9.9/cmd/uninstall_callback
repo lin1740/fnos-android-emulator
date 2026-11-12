@@ -1,0 +1,432 @@
+#!/bin/bash
+
+### 3.9.9-r2：补齐 /usr/sbin（runuser 所在目录），避免卸载回调里的降权清理失效。
+case ":${PATH:-}:" in
+    *:/usr/sbin:*) ;;
+    *) export PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}:/usr/sbin:/sbin" ;;
+esac
+
+### This script is called after the user uninstalls the application.
+### 卸载即清理本应用资源：容器、网络、镜像、（按向导选择处理的）数据卷、拉取残留。
+
+### 关键：把本脚本全部输出重定向到日志文件，保证 stdout 干净，
+### 避免被飞牛判定为「脚本出错且原因未知」（与 install/upgrade 一致）。
+### 3.9.8 修正：日志不再写进 @appdata 内部。卸载选「删除数据」时 @appdata/androidemu
+###   会被整个删除，日志跟着自毁（实测卸载后 uninstall.log 根本不存在，无法排查）。
+###   改写到 /tmp（重启自清，不产生残留文件）。同时把 PID 打出来便于对照。
+LOG_DIR="/tmp"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+exec >> "$LOG_DIR/androidemu-uninstall.log" 2>&1
+echo "[$(date '+%F %T')] ===== uninstall_callback 开始（pid=$$ 身份=$(id -un 2>/dev/null)）====="
+
+### 3.9.9：分辨率护栏是宿主常驻进程，卸载时精确停掉，避免残留。
+for _rp in $(pgrep -f "scripts/resolution_guard.sh supervise" 2>/dev/null); do
+    kill -9 "$_rp" 2>/dev/null || true
+    echo "[$(date '+%F %T')] 已停止分辨率护栏常驻（pid=$_rp）"
+done
+
+### 3.9.9：硬件视频编码 daemon 是宿主常驻进程，删容器不会带走它，这里先精确停掉。
+for _hp in $(pgrep -f "hwenc/bin/daemon" 2>/dev/null); do
+    kill -9 "$_hp" 2>/dev/null || true
+    echo "[$(date '+%F %T')] 已停止硬件编码 daemon（pid=$_hp）"
+done
+rm -rf "${TRIM_PKGVAR:-/var/apps/androidemu/var}/hwenc" 2>/dev/null || true
+
+
+### 3.9.8：把 compose 同步到 /docker/docker-compose.yaml（飞牛 docker-project 升级/启停读取该路径）。
+### 说明：/docker 由 root 拥有（755），包用户通常写不进去；本函数已改为 best-effort，
+### 写不进去就跳过（飞牛的 docker 项目记录用的是绝对路径，不依赖这份副本）。
+_ae_compose_to_docker(){
+    ### 仅做 best-effort 同步：包用户对 /docker（root 755）没有写权限时直接跳过，
+    ### 不再借 高权限容器写入。飞牛的 docker 项目记录里保存的是绝对路径
+    ### （/usr/trim/etc/dockermgr.conf 的 projects[].folder = <应用目录>/docker），
+    ### 不依赖 /docker 这份副本，功能上缺失它也不影响安装、升级、启停。
+    [ -f "$1" ] || return 0
+    cp -f "$1" /docker/docker-compose.yaml 2>/dev/null || return 0
+    chmod 644 /docker/docker-compose.yaml 2>/dev/null || true
+    return 0
+}
+
+### 升级守卫：升级/安装替换流程也会调用本脚本。
+### 此时绝不做任何破坏性清理（删容器/删镜像/删数据卷/杀后台拉取）。
+if [ "$TRIM_APP_STATUS" = "UPGRADE" ] || [ -n "${TRIM_OLD_APPVER:-}" ] || [ -n "${TRIM_TEMP_UPGRADE_FOLDER:-}" ]; then
+    _ae_compose_to_docker "${TRIM_APPDEST}/docker/docker-compose.yaml"
+    exit 0
+fi
+
+### 1) 先停掉宿主侧常驻辅助进程（ADB 端口转发、音频声明守护）。
+if [ -f "${TRIM_APPDEST}/scripts/redroid_adb_forward.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/redroid_adb_forward.sh" remove >/dev/null 2>&1 || true
+fi
+if [ -f "${TRIM_APPDEST}/scripts/androidemu_daemon.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/androidemu_daemon.sh" stop >/dev/null 2>&1 || true
+fi
+if [ -f "${TRIM_APPDEST}/server/gateway.py" ]; then
+    python3 "${TRIM_APPDEST}/server/gateway.py" stop >/dev/null 2>&1 || true
+fi
+rm -f "${TRIM_APPDEST:-/var/apps/androidemu/target}/app.sock" 2>/dev/null || true
+### 3.9.9-r2：兜底清掉本应用遗留的 socat 监听。
+### 旧版用固定 5556 + pkill；自定义端口时匹配不到，且 pkill 对历史 root 实例
+### 只会静默失败。这里按 ports.conf 的实际端口精确匹配并逐个 kill、记录结果。
+### （历史 root 实例由 uninstall_init 以更高权限先清一遍，两处互补。）
+_ADP1="$(grep -m1 '^ADB_PORT=' "${TRIM_PKGVAR:-/var/apps/androidemu/var}/ports.conf" 2>/dev/null | cut -d= -f2)"
+case "$_ADP1" in ''|*[!0-9]*) _ADP1=5556 ;; esac
+for _sp in $(ps -eo pid,args 2>/dev/null | grep -F "socat TCP-LISTEN:${_ADP1}," | grep -v grep | awk '{print $1}'); do
+    kill -9 "$_sp" 2>/dev/null && echo "[$(date '+%F %T')] 已停止 ADB 转发 socat（pid=$_sp 端口=$_ADP1）"
+done
+
+### 2) 停止后台拉取进程并清理拉取残留文件。
+VAR_DIR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+if [ -f "$VAR_DIR/pull.pid" ]; then
+    PID=$(cat "$VAR_DIR/pull.pid" 2>/dev/null)
+    [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
+fi
+pkill -f "pull_image.sh" 2>/dev/null || true
+pkill -f "redroid/redroid" 2>/dev/null || true
+pkill -f "scrcpy-over-webrtc" 2>/dev/null || true
+rm -f "$VAR_DIR/pull.pid" "$VAR_DIR/pull.log" "$VAR_DIR/pull-progress.log" "$VAR_DIR/eta.state" 2>/dev/null || true
+
+### 2.5) 兜底：再次停止本应用全部后台守护（3.8.9）。
+###   与 uninstall_init 用同一套匹配规则（唯一脚本名 + cmdline 含 androidemu），
+###   防止 init 阶段漏杀、或卸载过程中守护被重新拉起而残留。
+### 3.9.4：agent_watchdog_loop.sh 是降权后的常驻循环脚本（root 调用时以
+###   docker-androidemu 身份拉起），命令行里不含 agent_autodeploy.sh，必须单列。
+for _name in boot_guard.sh webrtc_watchdog.sh fix_keystore.sh fix_storage_perm.sh \
+             agent_autodeploy.sh agent_watchdog_loop.sh redroid_adb_forward.sh audio_fix.py gateway.py gateway_amd64 gateway_arm64 \
+             start_pull_bg.sh pull_image.sh supervisor; do
+    for _p in $(ps -eo pid,args 2>/dev/null | grep -F "$_name" | grep -F 'androidemu' | grep -v grep | awk '{print $1}'); do
+        [ "$_p" = "$$" ] && continue
+        kill -9 "$_p" 2>/dev/null || true
+    done
+done
+
+### 3) 移除本应用安装的 DRM 放权 udev 规则（只删自己的规则文件；非 root 时删不掉会记录）。
+RULE_FILE="/etc/udev/rules.d/99-androidemu-drm.rules"
+if [ -f "$RULE_FILE" ]; then
+    rm -f "$RULE_FILE" 2>/dev/null || true
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules 2>/dev/null || true
+    fi
+fi
+
+### 3.9.8：选了「删除数据」时的彻底清理实现。
+###   背景（实测 2026-11-06）：卸载回调是应用包用户（docker-androidemu）身份跑的，
+###   安卓数据目录里的文件属主是系统内高权限 / system（宿主 uid 1000 等），包用户对数据目录
+###   只有 --x，rm -rf 静默失败 —— 于是「删除数据」形同摆设，重装后旧应用与旧账号数据
+###   全部复活（实测残留 384MB 旧 userdata）。
+###   本版做法：在**应用自己的容器内**完成删除（系统内高权限 只在该容器命名空间内，不新建
+###   任何容器、不申请宿主高权限、不启动任何临时镜像），删除后立即结束容器进程，
+###   避免 Android 在删除与停止的间隙里重新写入；残留的空目录再由包用户 rmdir。
+_ae_purge_data() {
+    _purge_one() {   # $1=容器名  $2=容器内数据目录  $3=容器内 shell（安卓用 /system/bin/sh）
+        ### 3.9.9-r4：容器已不存在时不再返回「成功」。以前这里 `|| return 0`，
+        ### 而卸载初始化阶段已把容器 rm -f，回调永远走这条分支 —— 日志写着「已删除」，
+        ### 实际一个字节都没删（2026-11-12 实测残留 298MB）。改为返回 2 表示无可执行对象。
+        docker inspect "$1" >/dev/null 2>&1 || return 2
+        if [ "$(docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null)" != "running" ]; then
+            ### 应用被停用时容器是 exited，短暂启动只为执行一次删除
+            docker start "$1" >/dev/null 2>&1 || true
+            _w=0
+            while [ "$_w" -lt 15 ]; do
+                [ "$(docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null)" = "running" ] && break
+                sleep 1; _w=$((_w+1))
+            done
+        fi
+        _w=0
+        while [ "$_w" -lt 10 ]; do
+            ### 删完立刻 kill -9 1 结束容器：不给 Android 重新写入的机会
+            ### 先停掉 Android 框架（否则 system_server 会边删边重建 system_ce/misc_de 等目录），
+            ### 再删两遍（中间隔 1 秒，清掉 init 在这期间的补建），最后结束容器进程。
+            docker exec "$1" "${3:-/system/bin/sh}" -c \
+                "stop 2>/dev/null; sleep 2; \
+                 rm -rf '$2'/* '$2'/.[!.]* 2>/dev/null; sleep 1; \
+                 rm -rf '$2'/* '$2'/.[!.]* 2>/dev/null; \
+                 find '$2' -type d -exec chmod 0777 {} + 2>/dev/null; \
+                 kill -9 1" >/dev/null 2>&1
+            _e=$?
+            ### 0=正常返回；137/143=容器被自己 kill 掉（删除已执行）；容器已不在也算完成
+            case "$_e" in
+                0|137|143) return 0 ;;
+            esac
+            [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" != "true" ] && return 0
+            sleep 2; _w=$((_w+1))
+        done
+        return 1
+    }
+    _rc=0; _absent=0; _done=0
+    _purge_one androidemu-android /data /system/bin/sh; _r1=$?
+    _purge_one androidemu-webrtc /app/data sh; _r2=$?
+    case "$_r1" in
+        0) _done=$((_done+1)) ;;
+        2) _absent=$((_absent+1)) ;;
+        *) _rc=1 ;;
+    esac
+    case "$_r2" in
+        0) _done=$((_done+1)) ;;
+        2) _absent=$((_absent+1)) ;;
+        *) _rc=1 ;;
+    esac
+    ### 等容器真正停下（后面 compose down 才能顺利执行）
+    _w=0
+    while [ "$_w" -lt 15 ]; do
+        _run=0
+        for _c in androidemu-android androidemu-webrtc; do
+            [ "$(docker inspect -f '{{.State.Running}}' "$_c" 2>/dev/null)" = "true" ] && _run=1
+        done
+        [ "$_run" = "0" ] && break
+        sleep 1; _w=$((_w+1))
+    done
+    if [ "$_rc" = "0" ] && [ "$_done" -gt 0 ]; then
+        echo "[$(date '+%F %T')] 已在应用容器内删除安卓与画面服务数据（未新建任何容器）"
+        return 0
+    fi
+    if [ "$_rc" = "0" ] && [ "$_done" = "0" ] && [ "$_absent" -gt 0 ]; then
+        ### 正常流程会走到这里：容器在 uninstall_init 阶段已删除，数据也在那一阶段清空
+        echo "[$(date '+%F %T')] 容器已由卸载初始化阶段删除，本次无需再执行容器内删除"
+        return 0
+    fi
+    echo "[$(date '+%F %T')] 警告：容器内删除数据未完全成功，删除可能不彻底" >&2
+    return 1
+}
+
+### 3.5) 选了「删除数据」→ 容器删除前先清空数据（顺序不能反：容器没了就没法 exec）
+if [ "${wizard_keep_data:-true}" = "false" ]; then
+    _ae_purge_data || true
+fi
+
+### 4) 停止并删除容器（compose down 之外再兜底一次；新旧命名都清）。
+### 3.9.7：先用 compose down 正常注销项目。以前只做 docker rm -f，飞牛 Docker 面板的
+### 「项目管理」记录没被注销，卸载后仍显示一个「构建失败」的 androidemu 项目（实测）。
+### 不传 --volumes：数据卷由第 7 步按向导决定，down 不碰卷。
+for _cf in "${TRIM_APPDEST:-/var/apps/androidemu/target}/docker/docker-compose.yaml" \
+           /docker/docker-compose.yaml; do
+    if [ -f "$_cf" ] && grep -qE "^(name:[[:space:]]*androidemu|[[:space:]]+redroid:)" "$_cf" 2>/dev/null; then
+        docker compose -p androidemu -f "$_cf" down --remove-orphans >/dev/null 2>&1 || true
+        break
+    fi
+done
+docker rm -f androidemu-android androidemu-webrtc androidvm-rd-android androidvm-rd-webrtc 2>/dev/null || true
+### 3.9.7：卸载后清理升级守卫复制到 /docker 根的配置副本，否则飞牛面板一直挂着一个空项目。
+if [ -f /docker/docker-compose.yaml ] && grep -qE "^(name:[[:space:]]*androidemu|[[:space:]]+redroid:)" /docker/docker-compose.yaml 2>/dev/null; then
+    ### 3.9.9-r4：以前 rm 失败也照打「已清理」，日志不可信；改为按结果说话（细节在第 8.3 段）。
+    if rm -f /docker/docker-compose.yaml 2>/dev/null; then
+        echo "[$(date '+%F %T')] 已清理 /docker/docker-compose.yaml 残留（避免 Docker 项目面板留空项目）"
+    fi
+fi
+
+### 5) 删除默认网络。
+### 3.9.1：网络删除要重试 —— 容器刚删时网络可能仍被引用，一次性 rm 会失败（历史上因此残留，
+### 导致下次安装 compose 报 "network with name androidemu_default already exists"）。
+_ae_rm_network() {
+    local _i=0
+    while [ $_i -lt 3 ]; do
+        docker network rm androidemu_default docker_default androidvm-rd_default >/dev/null 2>&1 && break
+        _i=$((_i+1)); sleep 1
+    done
+    for _net in $(docker network ls --filter label=com.docker.compose.project=androidemu -q 2>/dev/null); do
+        docker network rm "$_net" >/dev/null 2>&1 || true
+    done
+}
+_ae_rm_network
+
+
+### 5.6) 选了「删除数据」时，先把应用数据目录里包用户能删的部分清掉；
+###   剩下的在「第 8.1 段」按同样的规则处理，不再依赖本地镜像。
+if [ "${wizard_keep_data:-true}" = "false" ]; then
+    _AE_PRE="$(readlink -f "${TRIM_PKGVAR:-/var/apps/androidemu/var}" 2>/dev/null)"
+    case "$_AE_PRE" in
+        */@appdata/androidemu) rm -rf "$_AE_PRE" 2>/dev/null || true ;;
+        *) : ;;
+    esac
+fi
+
+### 6) 本地镜像：**默认保留**（2.0.20 修正，理由见 uninstall_init 注释）。
+###    仅当卸载向导明确选择「同时删除镜像」（wizard_delete_images=true）时才删。
+if [ "${wizard_delete_images:-false}" = "true" ]; then
+### 6.1) 清理本地镜像：先按 runtime.conf 的配置名删除，再按仓库名兜底删除
+###    （覆盖用户预拉/手动 pull 产生的其它 tag）。仅限本应用两个镜像。不写死版本号。
+if [ -f "${TRIM_APPDEST}/scripts/rtconf.sh" ]; then
+    # shellcheck disable=SC1091
+    . "${TRIM_APPDEST}/scripts/rtconf.sh"
+    rtconf_load
+fi
+for IMG in "${CANON_REDROID:-}" "${OFF_REDROID:-}" "${CANON_WEBRTC:-}" "${OFF_WEBRTC:-}" \
+           "${CACHE_REDROID:-}" "${CACHE_WEBRTC:-}" \
+           "docker.m.daocloud.io/${REDROID_REPO:-redroid/redroid}:${REDROID_TAG:-12.0.0-latest}" \
+           "docker.m.daocloud.io/${WEBRTC_REPO:-buutuu/scrcpy-over-webrtc}:${WEBRTC_TAG:-latest}"; do
+    [ -n "$IMG" ] && docker image rm "$IMG" 2>/dev/null || true
+done
+docker images --format '{{.Repository}}:{{.Tag}}' | grep -E '(redroid/redroid|buutuu/scrcpy-over-webrtc):' | sort -u | while read -r IMG; do
+    docker image rm "$IMG" 2>/dev/null || true
+done
+### 3.9.7：上面按「仓库:标签」匹配，删不掉已 untag 的悬空层（显示为 <none>:<none>），
+### 实测卸载后仍残留 158MB。这里只清无 tag、无容器引用的 dangling 镜像，
+### 不会影响其它应用正在使用的镜像（image prune 默认只回收悬空层）。
+docker image prune -f >/dev/null 2>&1 || true
+echo "[$(date '+%F %T')] 已清理悬空镜像层"
+else
+    echo "[$(date '+%F %T')] 保留容器镜像（未选择删除镜像）"
+fi
+
+### 7) 数据卷：**默认保留**，只有向导明确选择「删除数据」（wizard_keep_data=false）时才删。
+###    2.0.18 修正（严重）：旧实现是 `[ "$wizard_keep_data" != "true" ]` 就删 ——
+###    而安装失败自动回滚、非向导卸载等路径根本不会传这个变量（为空），
+###    于是数据卷被误删，模拟器里的安卓数据不可恢复。现在改为「不明确说删就不删」。
+if [ "${wizard_keep_data:-true}" = "false" ]; then
+    echo "[$(date '+%F %T')] 向导选择了「删除数据」，删除数据卷"
+    ### 3.9.1 修正：volume rm 一次性调用常因容器刚删、卷仍被引用而静默失败（|| true 吞错），
+    ### 导致「删除数据」不彻底、下次安装旧数据复活。改为先兜底删容器，再重试 3 轮并校验。
+    for _vc in androidemu-android androidemu-webrtc androidvm-rd-android androidvm-rd-webrtc; do
+        docker rm -f "$_vc" >/dev/null 2>&1 || true
+    done
+    _vi=0
+    while [ $_vi -lt 3 ]; do
+        docker volume rm androidemu-data androidemu-webrtc-data androidvm-rd-data androidvm-rd-webrtc-data >/dev/null 2>&1 && break
+        _vi=$((_vi+1)); sleep 1
+    done
+    if docker volume ls --format '{{.Name}}' 2>/dev/null | grep -qx "androidemu-data"; then
+        echo "[$(date '+%F %T')] 警告：androidemu-data 卷删除失败（仍存在），请手动执行 docker volume rm androidemu-data"
+    else
+        ### 3.9.9-r4：不再笼统写「数据卷已彻底删除」。首次安装会改写 compose 为目录挂载
+        ### （data_location.sh），此时命名卷本来就不存在，真正要清的是应用数据目录（第 8.1 段）。
+        echo "[$(date '+%F %T')] 无 androidemu-data 命名卷残留（当前版本数据在应用数据目录，由第 8.1 段清理）"
+    fi
+else
+    echo "[$(date '+%F %T')] 保留数据卷（wizard_keep_data=${wizard_keep_data:-未提供}）：androidemu-data / androidemu-webrtc-data"
+    ### 3.9.8：把 ARM 系统库集（约 100MB）挪进保留的数据卷，供重装复用。
+    ### 以前它随 @appcenter 一起被删，保留数据重装仍要重新下载 5~10 分钟，
+    ### 与向导「重装秒级完成」的承诺不符。mv 是同卷瞬时操作，失败不影响卸载主流程。
+    _HSRC="${TRIM_APPDEST:-/var/apps/androidemu/target}/translation/houdini"
+    _HKEEP="${TRIM_PKGVAR:-/var/apps/androidemu/var}/vol-data/.houdini_keep"
+    if [ -d "$_HSRC" ] && [ -d "$(dirname "$_HKEEP")" ]; then
+        rm -rf "$_HKEEP" 2>/dev/null || true
+        if mv "$_HSRC" "$_HKEEP" 2>/dev/null; then
+            echo "[$(date '+%F %T')] 已把 ARM 系统库集移入保留数据卷，重装时无需重新下载"
+        fi
+    fi
+    ### 3.9.1：保留数据 ≠ 保留坏掉的表面缓存。
+    ### 只清「桌面图标缓存 + 桌面布局」这类可再生记录，并修正 APK 权限，
+    ### 保证重装后图标正常、账号与应用数据（聊天记录等）原样保留。
+    ### 路径探测顺序很关键（实测踩坑）：/data 实际是 bind 到 ${TRIM_PKGVAR}/vol-data/androidemu-data，
+    ### 而 `docker volume inspect androidemu-data` 返回的是 /vol1/docker/volumes/androidemu-data/_data
+    ### （空目录，改它毫无作用）。故优先容器实际挂载源，其次 vol-data，最后才是 volume 挂载点。
+    _mp=""
+    for _cand in \
+        "$(docker inspect androidemu-android --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' 2>/dev/null)" \
+        "${TRIM_PKGVAR:-/var/apps/androidemu/var}/vol-data/androidemu-data" \
+        "$(docker volume inspect androidemu-data --format '{{.Mountpoint}}' 2>/dev/null)"; do
+        if [ -n "$_cand" ] && [ -d "$_cand/app" ]; then _mp="$_cand"; break; fi
+    done
+    if [ -n "$_mp" ]; then
+        rm -f "$_mp/data/com.android.launcher3/databases/app_icons.db"* 2>/dev/null
+        rm -f "$_mp/data/com.android.launcher3/databases/launcher_"*.db 2>/dev/null
+        rm -f "$_mp/data/com.android.launcher3/databases/widgetpreviews.db" 2>/dev/null
+        find "$_mp/app" -mindepth 1 -type d -exec chmod 0771 {} + 2>/dev/null
+        find "$_mp/app" -type f \( -name '*.apk' -o -name '*.so' \) -exec chmod 0644 {} + 2>/dev/null
+        rm -rf "$_mp"/app/vmdl*.tmp 2>/dev/null
+        echo "[$(date '+%F %T')] 已清理桌面图标缓存并修正 APK 权限（应用数据与账号保留）"
+    fi
+fi
+
+### 8) 宿主侧残留清理（3.9.3 新增）
+###    背景：实测卸载后第三方清理工具（CleanFnOS）仍报「1 个残留应用 / 1 个残留用户」。
+###    现实约束（2026-10-31 实测）：飞牛的卸载回调是以**应用包用户**（docker-androidemu）
+###    身份执行的 —— `sudo -n` 不可用、/etc/passwd 不可写、/docker（root 755）不可写、
+###    iptables 需要 root。因此这里按「能做到的一定做到，做不到的明确写清楚」处理：
+###      · 能做到：应用私有数据目录里的可再生产物、局域网直连的 macvlan 网络、docker 卷
+###      · 做不到：删除系统用户、删除 /docker 副本、删除 iptables 规则（需 root）
+###    原则：只删本应用自己的东西（名字/路径都带 androidemu 前缀），不碰其它应用。
+
+### 8.1 应用私有数据目录（/volX/@appdata/androidemu）
+###    （数据目录权限在「第 4.0 段」由应用自带容器敞开，这里直接用包用户 rm -rf）
+_AE_APPDATA="$(readlink -f "${TRIM_PKGVAR:-/var/apps/androidemu/var}" 2>/dev/null)"
+case "$_AE_APPDATA" in
+    */@appdata/androidemu) : ;;
+    *)
+        for _v in /vol1 /vol2 /vol3 /vol4 /vol5 /vol6; do
+            [ -d "$_v/@appdata/androidemu" ] && { _AE_APPDATA="$_v/@appdata/androidemu"; break; }
+        done
+        ;;
+esac
+_AE_VOL="${_AE_APPDATA%/@appdata/androidemu}"
+
+if [ -n "$_AE_APPDATA" ] && [ -d "$_AE_APPDATA" ]; then
+    _AE_BEFORE="$(du -sk "$_AE_APPDATA" 2>/dev/null | awk '{print $1}')"
+    if [ "${wizard_keep_data:-true}" = "false" ]; then
+        ### 3.9.8 修正（实测 2026-11-06）：旧实现 rm -rf 后无条件打印「已删除」。
+        ### 实际包用户删不掉容器内系统进程写入的文件，rm 静默失败 → 「删除数据」形同摆设，
+        ### 重装后旧应用/旧账号数据全部复活（实测 384MB 旧 userdata 残留）。
+        ### 3.9.9-r4：真正的大头已在 uninstall_init 里用容器内删除清掉（此处多半只剩空壳）。
+        rm -rf "$_AE_APPDATA" 2>/dev/null || true
+        [ -d "$_AE_APPDATA" ] && rmdir "$_AE_APPDATA" 2>/dev/null || true
+        if [ -d "$_AE_APPDATA" ] && [ -n "$(ls -A "$_AE_APPDATA" 2>/dev/null)" ]; then
+            _AE_LEFT="$(du -sk "$_AE_APPDATA" 2>/dev/null | awk '{print $1}')"
+            echo "[$(date '+%F %T')] 警告：应用数据目录仍有残留（约 $(( ${_AE_LEFT:-0} / 1024 ))MB，属主为容器内系统进程，应用身份无权删除）：$_AE_APPDATA"
+            echo "[$(date '+%F %T')] 如仍看到旧应用数据，请以管理员身份执行：rm -rf '$_AE_APPDATA'"
+        else
+            echo "[$(date '+%F %T')] 已删除应用数据目录：$_AE_APPDATA（向导选择删除数据）"
+        fi
+    else
+        ### 保留数据：只留 vol-data（安卓应用与账号数据），其余均为可再生的中间产物
+        ### （机型伪装 build.prop、ARM 库集 armlibs、各种 *.log/*.pid、拉取缓存等）
+        find "$_AE_APPDATA" -mindepth 1 -maxdepth 1 ! -name 'vol-data' -exec rm -rf {} + 2>/dev/null || true
+        ### vol-data 为空（从未开机成功 / 没装过应用）时一并删掉，避免留下空目录被判为残留
+        if [ -d "$_AE_APPDATA/vol-data" ] && [ -z "$(ls -A "$_AE_APPDATA/vol-data" 2>/dev/null)" ]; then
+            rm -rf "$_AE_APPDATA/vol-data" 2>/dev/null || true
+        fi
+        rmdir "$_AE_APPDATA" 2>/dev/null || true
+        _AE_AFTER="$(du -sk "$_AE_APPDATA" 2>/dev/null | awk '{print $1}')"
+        echo "[$(date '+%F %T')] 已清理应用数据目录中的可再生产物（保留安卓数据 vol-data）：$(( ${_AE_BEFORE:-0} - ${_AE_AFTER:-0} ))KB"
+    fi
+fi
+
+### 8.2 平台侧目录：清空内容；目录本身由飞牛管理（父目录 root 所有，删不掉属正常）
+if [ -n "$_AE_VOL" ]; then
+    for _d in "$_AE_VOL/@apphome/androidemu" "$_AE_VOL/@appconf/androidemu"; do
+        [ -d "$_d" ] || continue
+        find "$_d" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+        rmdir "$_d" 2>/dev/null || true
+    done
+fi
+
+### 8.3 /docker 下的 compose 副本（升级中转文件，卸载后无用；该目录归系统管理员所有，删不掉就说明清楚）
+if [ -f /docker/docker-compose.yaml ] && grep -q "androidemu" /docker/docker-compose.yaml 2>/dev/null; then
+    if rm -f /docker/docker-compose.yaml 2>/dev/null; then
+        echo "[$(date '+%F %T')] 已删除 /docker/docker-compose.yaml（本应用的 compose 副本）"
+    else
+        echo "[$(date '+%F %T')] 提示：/docker/docker-compose.yaml 位于系统管理目录，应用身份无权删除；需要彻底清理请以管理员身份执行：rm -f /docker/docker-compose.yaml"
+    fi
+fi
+
+### 8.4 局域网直连：macvlan 网络（docker 组可删）+ iptables 放行规则（需 root）
+if [ -f "${TRIM_APPDEST}/scripts/lan_bridge.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/lan_bridge.sh" off >/dev/null 2>&1 || true
+fi
+_LB_CONF="${TRIM_PKGVAR:-/var/apps/androidemu/var}/lan_bridge.conf"
+if [ -f "$_LB_CONF" ]; then
+    IPRANGE_TMP="$(sed -n 's/^IPRANGE=//p' "$_LB_CONF" 2>/dev/null | head -n1)"
+    _b3="${IPRANGE_TMP%.*}"
+    case "$_b3" in
+        [0-9]*.[0-9]*.[0-9]*)
+            for _o in 248 249 250 251 252 253 254 255; do
+                iptables -D INPUT -s "$_b3.$_o" -j ACCEPT 2>/dev/null || true
+            done
+            ;;
+    esac
+fi
+docker network rm androidemu_lan >/dev/null 2>&1 || true
+
+### 8.5 系统用户 docker-androidemu：**刻意保留**（不是删不掉就算了）
+###    两个原因：
+###      ① 该用户由飞牛按 config/privilege 创建，卸载回调以该用户身份运行，无权 userdel
+###         （实测 sudo 不可用、/etc/passwd 不可写）；
+###      ② 更关键 —— 安卓数据目录（@appdata/.../vol-data）的属主就是它的 uid，
+###         删掉用户再重装会分配新 uid，旧数据将不可读，「保留数据卸载重装」直接失效。
+###    因此这里只做说明；用户彻底不再使用时可按需手动删除（见下方提示）。
+if id docker-androidemu >/dev/null 2>&1; then
+    echo "[$(date '+%F %T')] 系统用户 docker-androidemu 已保留：它是安卓数据目录的属主，删除会导致重装后旧数据不可读。"
+    echo "[$(date '+%F %T')]   若确定不再使用本应用，可由管理员执行：userdel docker-androidemu   （可选）"
+fi
+
+echo "[$(date '+%F %T')] 宿主侧残留清理完成"
+exit 0

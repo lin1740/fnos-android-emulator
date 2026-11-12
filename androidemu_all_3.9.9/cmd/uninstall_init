@@ -1,0 +1,252 @@
+#!/bin/bash
+# 3.9.9-r2：补齐 /usr/sbin（runuser 所在目录），避免回调里降权分支失效。
+case ":${PATH:-}:" in
+    *:/usr/sbin:*) ;;
+    *) export PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}:/usr/sbin:/sbin" ;;
+esac
+# ============================================================
+# uninstall_init - 卸载/升级前脚本
+# 设计原则：
+#   1. 任何情况下都不得返回非0退出码（飞牛会判定为"执行脚本出错"）
+#   2. 所有输出重定向到日志，stdout必须干净
+#   3. 升级流程只做compose同步，不做任何破坏性清理
+#   4. 所有命令都有错误兜底
+# ============================================================
+
+# 关键：不使用set -e，任何命令失败都不能导致脚本退出
+set +e
+
+# 3.9.9-r2：日志改写到 /tmp。原路径在应用数据目录内，卸载回调清理「可再生产物」
+# 时会把它一起删掉（实测 2026-11-10 卸载后 uninstall_init.log 不存在，无法审计
+# 身份与 socat 清理结果），与 uninstall_callback 早先改到 /tmp 是同一个原因。
+LOG_DIR="/tmp"
+mkdir -p "$LOG_DIR" 2>/dev/null
+
+# 输出重定向到日志（用更安全的方式，避免exec失败导致脚本异常）
+exec >>"$LOG_DIR/androidemu-uninstall-init.log" 2>&1
+
+echo "========================================"
+echo "[$(date '+%F %T')] uninstall_init 开始执行"
+echo "  身份=$(id -un 2>/dev/null) uid=$(id -u 2>/dev/null)"
+echo "  TRIM_APP_STATUS=${TRIM_APP_STATUS:-<未设置>}"
+echo "  TRIM_OLD_APPVER=${TRIM_OLD_APPVER:-<未设置>}"
+echo "  TRIM_TEMP_UPGRADE_FOLDER=${TRIM_TEMP_UPGRADE_FOLDER:-<未设置>}"
+echo "  TRIM_APPDEST=${TRIM_APPDEST:-<未设置>}"
+echo "  向导字段 wizard_keep_data=${wizard_keep_data:-<未设置>} wizard_delete_images=${wizard_delete_images:-<未设置>}"
+echo "========================================"
+
+# ============================================================
+# 升级守卫：升级流程只同步compose文件，不做任何清理
+# 飞牛升级时可能设置以下任一变量：
+#   - TRIM_APP_STATUS=UPGRADE
+#   - TRIM_OLD_APPVER（旧版本号）
+#   - TRIM_TEMP_UPGRADE_FOLDER（临时升级目录）
+#   - TRIM_APP_OP=upgrade（部分版本用这个）
+IS_UPGRADE=0
+if [ "$TRIM_APP_STATUS" = "UPGRADE" ]; then IS_UPGRADE=1; fi
+if [ -n "${TRIM_OLD_APPVER:-}" ]; then IS_UPGRADE=1; fi
+if [ -n "${TRIM_TEMP_UPGRADE_FOLDER:-}" ]; then IS_UPGRADE=1; fi
+if [ "${TRIM_APP_OP:-}" = "upgrade" ]; then IS_UPGRADE=1; fi
+
+if [ "$IS_UPGRADE" = "1" ]; then
+    echo "[$(date '+%F %T')] 检测到升级流程，仅同步compose文件，不做清理"
+    mkdir -p /docker 2>/dev/null
+    if [ -f "${TRIM_APPDEST}/docker/docker-compose.yaml" ]; then
+        cp -f "${TRIM_APPDEST}/docker/docker-compose.yaml" /docker/docker-compose.yaml 2>/dev/null
+        chmod 644 /docker/docker-compose.yaml 2>/dev/null
+        echo "[$(date '+%F %T')] compose文件已同步到/docker/"
+    else
+        echo "[$(date '+%F %T')] 警告：未找到compose文件 ${TRIM_APPDEST}/docker/docker-compose.yaml"
+    fi
+    echo "[$(date '+%F %T')] 升级守卫完成，正常退出"
+    exit 0
+fi
+
+echo "[$(date '+%F %T')] 非升级流程，执行完整卸载清理"
+
+# 3.9.9-r2：清理 ADB 转发 socat 的宿主残留（含历史版本以 root 启动的实例）。
+# 旧版在 root 且 runuser 不可用时把 socat 起成 高权限常驻；uninstall_callback 是包用户，
+# 杀不掉 高权限进程，导致卸载后 5556 仍被占用并指向已销毁的容器 IP（x86 实体机实测）。
+# 这里在 init 阶段按「本应用 ADB 端口 + socat 特征」精确清理，不误伤其它应用的转发。
+_AE_VAR0="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+_ADP0="$(grep -m1 '^ADB_PORT=' "$_AE_VAR0/ports.conf" 2>/dev/null | cut -d= -f2)"
+case "$_ADP0" in ''|*[!0-9]*) _ADP0=5556 ;; esac
+for _sp in $(ps -eo pid,args 2>/dev/null | grep -F "socat TCP-LISTEN:${_ADP0}," | grep -v grep | awk '{print $1}'); do
+    kill -9 "$_sp" 2>/dev/null && echo "[$(date '+%F %T')] 已清理 ADB 转发 socat 残留 pid=$_sp 端口=$_ADP0"
+done
+
+# ============================================================
+# 1) 停止后台拉取进程
+VAR_DIR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+if [ -f "$VAR_DIR/pull.pid" ]; then
+    PID=$(cat "$VAR_DIR/pull.pid" 2>/dev/null)
+    if [ -n "$PID" ]; then
+        kill "$PID" 2>/dev/null
+        echo "[$(date '+%F %T')] 已停止拉取进程 PID=$PID"
+    fi
+fi
+pkill -f "pull_image.sh" 2>/dev/null
+pkill -f "start_pull_bg.sh" 2>/dev/null
+rm -f "$VAR_DIR/pull.pid" "$VAR_DIR/pull.log" "$VAR_DIR/pull-progress.log" "$VAR_DIR/eta.state" 2>/dev/null
+
+# ============================================================
+# 2) 停止网关和音频守护
+if [ -f "${TRIM_APPDEST}/server/gateway.py" ]; then
+    python3 "${TRIM_APPDEST}/server/gateway.py" stop 2>/dev/null
+    echo "[$(date '+%F %T')] 已停止网关"
+fi
+if [ -f "${TRIM_APPDEST}/scripts/androidemu_daemon.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/androidemu_daemon.sh" stop 2>/dev/null
+    echo "[$(date '+%F %T')] 已停止音频守护"
+fi
+rm -f "${TRIM_APPDEST}/app.sock" 2>/dev/null
+rm -f "$VAR_DIR/gateway.lock" "$VAR_DIR/audio_fix.pid" 2>/dev/null
+
+# ============================================================
+# 2.5) 停止本应用**全部**后台守护（3.8.9 修复）
+#   问题实测：此前只停了网关与音频守护，boot_guard / webrtc_watchdog / fix_keystore /
+#   agent_autodeploy 等守护会残留下来，继续指向已被删除的应用目录反复报错（实测卸载后
+#   仍有 6 个守护进程在跑，且属主为 root，用户侧无法清理）。
+#   做法：按「唯一脚本名 + cmdline 含 androidemu」双重匹配，只杀本应用自己的守护，
+#   不会误伤同名脚本的其它应用；升级流程在上方守卫处已提前退出，不会走到这里。
+### 3.9.4：agent_watchdog_loop.sh 是降权后的常驻循环脚本（root 调用时以 docker-androidemu
+###   身份拉起），其命令行里不含 agent_autodeploy.sh，必须单列，否则卸载后会残留。
+for _name in boot_guard.sh webrtc_watchdog.sh fix_keystore.sh fix_storage_perm.sh \
+             agent_autodeploy.sh agent_watchdog_loop.sh redroid_adb_forward.sh audio_fix.py gateway.py gateway_amd64 gateway_arm64 \
+             start_pull_bg.sh pull_image.sh supervisor; do
+    for _p in $(ps -eo pid,args 2>/dev/null | grep -F "$_name" | grep -F 'androidemu' | grep -v grep | awk '{print $1}'); do
+        [ "$_p" = "$$" ] && continue
+        kill -9 "$_p" 2>/dev/null
+    done
+done
+echo "[$(date '+%F %T')] 已停止本应用全部后台守护"
+rm -f "$VAR_DIR"/*.pid "$VAR_DIR"/boot_guard.stamp "$VAR_DIR"/dri_release.done 2>/dev/null
+
+# ============================================================
+# 3) 强制删除容器（不依赖compose，compose文件异常也能清干净）
+### 3.9.9-r4：删容器之前先把「删除数据」真正执行掉。
+###   实测 2026-11-12（手机客户端卸载，向导选了「删除数据」）：
+###     uninstall_init 在 19:58:33 已 rm -f 容器 → 回调 19:58:43 的「容器内删除」里
+###     `docker inspect` 直接失败返回 0，等于什么都没删；
+###     随后「数据卷」删的是早已不用的命名卷（当前版本首次安装已改为 bind 挂载），
+###     最后包用户 rm -rf 撞上 0771 的安卓数据目录，静默失败 → 残留 298MB 用户数据。
+### 3.9.9-r4 补充：向导字段是否传进 uninstall_init 依飞牛版本而定（回调一定能拿到）。
+###   为了两种情况都正确：
+###     · wizard_keep_data=false  → 这里先清空数据，再删容器；
+###     · wizard_keep_data 为空   → 只停止容器，把「按用户选择清数据 + 删容器」留给回调，
+###       否则回调里 `docker inspect` 找不到容器，删除会变成空操作（就是本次问题的成因）。
+_AE_CONTAINERS_GONE=1
+if [ "${wizard_keep_data:-true}" = "false" ]; then
+    echo "[$(date '+%F %T')] 向导选择「删除数据」：在删除容器前清空安卓与画面服务数据"
+    _ae_init_purge() {   # $1=容器名 $2=容器内数据目录 $3=容器内 shell
+        docker inspect "$1" >/dev/null 2>&1 || return 0
+        if [ "$(docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null)" != "running" ]; then
+            docker start "$1" >/dev/null 2>&1 || true
+            _w=0
+            while [ "$_w" -lt 20 ]; do
+                [ "$(docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null)" = "running" ] && break
+                sleep 1; _w=$((_w+1))
+            done
+        fi
+        _w=0
+        while [ "$_w" -lt 10 ]; do
+            docker exec "$1" "${3:-/system/bin/sh}" -c \
+                "stop 2>/dev/null; sleep 2; \
+                 rm -rf '$2'/* '$2'/.[!.]* 2>/dev/null; sleep 1; \
+                 rm -rf '$2'/* '$2'/.[!.]* 2>/dev/null; \
+                 find '$2' -type d -exec chmod 0777 {} + 2>/dev/null; \
+                 kill -9 1" >/dev/null 2>&1
+            case "$?" in
+                0|137|143) return 0 ;;
+            esac
+            [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" != "true" ] && return 0
+            sleep 2; _w=$((_w+1))
+        done
+        return 1
+    }
+    if _ae_init_purge androidemu-android /data /system/bin/sh; then
+        echo "[$(date '+%F %T')] 已清空安卓数据（容器内删除）"
+    else
+        echo "[$(date '+%F %T')] 警告：安卓数据未能清空，回调阶段会再尝试一次"
+    fi
+    if _ae_init_purge androidemu-webrtc /app/data sh; then
+        echo "[$(date '+%F %T')] 已清空画面服务数据（容器内删除）"
+    fi
+elif [ -z "${wizard_keep_data:-}" ]; then
+    echo "[$(date '+%F %T')] 未获取到向导字段 wizard_keep_data：只停止容器，数据与容器删除交由回调阶段处理"
+    _AE_CONTAINERS_GONE=0
+else
+    echo "[$(date '+%F %T')] 未选择删除数据（wizard_keep_data=${wizard_keep_data}），保留安卓数据"
+fi
+
+for C in androidemu-android androidemu-webrtc androidvm-rd-android androidvm-rd-webrtc; do
+    if [ "$_AE_CONTAINERS_GONE" = "1" ]; then
+        docker rm -f "$C" 2>/dev/null
+    else
+        docker stop -t 10 "$C" >/dev/null 2>&1
+    fi
+done
+if [ "$_AE_CONTAINERS_GONE" = "1" ]; then
+    echo "[$(date '+%F %T')] 已清理容器"
+else
+    echo "[$(date '+%F %T')] 已停止容器（未删除，等待回调阶段按向导选择处理）"
+fi
+
+# ============================================================
+# 4) 删除网络（容器仍未删除时交给回调：网络被容器占用时删不掉）
+### 3.9.1：网络删除要重试 —— 容器刚删时网络可能仍被引用，一次性 rm 会失败（历史上因此残留，
+### 导致下次安装 compose 报 "network with name androidemu_default already exists"）。
+_ae_rm_network() {
+    local _i=0
+    while [ $_i -lt 3 ]; do
+        docker network rm androidemu_default androidemu_lan docker_default androidvm-rd_default >/dev/null 2>&1 && break
+        _i=$((_i+1)); sleep 1
+    done
+    for _net in $(docker network ls --filter label=com.docker.compose.project=androidemu -q 2>/dev/null); do
+        docker network rm "$_net" >/dev/null 2>&1 || true
+    done
+}
+if [ "$_AE_CONTAINERS_GONE" = "1" ]; then
+    _ae_rm_network
+    echo "[$(date '+%F %T')] 已清理网络"
+else
+    echo "[$(date '+%F %T')] 容器尚未删除，网络清理交由回调阶段"
+fi
+
+# ============================================================
+# 5) compose down 兜底（容器还在时必须跳过，否则 down 会把容器删掉，回调就无法清数据）
+if [ "$_AE_CONTAINERS_GONE" = "1" ] && [ -d "${TRIM_APPDEST}/docker" ]; then
+    cd "${TRIM_APPDEST}/docker" 2>/dev/null
+    ### 3.9.2：容器在上面已 rm -f，此处只是网络/残留兜底，超时从 30s 降到 8s ——
+    ### 飞牛卸载有总超时，实测容器异常时 30s 的 down 会让整个卸载被判失败。
+    docker compose -p androidemu down -t 8 --remove-orphans 2>/dev/null
+    echo "[$(date '+%F %T')] compose down 完成"
+fi
+
+# ============================================================
+# 6) 镜像：默认保留，只有卸载向导明确选择删除才删
+if [ "$_AE_CONTAINERS_GONE" != "1" ]; then
+    ### 容器仍在（镜像被容器引用时删不掉），镜像处理交给回调阶段
+    echo "[$(date '+%F %T')] 容器尚未删除，镜像处理交由回调阶段"
+elif [ "${wizard_delete_images:-false}" = "true" ]; then
+    echo "[$(date '+%F %T')] 用户选择删除镜像，开始清理"
+    ### 3.8.9：镜像名取自 runtime.conf（不写死版本），随后再按前缀兜底扫一遍（覆盖历史/别名标签）
+    if [ -f "${TRIM_APPDEST}/scripts/rtconf.sh" ]; then
+        # shellcheck disable=SC1091
+        . "${TRIM_APPDEST}/scripts/rtconf.sh"
+        rtconf_load
+    fi
+    for IMG in "${CANON_REDROID:-}" "${OFF_REDROID:-}" "${CANON_WEBRTC:-}" "${OFF_WEBRTC:-}" \
+               "${CACHE_REDROID:-}" "${CACHE_WEBRTC:-}"; do
+        [ -n "$IMG" ] && docker image rm "$IMG" 2>/dev/null
+    done
+    docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -E '(redroid/redroid|buutuu/scrcpy-over-webrtc):' | sort -u | while read -r IMG; do
+        docker image rm "$IMG" 2>/dev/null
+    done
+    echo "[$(date '+%F %T')] 镜像清理完成"
+else
+    echo "[$(date '+%F %T')] 保留容器镜像（未选择删除），下次安装可直接复用"
+fi
+
+echo "[$(date '+%F %T')] uninstall_init 完成，正常退出"
+exit 0

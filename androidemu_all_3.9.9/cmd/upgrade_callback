@@ -1,0 +1,553 @@
+#!/bin/bash
+
+### 3.9.9-r2：补齐 /usr/sbin（runuser 所在目录），避免升级回调里的降权后台
+### 任务因找不到 runuser 而回退成 高权限常驻。只补缺失段。
+case ":${PATH:-}:" in
+    *:/usr/sbin:*) ;;
+    *) export PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}:/usr/sbin:/sbin" ;;
+esac
+
+### This script is called after the user upgrades the application.
+### Re-apply the same safeguards as install_callback so that an upgrade
+### from a previous version keeps images ready, PUBLIC_IP correct, and
+### GPU passthrough / software-render fallback intact. x86 与 ARM 合包后，
+### 本脚本同样按宿主架构自适应 DRI 路径、binderfs 与软件渲染回退。
+
+### 关键：把本脚本全部输出重定向到日志文件，保证 stdout 干净。
+### 飞牛对升级/安装脚本的 stdout 敏感：若脚本向标准输出打印内容
+### （如镜像拉取 echo 日志），会被判定为「脚本出错且原因未知」。
+LOG_DIR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+VAR_DIR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+exec >> "$LOG_DIR/upgrade.log" 2>&1
+
+### 3.9.9-r2：升级开始同样清理旧版遗留的 ADB 转发 socat（低版本升级路径不经过
+### install_callback）。按实际端口精确匹配；权限不足时如实记录，不影响升级主流程。
+_AE_USPORT="$(grep -m1 '^ADB_PORT=' "$VAR_DIR/ports.conf" 2>/dev/null | cut -d= -f2)"
+case "$_AE_USPORT" in ''|*[!0-9]*) _AE_USPORT=5556 ;; esac
+for _AE_UP in $(ps -eo pid,args 2>/dev/null | grep -F "socat TCP-LISTEN:${_AE_USPORT}," | grep -v grep | awk '{print $1}'); do
+    if kill -9 "$_AE_UP" 2>/dev/null; then
+        echo "[$(date '+%F %T')] 升级前清理遗留 ADB 转发 socat（pid=$_AE_UP 端口=$_AE_USPORT）"
+    else
+        echo "[$(date '+%F %T')] 遗留 ADB 转发 socat 非本用户进程（pid=$_AE_UP），回调无权清理"
+    fi
+done
+
+### 3.9.3 修正：升级保留 var 数据——若 var 里有历史 root 会话留下的 系统属主
+### 物件（实测 2026-10-31 全新安装窗：var/props 为 0:0 755，apply_rebrand
+### 的 rm -rf props→mv props.new→props 原子切换无法完成，身份伪装挂载缺失），
+### 且解包后应用树在应用中心托管到位前同样是 系统属主（同日安装官方日志：
+### tune_compose 对 compose 共 19 条 Permission denied）。root 环境下先行归一化：
+### 应用树与 var 遗留物件全部纠正到 docker-androidemu 名下，后续
+### tune_compose / apply_rebrand / harden_system 的写入与幂等重放才能成立。
+### 非 系统身份下本块整体跳过，行为不变；只动本应用自己的目录。
+if [ "$(id -u)" = "0" ]; then
+    _APP_TREE="${TRIM_APPDEST:-/vol1/@appcenter/androidemu}"
+    chown -R docker-androidemu:docker "$_APP_TREE" 2>/dev/null || true
+    find "$VAR_DIR" ! -user docker-androidemu -exec chown docker-androidemu:docker {} + 2>/dev/null || true
+    echo "[$(date '+%F %T')] 应用树/var 属主归一化完成（3.9.3 权限修正）"
+fi
+
+### 升级保持已选安卓系统版本（VAR_DIR/android_version 持久化）
+if [ -f "${VAR_DIR}/android_version" ]; then
+    _KEEP_VER=$(cat "${VAR_DIR}/android_version" 2>/dev/null | tr -d "\r\n\t ")
+    case "$_KEEP_VER" in
+        10|11|12|13|14|15|16)
+            export ANDROIDEMU_ANDROID_VER="$_KEEP_VER"
+            _RT_CONF="${TRIM_APPDEST}/docker/runtime.conf"
+            if [ -f "$_RT_CONF" ]; then
+                sed -i "/^ANDROIDEMU_ANDROID_VER=/d" "$_RT_CONF"
+                sed -i "1i ANDROIDEMU_ANDROID_VER=\"$_KEEP_VER\"" "$_RT_CONF"
+            fi
+            echo "[$(date '+%F %T')] 升级保持安卓系统版本：Android $_KEEP_VER"
+        ;;
+    esac
+fi
+
+_INSTALL_SUCCESS=0
+_cleanup_on_failure() {
+    # 只有在未成功完成时才清理
+    if [ "$_INSTALL_SUCCESS" = "1" ]; then
+        return 0
+    fi
+    echo "[$(date '+%F %T')] 检测到安装/升级未正常完成，执行清理..." >&2
+
+    # 1. 停止并删除本应用的容器（新旧命名都清）
+    for _CN in androidemu-android androidemu-webrtc \
+               androidemu_arm-android androidemu_arm-webrtc \
+               androidvm-rd-android androidvm-rd-webrtc; do
+        docker rm -f "$_CN" >/dev/null 2>&1 || true
+    done
+
+    # 2. 删除本应用的网络
+    docker network rm androidemu_default androidvm-rd_default >/dev/null 2>&1 || true
+
+    # 3. 停止后台进程（音频守护、agent部署、镜像拉取等，不碰网关）
+    if [ -f "${TRIM_APPDEST}/scripts/androidemu_daemon.sh" ]; then
+        bash "${TRIM_APPDEST}/scripts/androidemu_daemon.sh" stop >/dev/null 2>&1 || true
+    fi
+    pkill -f "bash .*androidemu.*/scripts/agent_autodeploy.sh" >/dev/null 2>&1 || true
+    pkill -f "bash .*androidemu.*/scripts/start_pull_bg.sh" >/dev/null 2>&1 || true
+    pkill -f "bash .*androidemu.*/scripts/pull_image.sh" >/dev/null 2>&1 || true
+    pkill -f "bash .*androidemu.*/scripts/webrtc_watchdog.sh" >/dev/null 2>&1 || true
+    pkill -f "bash .*androidemu.*/scripts/redroid_adb_forward.sh" >/dev/null 2>&1 || true
+    # 注意：不停止网关服务、不删除 socket，由 systemd 自动管理
+
+    # 5. 全新安装失败时，删除 /docker/docker-compose.yaml（如果是本应用创建的）
+    #    升级时不删除，因为可能有其他版本依赖
+
+    # 6. 删除临时状态文件
+    rm -f "${TRIM_PKGVAR:-/var/apps/androidemu/var}/.installing" >/dev/null 2>&1 || true
+
+    echo "[$(date '+%F %T')] 清理完成" >&2
+}
+trap _cleanup_on_failure EXIT INT TERM HUP
+
+echo "[$(date '+%F %T')] ==== upgrade_callback 开始，宿主架构：$(uname -m)，旧版本：${TRIM_OLD_APPVER:-未知} ===="
+
+### 0) 升级前清理旧容器（保留数据卷 androidemu-data，安卓应用数据不丢），
+###    避免旧容器状态异常或 recreate 冲突导致升级失败（飞牛报「执行脚本出错且原因未知」）。
+###    兼容改名前的旧版残留（androidvm-rd-*）与旧独立 ARM 版容器（androidemu_arm-*，
+###    合包后统一接管；其数据卷不迁移，由用户自行决定保留/删除）。
+### 3.9.5 修复：常规升级路径必须同时清掉本应用自己的两个容器。
+### 旧逻辑只清 legacy 命名，导致「停用后容器处于 Created/Exited 残留」时，
+### 升级到 compose up 阶段撞名失败（实测：Container name "/androidemu-android"
+### is already in use → 升级中断、应用目录被删、数据卷被清）。数据卷保留不动。
+for LEGACY_NAME in androidemu-android androidemu-webrtc \
+                   androidemu_arm-android androidemu_arm-webrtc \
+                   androidvm-rd-android androidvm-rd-webrtc; do
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${LEGACY_NAME}$"; then
+        docker rm -f "${LEGACY_NAME}" 2>/dev/null || true
+    fi
+done
+### 顺带清掉 compose 改名产生的孤儿（<hash>_androidemu-*），同样会占名字
+docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^[0-9a-f]{12}_androidemu-' | while read -r _o; do
+    docker rm -f "$_o" 2>/dev/null || true
+done
+
+COMPOSE="${TRIM_APPDEST}/docker/docker-compose.yaml"
+HELPER="${TRIM_APPDEST}/scripts/pull_image.sh"
+
+### 3.9.8：把 compose 同步到 /docker/docker-compose.yaml（飞牛 docker-project 升级/启停读取该路径）。
+### 说明：/docker 由 root 拥有（755），包用户通常写不进去；本函数已改为 best-effort，
+### 写不进去就跳过（飞牛的 docker 项目记录用的是绝对路径，不依赖这份副本）。
+_ae_compose_to_docker(){
+    ### 仅做 best-effort 同步：包用户对 /docker（root 755）没有写权限时直接跳过，
+    ### 不再借 高权限容器写入。飞牛的 docker 项目记录里保存的是绝对路径
+    ### （/usr/trim/etc/dockermgr.conf 的 projects[].folder = <应用目录>/docker），
+    ### 不依赖 /docker 这份副本，功能上缺失它也不影响安装、升级、启停。
+    [ -f "$1" ] || return 0
+    cp -f "$1" /docker/docker-compose.yaml 2>/dev/null || return 0
+    chmod 644 /docker/docker-compose.yaml 2>/dev/null || true
+    return 0
+}
+
+### Round pull: ensure both images are present.
+if [ -f "$HELPER" ]; then
+    . "$HELPER"
+    ensure_redroid_image || true
+    ensure_webrtc_image || true
+fi
+
+### 1) Fill the real NAS IP into the compose file.
+### 3.9.1：优先真实局域网 IP（hostname -I 首个常是 docker 网桥）
+if [ -f "${TRIM_APPDEST}/scripts/net_util.sh" ]; then . "${TRIM_APPDEST}/scripts/net_util.sh"; fi
+if command -v ae_lan_ip >/dev/null 2>&1; then
+    NAS_IP="$(ae_lan_ip)"
+else
+    NAS_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+fi
+[ -z "$NAS_IP" ] && NAS_IP="127.0.0.1"
+if [ -f "$COMPOSE" ]; then
+    sed -i "s/PUBLIC_IP=127\.0\.0\.1/PUBLIC_IP=${NAS_IP}/g" "$COMPOSE"
+fi
+
+### 2) 架构识别 + GPU 直通/软件渲染 + binderfs 自适应校准（与 install_callback 一致，
+###    统一由 tune_compose.sh 处理，幂等）。
+ARCH="$(uname -m 2>/dev/null)"
+IS_ARM=0
+case "$ARCH" in
+    aarch64|arm*|armv*) IS_ARM=1 ;;
+esac
+DRI_DIR=""
+for D in /usr/lib/x86_64-linux-gnu/dri /usr/lib/aarch64-linux-gnu/dri /usr/lib/arm-linux-gnueabihf/dri; do
+    [ -d "$D" ] && DRI_DIR="$D" && break
+done
+GPU_MODE="software"
+if [ "$IS_ARM" = "0" ] && [ -e /dev/dri ] && [ -n "$DRI_DIR" ]; then
+    GPU_MODE="host"
+fi
+
+### 3.9.8：升级会重新探测 GPU 并重写 render-mode，清掉旧的渲染回退标记，
+### 避免「标记还在但配置已回到 GPU 直通」导致守护永久跳过自愈。
+rm -f "${TRIM_PKGVAR:-/var/apps/androidemu/var}/gpu_fallback.done" \
+      "${TRIM_PKGVAR:-/var/apps/androidemu/var}/gpu_artifact.done" \
+      "${TRIM_PKGVAR:-/var/apps/androidemu/var}/dri_release.done" 2>/dev/null || true
+if [ -f "$COMPOSE" ] && [ -f "${TRIM_APPDEST}/scripts/tune_compose.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/tune_compose.sh" "$COMPOSE" || true
+
+### 3.9.1：设备与 compose 兜底校验。
+### 宿主缺少 /dev/binder 或 /dev/net/tun 时，compose 的 devices 段会导致创建失败
+### （应用中心报「compose 或 container 异常」）。先尝试自愈设备，再校验 compose，
+### 校验失败则仅移除指向不存在路径的挂载/设备/security 行，避免应用无法启用。
+if [ -f "${TRIM_APPDEST}/scripts/ensure_devices.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/ensure_devices.sh" 2>&1 | while read -r _l; do echo "$_l"; done
+### 3.9.1：产品身份伪装（去 redroid 痕迹）。仅在安装/升级时执行一次，不放在启动链路里，
+### 避免 docker create 探测容器与镜像拉取争用导致启动卡住。
+if [ -x "${TRIM_APPDEST}/scripts/apply_rebrand.sh" ]; then
+    timeout 180 bash "${TRIM_APPDEST}/scripts/apply_rebrand.sh" 2>&1 | tail -3 || true
+fi
+fi
+if [ -f "$COMPOSE" ] && ! (cd "$(dirname "$COMPOSE")" && docker compose config -q >/dev/null 2>&1); then
+    echo "compose 校验未通过，清理指向不存在路径的挂载/设备项..."
+    python3 - "$COMPOSE" <<'PYCLEAN'
+import io, os, re, sys
+p = sys.argv[1]
+lines = io.open(p, encoding="utf-8", errors="replace").read().split("\n")
+fixed, removed = [], []
+for l in lines:
+    m = re.match(r"^(\s*-\s*)(/[^:]+):([^:]+)(:ro|:rw)?\s*$", l)
+    if m and not os.path.exists(m.group(2)):
+        removed.append(m.group(2)); continue
+    m = re.match(r"^(\s*-\s*)(/dev/[^\s:]+)\s*$", l)
+    if m and not os.path.exists(m.group(2)):
+        removed.append(m.group(2)); continue
+    m = re.match(r"^(\s*-\s*seccomp=)(/[^\s]+)\s*$", l)
+    if m and not os.path.exists(m.group(2)):
+        removed.append("seccomp=" + m.group(2)); continue
+    fixed.append(l)
+if removed:
+    io.open(p, "w", encoding="utf-8", newline="\n").write("\n".join(fixed))
+    print("已移除无效项 %d 个: %s" % (len(removed), ", ".join(removed[:6])))
+PYCLEAN
+fi
+fi
+
+if [ -f "$COMPOSE" ] && [ -f "${TRIM_APPDEST}/scripts/tune_resources.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/tune_resources.sh" "$COMPOSE" || true
+fi
+
+### 3.9.8：沿用安装时选择的权限级别（profile-level 已存在则不覆盖），并重新应用到 compose。
+if [ -f "${TRIM_APPDEST}/scripts/runtime_profile.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/runtime_profile.sh" "$COMPOSE" || true
+fi
+
+### 3) 3.9.8 起不再修改宿主 DRM 节点权限（放权改在容器内完成，见 scripts/gpu_release.sh）。
+###    3.9.9-r4：清理历史版本遗留的宿主 udev 放权规则，并把节点权限交还系统默认。
+###    背景（2026-11-11 核查）：旧版写过 /etc/udev/rules.d/99-androidemu-drm.rules
+###    （MODE=0666）；升级到 3.9.8/3.9.9 后该文件仍在且生效，/dev/dri 一直 666，
+###    与「除运行环境内设备节点外不修改宿主设备」的约定不符。此处删除并 reload。
+###    删除后容器重建时仍由 install/upgrade 第 5.1 步与 boot_guard 调 gpu_release.sh
+###    在「容器内」放权，宿主节点保持系统默认（root:video|render 660）。
+_DRM_RULE=/etc/udev/rules.d/99-androidemu-drm.rules
+if [ -f "$_DRM_RULE" ]; then
+    rm -f "$_DRM_RULE" 2>/dev/null && echo "[$(date '+%F %T')] 已清理旧版遗留的宿主 DRM udev 规则：$_DRM_RULE"
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules >/dev/null 2>&1 || true
+        udevadm trigger --subsystem-match=drm >/dev/null 2>&1 || true
+    fi
+fi
+
+### 3.5) 3.9.8：不再安装宿主 udev 放权规则（放权改为容器启动后在容器内完成，
+###      宿主 /dev/dri 保持系统默认，见第 5.1 步与 scripts/gpu_release.sh）。
+
+### 3.6) 保留用户已选访问模式（2.0.2）：按 net.conf 重放 PUBLIC_IP/USE_TLS/对外端口，
+###      避免升级把用户的外网/反代设置覆盖回默认；随后第 5 步统一启动容器。
+PORTS_CONF="${VAR_DIR}/ports.conf"
+port_cur() { sed -n "s/^$1=//p" "$PORTS_CONF" 2>/dev/null | head -n1; }
+PMODE="${wizard_port_mode:-default}"
+PW="${wizard_web_port:-}"; PT="${wizard_turn_port:-}"; PA="${wizard_adb_port:-}"
+if [ "$PMODE" = "custom" ]; then
+    [ -n "$PW" ] || PW="$(port_cur WEB_PORT)"; [ -n "$PW" ] || PW=8443
+    [ -n "$PT" ] || PT="$(port_cur TURN_PORT)"; [ -n "$PT" ] || PT=3478
+    [ -n "$PA" ] || PA="$(port_cur ADB_PORT)"; [ -n "$PA" ] || PA=5556
+    case "$PW" in ''|*[!0-9]*) PW=8443 ;; esac
+    case "$PT" in ''|*[!0-9]*) PT=3478 ;; esac
+    case "$PA" in ''|*[!0-9]*) PA=5556 ;; esac
+    { echo "WEB_PORT=$PW"; echo "TURN_PORT=$PT"; echo "ADB_PORT=$PA"; echo "UPDATED=$(date '+%F %T')"; } > "$PORTS_CONF" 2>/dev/null || true
+    echo "[$(date '+%F %T')] 端口按向导设置更新：画面=$PW TURN=$PT ADB=$PA"
+else
+    if [ ! -f "$PORTS_CONF" ]; then
+        { echo "WEB_PORT=8443"; echo "TURN_PORT=3478"; echo "ADB_PORT=5556"; echo "UPDATED=$(date '+%F %T')"; } > "$PORTS_CONF" 2>/dev/null || true
+        echo "[$(date '+%F %T')] 使用默认端口：画面=8443 TURN=3478 ADB=5556"
+    else
+        echo "[$(date '+%F %T')] 保持现有端口：画面=$(port_cur WEB_PORT) TURN=$(port_cur TURN_PORT) ADB=$(port_cur ADB_PORT)"
+    fi
+fi
+if [ -f "${TRIM_APPDEST}/scripts/net_mode.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/net_mode.sh" --no-restart || true
+fi
+
+### 3.9.1：中继段占用预检（仅在冲突时换段）——webrtc 全段映射，任一 UDP 端口被宿主
+### 其它程序占用（实测 pxy 占 50054）会导致容器停在 Created、设备永不上线。
+if [ -f "${TRIM_APPDEST}/scripts/turn_ports.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/turn_ports.sh" || true
+fi
+
+### 3.9.9-r3：升级迁移旧版 resolution.conf 的默认档。
+### 旧版默认 PC 1920x1080 / PHONE 1080x2340 都不是 16 的倍数；升级保留 conf 后，
+### 护栏会把它们向下对齐成 1920x1072 / 1072x2336，并在旧逻辑下覆盖运行期新默认
+### 576x1280（ARM 3.9.8→3.9.9 实测）。这里只替换「与旧版默认一致」的值，
+### 用户自行改过的其它分辨率一律保留；替换后留标记，由护栏执行一次 wm size reset。
+_AE_RC="${TRIM_PKGVAR:-/var/apps/androidemu/var}/resolution.conf"
+if [ -f "$_AE_RC" ]; then
+    _ae_ph=$(grep -m1 '^PHONE=' "$_AE_RC" 2>/dev/null | cut -d= -f2)
+    _ae_pc=$(grep -m1 '^PC=' "$_AE_RC" 2>/dev/null | cut -d= -f2)
+    _ae_rch=0
+    case "$_ae_ph" in
+        1080x2340|1072x2336|720x1440|504x1088)
+            sed -i 's/^PHONE=.*/PHONE=576x1280/' "$_AE_RC" 2>/dev/null && _ae_rch=1 ;;
+    esac
+    case "$_ae_pc" in
+        1920x1080|1920x1072)
+            sed -i 's/^PC=.*/PC=1920x1088/' "$_AE_RC" 2>/dev/null && _ae_rch=1 ;;
+    esac
+    if [ "$_ae_rch" = "1" ]; then
+        grep -q '^DEFAULT=' "$_AE_RC" 2>/dev/null || echo 'DEFAULT=PHONE' >> "$_AE_RC"
+        sed -i "s/^UPDATED=.*/UPDATED=$(date '+%F %T')/" "$_AE_RC" 2>/dev/null || true
+        touch "${TRIM_PKGVAR:-/var/apps/androidemu/var}/.res_default_migrated" 2>/dev/null || true
+        echo "[$(date '+%F %T')] 已迁移旧版默认分辨率 -> PC=1920x1088 PHONE=576x1280（标记待护栏 reset）"
+    fi
+fi
+
+### 4) 把校准后的 compose 同步到 /docker（飞牛 docker-project 升级/启停读取该路径）。
+if [ -f "$COMPOSE" ]; then
+    _ae_compose_to_docker "$COMPOSE"
+fi
+
+### 4.7) 数据存储位置（2.0.53）：升级时若检测到既有安卓数据则保持命名卷不动；
+###      全新路径才会切换到应用空间内的 bind 挂载（幂等）。
+if [ -f "${TRIM_APPDEST}/scripts/data_location.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/data_location.sh" || true
+fi
+
+### 5) Start the compose project.
+### 3.9.4：升级重建前硬清场（关键修复）。
+### 实测（2026-11-01 3.9.3→3.9.4 界面升级）：compose up -d 的 Recreate 需要先移除
+### 旧容器；若旧容器仍在运行（用户没先停用、或开机守护在升级窗口内把画面容器拉回），
+### Docker 直接报「cannot remove container: container is running」，整个升级在中途
+### 失败 —— 用户视角就是「无法更新 / 应用打不开 / 桌面无图标」，且应用被卡在安装中状态。
+### 这里统一硬清场：先停本应用的常驻守护（防止它们在升级窗口内把容器拉回），
+### 再 rm -f 两个容器（安卓数据在外部卷 androidemu-data，不受影响）。
+### 升级收尾会按新版本重建守护、网关与 agent（见下文），无需手工恢复。
+pkill -9 -f "androidemu/scripts/boot_guard.sh" 2>/dev/null || true
+pkill -9 -f "androidemu/scripts/webrtc_watchdog.sh" 2>/dev/null || true
+pkill -9 -f "androidemu/server/audio_fix.py" 2>/dev/null || true
+pkill -9 -f "androidemu/scripts/agent_autodeploy.sh" 2>/dev/null || true
+pkill -9 -f "androidemu/scripts/redroid_adb_forward.sh" 2>/dev/null || true
+docker rm -f androidemu-android androidemu-webrtc >/dev/null 2>&1 || true
+if [ -d "${TRIM_APPDEST}/docker" ]; then
+    cd "${TRIM_APPDEST}/docker" || true
+    # -p androidemu：固定 compose 项目名，避免与飞牛应用中心创建的项目名不一致
+    # 导致「容器名已被占用」Conflict，升级/启动失败（报执行脚本出错）
+    docker compose -p androidemu up -d 2>/dev/null || true
+fi
+### 5.1) 3.9.8：容器起来后立刻给「容器内」/dev/dri 放权（surfaceflinger 还没打开设备）。
+###      宿主 /dev/dri 保持原样，不再被本应用改动。
+if [ -f "${TRIM_APPDEST}/scripts/gpu_release.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/gpu_release.sh" --wait 30 >/dev/null 2>&1 || true
+fi
+### 3.9.9：投屏可启动性（app_process 副本 + 最小能力 + bind mount）
+if [ -f "${TRIM_APPDEST}/scripts/app_process_caps.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/app_process_caps.sh" --install || true
+fi
+### 3.9.9：受限档运行期复核（脚本内部按档位自判，非该档直接退出）
+if [ -f "${TRIM_APPDEST}/scripts/runtime_guard.sh" ]; then
+    TRIM_PKGVAR="${TRIM_PKGVAR:-/var/apps/androidemu/var}" bash "${TRIM_APPDEST}/scripts/runtime_guard.sh" >/dev/null 2>&1 || true
+fi
+### 3.9.9：系统导航条修复（镜像 overlay 缺失 → 导航条异常巨大遮挡应用底部控件；
+### 安卓未启动完成时脚本自动跳过，由 boot_guard 巡检兜底）
+if [ -f "${TRIM_APPDEST}/scripts/fix_navbar.sh" ]; then
+    TRIM_PKGVAR="${TRIM_PKGVAR:-/var/apps/androidemu/var}" bash "${TRIM_APPDEST}/scripts/fix_navbar.sh" --install || true
+fi
+
+if [ -f "${TRIM_APPDEST}/scripts/webrtc_watchdog.sh" ]; then
+    echo "[$(date '+%F %T')] 画面服务自检（端口级）…"
+    bash "${TRIM_APPDEST}/scripts/webrtc_watchdog.sh" ensure || true
+fi
+### 修复「更新后 bad gateway / 网关自动登录 401」：数据卷保留时 users.json 里的口令哈希
+### 可能与内置默认口令不一致，自动登录必然 401。先试登录，失败才备份→删文件→重启自举，
+### 失败自动回滚（存在 gw_admin.conf 视为自定义口令，默认不动）。正常时 1 秒内返回。
+if [ -f "${TRIM_APPDEST}/scripts/fix_webrtc_auth.sh" ]; then
+    echo "[$(date '+%F %T')] 校验画面服务后台账号…"
+    TRIM_PKGVAR="${TRIM_PKGVAR:-/var/apps/androidemu/var}" timeout 150 \
+        bash "${TRIM_APPDEST}/scripts/fix_webrtc_auth.sh" || true
+fi
+for _N in $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^(androidemu|androidvm-rd|androidemu_arm)' | grep -v -E '^androidemu-(android|webrtc)$'); do
+    docker rm -f "$_N" 2>/dev/null || true
+    echo "[$(date '+%F %T')] 已清理重复/历史容器：$_N"
+done
+if [ -f "${TRIM_APPDEST}/scripts/agent_autodeploy.sh" ]; then
+    ### 3.9.4：本回调以系统身份运行，原先直接 nohup 会把「系统身份的 agent 常驻循环」留在宿主上
+    ### （实测 upgrade 后宿主同时存在一份 root、一份 docker-androidemu 的 while 循环，每 30s
+    ### 各扫一次；runtime.status 自己写着「期望无系统身份常驻」，容易被误判为高权限应用）。
+    ### 这里降权到应用用户启动；脚本内部自身也会在检测到 root 时降权并做跨别名单实例清理，双保险。
+    _AE_VAR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+    if id docker-androidemu >/dev/null 2>&1; then
+        if command -v runuser >/dev/null 2>&1; then
+            nohup runuser -u docker-androidemu -- env TRIM_APPDEST="$TRIM_APPDEST" TRIM_PKGVAR="$_AE_VAR" \
+                bash "${TRIM_APPDEST}/scripts/agent_autodeploy.sh" >/dev/null 2>&1 &
+        elif command -v su >/dev/null 2>&1; then
+            nohup su -s /bin/bash docker-androidemu -c \
+                "env TRIM_APPDEST='$TRIM_APPDEST' TRIM_PKGVAR='$_AE_VAR' bash '${TRIM_APPDEST}/scripts/agent_autodeploy.sh'" \
+                >/dev/null 2>&1 &
+        else
+            nohup bash "${TRIM_APPDEST}/scripts/agent_autodeploy.sh" >/dev/null 2>&1 &
+        fi
+    else
+        nohup bash "${TRIM_APPDEST}/scripts/agent_autodeploy.sh" >/dev/null 2>&1 &
+    fi
+fi
+### 3.9.9：常驻守护必须降权启动，并补起 boot_guard。
+###   本回调以系统身份运行，旧代码直接 `nohup bash webrtc_watchdog.sh start`，
+###   结果把「系统身份的看护进程」留在宿主上 —— 实测升级后 ps 里出现
+###   root …/webrtc_watchdog.sh supervise，并继续派生 root 的 boot_guard once、
+###   harden_system.sh、docker restart 子进程（审核第 1 条 root 应用红线）。
+###   另外旧代码升级后只起画面看护，安卓侧巡检（ensure_helpers / adbd / 渲染兜底）
+###   没有常驻实例，只能等飞牛下次调用 cmd/main 才恢复。
+###   这里与安装路径（start_pull_bg）保持一致：runuser/su 降到包用户再启动。
+_AE_RUNU="${TRIM_RUN_USERNAME:-docker-androidemu}"
+_AE_VAR="${_AE_VAR:-${TRIM_PKGVAR:-/var/apps/androidemu/var}}"
+_ae_spawn_guard(){
+    _g="$1"
+    [ -f "${TRIM_APPDEST}/scripts/$_g" ] || return 0
+    if [ "$(id -u)" = "0" ] && id "$_AE_RUNU" >/dev/null 2>&1; then
+        if command -v runuser >/dev/null 2>&1; then
+            nohup runuser -u "$_AE_RUNU" -- env TRIM_APPDEST="$TRIM_APPDEST" TRIM_PKGVAR="$_AE_VAR" \
+                bash "${TRIM_APPDEST}/scripts/$_g" start >/dev/null 2>&1 &
+            return 0
+        fi
+        if command -v su >/dev/null 2>&1; then
+            nohup su -s /bin/bash "$_AE_RUNU" -c \
+                "env TRIM_APPDEST='$TRIM_APPDEST' TRIM_PKGVAR='$_AE_VAR' bash '${TRIM_APPDEST}/scripts/$_g' start" \
+                >/dev/null 2>&1 &
+            return 0
+        fi
+    fi
+    nohup bash "${TRIM_APPDEST}/scripts/$_g" start >/dev/null 2>&1 &
+}
+### 3.9.9：清掉 upgrade_init 留下的升级窗口标记 —— 否则新拉起的看护会继续静默
+### 30 分钟，期间容器崩溃/丢失都无人补建。
+rm -f "$_AE_VAR/.upgrade_window" 2>/dev/null || true
+_ae_spawn_guard boot_guard.sh
+_ae_spawn_guard webrtc_watchdog.sh
+
+if [ -f "${TRIM_APPDEST}/scripts/gw_socket.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/gw_socket.sh" start
+    echo "[$(date '+%F %T')] 已启动统一网关服务（Go，用户级别，自带守护）"
+fi
+
+### 6) 启动后兜底自愈：宿主节点放权 + 若 surfaceflinger 处于崩溃循环则重建容器。
+###    仅 GPU 直通模式。
+if [ "$GPU_MODE" = "host" ] && [ -f "${TRIM_APPDEST}/scripts/fix_gpu_perms.sh" ]; then
+    nohup bash "${TRIM_APPDEST}/scripts/fix_gpu_perms.sh" >/dev/null 2>&1 &
+fi
+
+### 6.5) 音频编码器注册修复（2.0.3）：注册镜像内已存在但未声明的 Opus 编码器
+if [ -f "${TRIM_APPDEST}/scripts/androidemu_daemon.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/androidemu_daemon.sh" fix || true
+fi
+if [ -f "${TRIM_APPDEST}/scripts/redroid_adb_forward.sh" ]; then
+    ### 3.9.8：升级回调以系统身份运行，后台守护必须降权到包用户，避免宿主残留 高权限常驻进程。
+    if [ "$(id -u)" = "0" ] && command -v runuser >/dev/null 2>&1 && id "${TRIM_RUN_USERNAME:-docker-androidemu}" >/dev/null 2>&1; then
+        nohup runuser -u "${TRIM_RUN_USERNAME:-docker-androidemu}" -- bash "${TRIM_APPDEST}/scripts/redroid_adb_forward.sh" install >/dev/null 2>&1 &
+    else
+        nohup bash "${TRIM_APPDEST}/scripts/redroid_adb_forward.sh" install >/dev/null 2>&1 &
+    fi
+fi
+if [ -f "${TRIM_APPDEST}/scripts/audio_watchdog.sh" ]; then
+    bash "${TRIM_APPDEST}/scripts/audio_watchdog.sh" start || true
+fi
+
+_INSTALL_SUCCESS=1
+
+### 3.9.4：修正历史遗留的 props 属主（早期版本有以 root 生成过属性文件的记录）。
+###   本回调以系统身份运行，升级时顺手归位，避免后续 apply_rebrand 以应用用户执行时
+###   删不掉、覆盖不了，最终整体替换失败并在数据目录留下 props/props.new 嵌套目录。
+_VAR_DIR_394="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+if [ -d "${_VAR_DIR_394}/props" ]; then
+    chown -R docker-androidemu:AppUsers "${_VAR_DIR_394}/props" 2>/dev/null || true
+    chmod -R u+rwX "${_VAR_DIR_394}/props" 2>/dev/null || true
+fi
+
+
+### 3.9.9：把 var 下由 root 创建的日志交还包用户（升级回调同样以系统身份运行）。
+###   本回调开头虽已全量归位，但升级收尾还有 root 步骤（fix_gpu_perms、网关启动、
+###   gpu_release）会新建 系统属主日志；包用户守护再追加就 Permission denied
+###   （实测 boot_guard 日志反复出现 gpu_fix.log: Permission denied）。
+if [ "$(id -u)" = "0" ]; then
+    _AE_RUNU="${TRIM_RUN_USERNAME:-docker-androidemu}"
+    if id "$_AE_RUNU" >/dev/null 2>&1; then
+        ### 3.9.9 复测修订：runtime_guard 的 status / stamp / 标记、ADB 转发的
+        ### pid / log / py 一并交还，否则包用户看护覆写状态会持续 Permission denied。
+        for _lf in "${_VAR_DIR_394}"/*.log "${_VAR_DIR_394}"/boot_diag.status \
+                   "${_VAR_DIR_394}"/ports.conf "${_VAR_DIR_394}"/profile-level \
+                   "${_VAR_DIR_394}"/guard-on "${_VAR_DIR_394}"/runtime_guard.status \
+                   "${_VAR_DIR_394}"/runtime_guard.stamp "${_VAR_DIR_394}"/adb_forward.pid \
+                   "${_VAR_DIR_394}"/adb_forward.log "${_VAR_DIR_394}"/adb_forward.py; do
+            [ -f "$_lf" ] || continue
+            [ "$(stat -c %U "$_lf" 2>/dev/null)" = "$_AE_RUNU" ] && continue
+            chown "$_AE_RUNU":docker "$_lf" 2>/dev/null || chown "$_AE_RUNU" "$_lf" 2>/dev/null || true
+        done
+        [ -d "${_VAR_DIR_394}" ] && chown "$_AE_RUNU":docker "${_VAR_DIR_394}" 2>/dev/null || true
+        ### 3.9.9：docker/.env 同样交给包用户（权限保持 600）。后台 start_pull_bg.sh
+        ### 以包用户跑 compose，读不到 系统属主的 .env 会直接起不来容器
+        ### （实测 `open .../docker/.env: permission denied`，三次重试全失败）。
+        if [ -f "${TRIM_APPDEST}/docker/.env" ]; then
+            chown "$_AE_RUNU":docker "${TRIM_APPDEST}/docker/.env" 2>/dev/null || true
+        fi
+        ### 3.9.9 复测修订：升级自旧包时可能残留 系统身份的 ADB 转发守护
+        ### （降权看护杀不掉它），在 root 回调里精确清理并以包用户补起。
+        _AE_SYS_SUP=0
+        for _p in $(ps -eo user=,pid=,args= 2>/dev/null \
+                    | awk '$1=="root" && /redroid_adb_forward\.sh supervise/ {print $2}'); do
+            kill -9 "$_p" 2>/dev/null || true
+            _AE_SYS_SUP=1
+        done
+        if [ "$_AE_SYS_SUP" = "1" ] && [ -x "${TRIM_APPDEST}/scripts/redroid_adb_forward.sh" ]; then
+            if ! ps -eo args= 2>/dev/null | grep -F "redroid_adb_forward.sh supervise" \
+                 | grep -v grep | grep -q .; then
+                nohup runuser -u "$_AE_RUNU" -- env TRIM_PKGVAR="${_VAR_DIR_394}" \
+                    bash "${TRIM_APPDEST}/scripts/redroid_adb_forward.sh" install >/dev/null 2>&1 &
+            fi
+        fi
+    fi
+fi
+
+### 3.9.1：升级完成后幂等启动网关（健康时不重启，不会掐断在线会话）。
+### 与 upgrade_init 的 stop 配对，确保运行的是本版本二进制，避免新旧混用。
+for _b in "${TRIM_APPDEST}/server/gateway_amd64" "${TRIM_APPDEST}/server/gateway_arm64"; do
+    if [ -x "$_b" ]; then
+        TRIM_APPDEST="${TRIM_APPDEST}" TRIM_PKGVAR="${TRIM_PKGVAR:-/var/apps/androidemu/var}" \
+            "$_b" start >/dev/null 2>&1 && echo "网关已启动：$(basename "$_b")"
+        break
+    fi
+done
+
+### 3.9.9：硬件视频编码 —— 升级前若处于启用状态，升级后重新应用一次。
+### 容器/注入可能在升级过程中被重建，不重放会退化成软件编码（且状态文件仍是 enabled）。
+_HW_VAR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+if [ -f "$_HW_VAR/hwenc.status" ] && [ "$(cat "$_HW_VAR/hwenc.status" 2>/dev/null)" = "enabled" ] \
+   && [ -x "${TRIM_APPDEST}/scripts/hwenc_ctl.sh" ]; then
+    echo "[$(date '+%F %T')] 检测到硬件视频编码已启用，升级后重新应用"
+    TRIM_APPDEST="${TRIM_APPDEST}" TRIM_PKGVAR="$_HW_VAR" \
+        bash "${TRIM_APPDEST}/scripts/hwenc_ctl.sh" enable >>"$_HW_VAR/hwenc.log" 2>&1 || true
+fi
+
+### 3.9.9：升级会替换脚本文件，升级后重新拉起分辨率护栏常驻进程。
+### 3.9.9-r3：必须先 stop 旧进程。start 发现已有 supervise 会直接 exit 0，
+### 升级替换文件后旧进程仍按旧代码运行（ARM 3.9.8→3.9.9 实测：wm 仍被旧逻辑改写，
+### 新加的升级迁移分支从未执行）。stop 后再 start，保证跑的是新脚本。
+_RG_VAR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+if [ -x "${TRIM_APPDEST}/scripts/resolution_guard.sh" ]; then
+    TRIM_APPDEST="${TRIM_APPDEST}" TRIM_PKGVAR="$_RG_VAR" \
+        TRIM_RUN_USERNAME="${TRIM_RUN_USERNAME:-docker-androidemu}" \
+        bash "${TRIM_APPDEST}/scripts/resolution_guard.sh" stop \
+        >>"$_RG_VAR/upgrade.log" 2>&1 || true
+    TRIM_APPDEST="${TRIM_APPDEST}" TRIM_PKGVAR="$_RG_VAR" \
+        TRIM_RUN_USERNAME="${TRIM_RUN_USERNAME:-docker-androidemu}" \
+        bash "${TRIM_APPDEST}/scripts/resolution_guard.sh" start \
+        >>"$_RG_VAR/upgrade.log" 2>&1 || true
+fi
+
+exit 0

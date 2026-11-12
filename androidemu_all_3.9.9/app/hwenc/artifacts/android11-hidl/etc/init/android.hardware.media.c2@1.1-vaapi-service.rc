@@ -1,0 +1,6 @@
+service android-hardware-media-c2-vaapi-hal /vendor/bin/hw/android.hardware.media.c2@1.1-vaapi-service
+    class hal
+    user mediacodec
+    group camera mediadrm drmrpc
+    ioprio rt 4
+    task_profiles ProcessCapacityHigh

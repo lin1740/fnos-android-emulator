@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""
+androidemu 3.9.2 主启动脚本
+- start: 启动网关服务 + 统一守护进程 + supervisor监控 + 后台拉取镜像
+- stop: 停止容器
+- status: 检查容器状态
+"""
+import os
+import re
+import sys
+import time
+import subprocess
+import signal
+import shutil
+# 3.9.4：heal_tree_perm() 里用了 pwd.getpwnam 但没有导入（该函数原先只在局部导入过），
+# 导致 `main start` 执行到第 339 行必抛 NameError: name 'pwd' is not defined，
+# 整个启动流程中断、网关与守护都起不来。这里补全全局导入。
+import pwd
+
+# 3.9.9-r2：飞牛看护/回调的 PATH 常不含 /usr/sbin，而 runuser 在 /usr/sbin/runuser。
+# 下面 shutil.which("runuser") 若找不到，会把后台任务回退成 高权限常驻。
+if "/usr/sbin" not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin") + ":/usr/sbin:/sbin"
+
+APP_DEST = os.environ.get("TRIM_APPDEST", "/var/apps/androidemu/target")
+VAR_DIR = os.environ.get("TRIM_PKGVAR", "/var/apps/androidemu/var")
+COMPOSE = os.path.join(APP_DEST, "docker", "docker-compose.yaml")
+DAEMON_SH = os.path.join(APP_DEST, "scripts", "androidemu_daemon.sh")
+SUPERVISOR_SH = os.path.join(APP_DEST, "scripts", "supervisor.sh")
+GATEWAY_PID = os.path.join(VAR_DIR, "gateway.pid")
+GATEWAY_LOG = os.path.join(VAR_DIR, "gateway.log")
+DAEMON_PID = os.path.join(VAR_DIR, "audio_watchdog.pid")
+SUPERVISOR_PID = os.path.join(VAR_DIR, "supervisor.pid")
+
+os.makedirs(VAR_DIR, exist_ok=True)
+
+def log(msg):
+    try:
+        with open(os.path.join(VAR_DIR, "main.log"), "a") as f:
+            f.write("[%s] %s\n" % (time.strftime("%F %T"), msg))
+    except Exception:
+        pass
+
+def run(cmd, timeout=60):
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True, timeout=timeout)
+    except Exception as e:
+        log("命令执行异常：%s -> %r" % (cmd, e))
+        return None
+
+def is_gateway_running():
+    """检查网关是否真的在运行（PID + cmdline + socket）"""
+    try:
+        with open(GATEWAY_PID) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            if b"gateway" not in f.read():
+                return False
+        # 额外检查 socket 是否存在且可连接
+        sock_path = os.path.join(APP_DEST, "app.sock")
+        if not os.path.exists(sock_path):
+            return False
+        return True
+    except Exception:
+        return False
+
+def gw_binary():
+    """3.9.1：按宿主架构选择 Go 版网关二进制。"""
+    import platform
+    arch = platform.machine().lower()
+    name = "gateway_arm64" if arch in ("aarch64", "arm64") else "gateway_amd64"
+    p = os.path.join(APP_DEST, "server", name)
+    if os.path.exists(p) and os.access(p, os.X_OK):
+        return p
+    return ""
+
+
+def start_gateway():
+    """网关自带守护循环与自愈（Go 实现），这里只做幂等启动。
+    健康时 start 不会重启（避免掐断在线会话），并会清理上一版遗留的网关进程。"""
+    binp = gw_binary()
+    if not binp:
+        log("未找到 Go 网关二进制（server/gateway_amd64|gateway_arm64）")
+        return
+    try:
+        r = subprocess.run([binp, "start"], capture_output=True, timeout=60,
+                           env={**os.environ, "TRIM_APPDEST": APP_DEST, "TRIM_PKGVAR": VAR_DIR})
+        out = (r.stdout or b"").decode("utf-8", "replace").strip()
+        err = (r.stderr or b"").decode("utf-8", "replace").strip()
+        log("网关启动：%s%s" % (out, (" ｜ " + err) if err else ""))
+    except Exception as e:
+        log("网关启动失败：%r" % (e,))
+
+def stop_gateway():
+    """按 PID 文件 + /proc/<pid>/cmdline 身份停止（不使用 pkill）。"""
+    binp = gw_binary()
+    if not binp:
+        log("未找到 Go 网关二进制，跳过停止")
+        return
+    try:
+        r = subprocess.run([binp, "stop"], capture_output=True, timeout=60,
+                           env={**os.environ, "TRIM_APPDEST": APP_DEST, "TRIM_PKGVAR": VAR_DIR})
+        log("网关停止：%s" % (r.stdout or b"").decode("utf-8", "replace").strip())
+    except Exception as e:
+        log("网关停止失败：%r" % (e,))
+
+def is_daemon_running():
+    """检查统一守护进程是否在运行（音频+分辨率）"""
+    try:
+        with open(DAEMON_PID) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            if b"androidemu_daemon" not in f.read():
+                return False
+        return True
+    except Exception:
+        return False
+
+def start_daemon():
+    """启动统一守护进程（Go版本，架构自适应，幂等）"""
+    if not os.path.exists(DAEMON_SH):
+        log("未找到统一守护进程脚本：%s" % DAEMON_SH)
+        return
+    if is_daemon_running():
+        log("统一守护进程已在运行，跳过")
+        return
+    try:
+        proc = subprocess.Popen(
+            ["bash", DAEMON_SH, "daemon"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cwd=APP_DEST, start_new_session=True
+        )
+        log("统一守护进程已启动（Go版本，音频+分辨率），PID=%d" % proc.pid)
+    except Exception as e:
+        log("统一守护进程启动失败：%r" % (e,))
+
+def stop_daemon():
+    """停止统一守护进程"""
+    try:
+        if is_daemon_running():
+            with open(DAEMON_PID) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGTERM)
+            log("统一守护进程已停止，PID=%d" % pid)
+    except Exception as e:
+        log("统一守护进程停止失败：%r" % (e,))
+    finally:
+        for pf in [DAEMON_PID, os.path.join(VAR_DIR, "resolution_autoswitch.pid")]:
+            if os.path.exists(pf):
+                try:
+                    os.remove(pf)
+                except Exception:
+                    pass
+
+def is_supervisor_running():
+    """检查supervisor是否在运行"""
+    try:
+        with open(SUPERVISOR_PID) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            if b"androidemu_supervisor" not in f.read():
+                return False
+        return True
+    except Exception:
+        return False
+
+def start_supervisor():
+    """3.8.7：启动supervisor统一监控（容器/agent/音频健康检查+自动恢复+HTTP API）"""
+    if not os.path.exists(SUPERVISOR_SH):
+        log("未找到supervisor脚本：%s" % SUPERVISOR_SH)
+        return
+    if is_supervisor_running():
+        log("supervisor已在运行，跳过")
+        return
+    try:
+        proc = subprocess.Popen(
+            ["bash", SUPERVISOR_SH],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cwd=APP_DEST, start_new_session=True,
+            env={**os.environ, "TRIM_APPDEST": APP_DEST, "TRIM_PKGVAR": VAR_DIR}
+        )
+        with open(SUPERVISOR_PID, "w") as f:
+            f.write(str(proc.pid))
+        log("supervisor统一监控已启动，PID=%d" % proc.pid)
+    except Exception as e:
+        log("supervisor启动失败：%r" % (e,))
+
+def stop_supervisor():
+    """停止supervisor"""
+    try:
+        if is_supervisor_running():
+            with open(SUPERVISOR_PID) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGTERM)
+            log("supervisor已停止，PID=%d" % pid)
+    except Exception as e:
+        log("supervisor停止失败：%r" % (e,))
+    finally:
+        if os.path.exists(SUPERVISOR_PID):
+            try:
+                os.remove(SUPERVISOR_PID)
+            except Exception:
+                pass
+
+def _selfheal_compose():
+    """3.9.1：compose 启动前自愈。
+    动态注入的挂载（props / armlibs 等）或设备节点（/dev/binder、/dev/net/tun）
+    在宿主上不存在时，docker compose 会在创建阶段直接失败，应用中心表现为
+    「compose 或 container 异常」并反复启用失败。此处先校验，失败后仅移除
+    「指向不存在路径」的挂载/设备/安全配置行，其余配置一律不动。
+    """
+    targets = [COMPOSE, "/docker/docker-compose.yaml"]
+    for comp in targets:
+        try:
+            if not os.path.exists(comp):
+                ### 3.9.4 加固：/docker/docker-compose.yaml 被外部删除/损坏时，
+                ### 旧逻辑直接跳过，随后 compose 无文件可用 → 飞牛报
+                ### 「compose 文件异常」。现从应用目录内的原始文件恢复一份。
+                src = os.path.join(APP_DEST, "docker", "docker-compose.yaml")
+                if comp != COMPOSE and os.path.exists(src):
+                    try:
+                        os.makedirs(os.path.dirname(comp), exist_ok=True)
+                        with open(src, "rb") as _f, open(comp, "wb") as _g:
+                            _g.write(_f.read())
+                        log("compose 文件缺失，已从应用目录恢复：%s" % comp)
+                    except Exception as _e:
+                        log("compose 文件恢复失败(%s)：%r" % (comp, _e))
+                continue
+            d = os.path.dirname(comp) or "/"
+            cmd = "cd %s && docker compose config -q" % d
+            rc = subprocess.run(cmd, shell=True, capture_output=True, timeout=90)
+            if rc.returncode == 0:
+                continue
+            log("compose 校验失败，开始自愈: %s" % comp)
+            with open(comp, encoding="utf-8", errors="replace") as f:
+                lines = f.read().split("\n")
+            fixed, removed = [], []
+            for l in lines:
+                m_vol = re.match(r"^(\s*-\s*)(/[^:]+):([^:]+)(:ro|:rw)?\s*$", l)
+                if m_vol:
+                    if not os.path.exists(m_vol.group(2)):
+                        removed.append(m_vol.group(2)); continue
+                m_dev = re.match(r"^(\s*-\s*)(/dev/[^\s:]+)\s*$", l)
+                if m_dev:
+                    if not os.path.exists(m_dev.group(2)):
+                        removed.append(m_dev.group(2)); continue
+                m_sec = re.match(r"^(\s*-\s*seccomp=)(/[^\s]+)\s*$", l)
+                if m_sec:
+                    if not os.path.exists(m_sec.group(2)):
+                        removed.append("seccomp=" + m_sec.group(2)); continue
+                fixed.append(l)
+            if removed:
+                with open(comp, "w", encoding="utf-8", newline="\n") as f:
+                    f.write("\n".join(fixed))
+                for r in removed[:10]:
+                    log("  移除无效项: %s" % r)
+                rc2 = subprocess.run(cmd, shell=True, capture_output=True, timeout=90)
+                log("自愈后校验: %s" % ("通过" if rc2.returncode == 0 else "仍失败"))
+            else:
+                log("未发现无效挂载/设备，compose 错误另有原因")
+        except Exception as e:
+            log("compose 自愈异常(%s)：%r" % (comp, e))
+
+
+def heal_var_perm():
+    """3.9.2 热修：var 下的日志/锁/标记文件若被早期系统身份流程建为系统账号所有，
+    之后以普通用户 docker-androidemu 运行的开机巡检就写不进去 —— 实测表现为
+    「面板/ADB 装完应用桌面一直不出图标」（app_desktop_sync 在加锁处静默退出）
+    以及 harden_system / fix_app_icons 节流失效、每分钟刷 Permission denied。
+    这里只纠正这几类文件（.log/.pid/.lock/.stamp）的属主，不动其它文件、不递归。"""
+    import pwd
+    import stat as _stat
+    try:
+        pw = pwd.getpwnam("docker-androidemu")
+    except KeyError:
+        return
+    if os.geteuid() != 0:
+        return
+    fixed = 0
+    try:
+        names = os.listdir(VAR_DIR)
+    except OSError:
+        return
+    for fn in names:
+        if not fn.endswith((".log", ".pid", ".lock", ".stamp")):
+            continue
+        p = os.path.join(VAR_DIR, fn)
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        if not _stat.S_ISREG(st.st_mode):
+            continue
+        if st.st_uid == pw.pw_uid and st.st_gid == pw.pw_gid:
+            continue
+        try:
+            os.chown(p, pw.pw_uid, pw.pw_gid)
+            fixed += 1
+        except OSError:
+            pass
+    if fixed:
+        log("已纠正 var 下 %d 个日志/锁/标记文件的属主（原为系统账号，普通用户无法写入）" % fixed)
+
+    # 3.9.3 补充：var 顶层/子层遗留 strays（实测 2026-10-31 全新安装窗：
+    # var/props 为 0:0 755 —— 上一个会话系统身份操作的残留；apply_rebrand
+    # 的「rm -rf props → mv props.new → props」原子切换因此无法完成，
+    # 身份伪装画像素材整体缺失）。刻意整棵跳过并剪枝 vol-* / tmp* 开头的
+    # 数据目录：内部是容器写入的安卓数据分区，条目量大、属主本就是容器侧
+    # 身份，不应被宿主侧纠正；其余目录条目数很少，走一遍成本可忽略。
+    _pair = (pw.pw_uid, pw.pw_gid)
+    fixed2 = 0
+    try:
+        for _base, dirs, files in os.walk(VAR_DIR):
+            keep = []
+            for d in list(dirs):
+                p = os.path.join(_base, d)
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                if d.startswith(("vol-", "tmp")):
+                    continue
+                keep.append(d)
+                if (st.st_uid, st.st_gid) != _pair:
+                    try:
+                        os.chown(p, pw.pw_uid, pw.pw_gid)
+                        fixed2 += 1
+                    except OSError:
+                        pass
+            dirs[:] = keep
+            for f in files:
+                p = os.path.join(root, f)
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                if (st.st_uid, st.st_gid) != _pair:
+                    try:
+                        os.chown(p, pw.pw_uid, pw.pw_gid)
+                        fixed2 += 1
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+    if fixed2:
+        log("已纠正 var 下 %d 个遗留物件的属主（排除 vol-*/tmp* 数据目录；3.9.3 权限修正）" % fixed2)
+
+
+def heal_tree_perm():
+    """3.9.3 补充：应用树在解包后的一段窗口内可能仍是 系统属主（实测
+    2026-10-31 全新安装：官方日志 tune_compose 对 compose 的 grep/sed 共
+    19 条 Permission denied，且同一次安装的后段权限又被应用中心归一化）。
+    这里以 系统身份把应用树内非 docker-androidemu 属主的物件纠正回来，
+    只动本应用目录；此后 boot_guard 巡检里的 compose 写入 / apply_rebrand
+    重放才能成立。每一条仅在实际不一致时才纠正，正常安装空转成本可忽略。"""
+    import stat as _stat
+    try:
+        pw = pwd.getpwnam("docker-androidemu")
+    except KeyError:
+        return
+    if os.geteuid() != 0:
+        return
+    _pair = (pw.pw_uid, pw.pw_gid)
+    fixed = 0
+    try:
+        for root, dirs, files in os.walk(APP_DEST):
+            for nm in list(dirs) + files:
+                p = os.path.join(root, nm)
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                if (st.st_uid, st.st_gid) == _pair:
+                    continue
+                try:
+                    os.chown(p, pw.pw_uid, pw.pw_gid)
+                    fixed += 1
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    if fixed:
+        log("已纠正应用树内 %d 个物件的属主（3.9.3 权限修正）" % fixed)
+
+
+def _wait_docker(max_wait=90):
+    """3.9.4 加固：等待 docker 守护就绪，避免开机/重启后立刻点「启用」时
+    docker 尚未起来，所有 docker 调用直接失败，飞牛据此弹出「docker不可用」。
+    实测（2026-11-02 用户反馈）该提示多数不是真的不可用，而是时序问题。
+    这里最多等 max_wait 秒；超时也不退出（后续每步都各自容错并重试），
+    仅记录日志，绝不因等待失败而让整个启用失败。"""
+    try:
+        import time as _t
+        waited = 0
+        while waited < max_wait:
+            r = subprocess.run(["docker", "info"], capture_output=True, timeout=15)
+            if r.returncode == 0:
+                if waited:
+                    log("docker 守护已就绪（等待 %d 秒）" % waited)
+                return True
+            _t.sleep(3)
+            waited += 3
+        log("等待 docker 守护 %d 秒仍未就绪，继续尝试后续步骤（各步骤独立容错）" % max_wait)
+    except Exception as e:
+        log("等待 docker 守护异常：%r" % (e,))
+    return False
+
+
+def start():
+    log("=== 启动 androidemu 3.9.8 ===")
+    _wait_docker()
+    heal_var_perm()
+    heal_tree_perm()
+    # 3.9.3：标记「用户希望本应用运行」—— boot_guard 见容器不存在时会主动创建
+    #（飞牛的「启用」只做 compose start，容器不存在会报 12005「docker不可用」）
+    try:
+        open(os.path.join(VAR_DIR, ".want_running"), "w").close()
+    except Exception:
+        pass
+    # 3.9.1：先确保 binder / tun 设备存在，否则 compose 的 devices 段必然创建失败
+    _dev = os.path.join(APP_DEST, "scripts", "ensure_devices.sh")
+    if os.path.exists(_dev):
+        try:
+            r = subprocess.run(["bash", _dev], capture_output=True, timeout=60)
+            for ln in (r.stdout or b"").decode("utf-8", "replace").strip().split("\n"):
+                if ln:
+                    log(ln)
+        except Exception as e:
+            log("设备自愈异常：%r" % (e,))
+    _selfheal_compose()
+    ### 3.9.4：清理 compose 因名字冲突产生的孤儿容器（形如 <hash>_androidemu-android）。
+    ### 这类容器是 compose 在旧容器未删除时新建又被改名留下的，会让看护、修复脚本
+    ### 按名字找不到目标容器，也会占着数据卷/网络造成下次创建的诡异失败。
+    run("docker ps -a --format '{{.Names}}' | grep -E '^[0-9a-f]{12}_androidemu-' "
+        "| xargs -r docker rm -f >/dev/null 2>&1 || true", timeout=60)
+    # 3.9.4：确保 compose 的服务容器都存在。
+    # 飞牛的「启用」只执行 compose start（只能启动已存在的容器），容器缺失时不会补建；
+    # 实测（2026-11-01 停用→启用）画面服务容器缺失、安卓容器还在，于是「启用」后
+    # 8443 一直无响应、点开应用是白屏，而 boot_guard 的 _has_container 只看安卓容器，
+    # 同样不会触发补建。这里在启用链路上先把缺的补上（已存在的容器不受影响）。
+    if os.path.exists(COMPOSE):
+        for _svc, _cname in (("redroid", "androidemu-android"),
+                             ("webrtc", "androidemu-webrtc")):
+            _r = run("docker inspect -f '{{.State.Status}}' %s" % _cname, timeout=15)
+            if _r is None or _r.returncode != 0:
+                log("%s 容器缺失 → 按 compose 补建" % _cname)
+                run("cd %s && docker compose -p androidemu up -d %s"
+                    % (os.path.dirname(COMPOSE), _svc), timeout=240)
+    # 3.9.0：数据卷为 external，启动前幂等补建（缺失时 compose 会直接报错）
+    run("docker volume create androidemu-data >/dev/null 2>&1; "
+        "docker volume create androidemu-webrtc-data >/dev/null 2>&1", timeout=30)
+    _tune = os.path.join(APP_DEST, "scripts", "tune_resources.sh")
+    if os.path.exists(_tune):
+        run("bash '%s' '%s'" % (_tune, COMPOSE), timeout=30)
+    # 3.9.8：按安装时选择的权限级别重新应用 seccomp 约束（启用时保持与选择一致）
+    _rl = os.path.join(APP_DEST, "scripts", "runtime_profile.sh")
+    if os.path.exists(_rl):
+        run("bash '%s' '%s'" % (_rl, COMPOSE), timeout=30)
+    # 3.9.9：受限档运行期复核（无 su / adbd 非 root / ADB 仅绑本机）
+    _lockdown = os.path.join(APP_DEST, "scripts", "runtime_guard.sh")
+    if os.path.exists(_lockdown):
+        run("TRIM_PKGVAR='%s' bash '%s'" % (VAR_DIR, _lockdown), timeout=120)
+    # GPU 权限释放
+    gpu_script = os.path.join(APP_DEST, "scripts", "gpu_release.sh")
+    if os.path.exists(gpu_script):
+        run("bash %s --compose %s" % (gpu_script, COMPOSE), timeout=30)
+
+    # 3.9.9：投屏可启动性（app_process 副本 + 最小能力 + bind mount）
+    # 上游 agent 会把自己降权到 shell(2000)，redroid 的 app_process 在非 系统身份下会 abort，
+    # 细节见 scripts/app_process_caps.sh。这里以 root 补设能力并挂载（幂等）。
+    caps_script = os.path.join(APP_DEST, "scripts", "app_process_caps.sh")
+    if os.path.exists(caps_script):
+        run("bash '%s' --install" % caps_script, timeout=120)
+
+    # 后台拉取镜像（3.9.8：以系统身份运行时降权到包用户，避免后台守护以 高权限常驻）
+    pull_script = os.path.join(APP_DEST, "scripts", "start_pull_bg.sh")
+    if os.path.exists(pull_script):
+        _pkg_user = os.environ.get("TRIM_RUN_USERNAME", "docker-androidemu")
+        if os.geteuid() == 0 and shutil.which("runuser"):
+            subprocess.Popen(["runuser", "-u", _pkg_user, "--", "bash", pull_script],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(["bash", pull_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # 3.9.8：宿主 udev 放权规则已取消（放权在容器内完成，见 scripts/gpu_release.sh）
+
+    # 启动网关服务
+    start_gateway()
+
+    # 自动部署云手机 Agent 到安卓容器（幂等，已运行则跳过）
+    agent_script = os.path.join(APP_DEST, "scripts", "agent_autodeploy.sh")
+    if os.path.exists(agent_script):
+        try:
+            subprocess.Popen(
+                ["bash", agent_script],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                cwd=APP_DEST, start_new_session=True
+            )
+            log("Agent 自动部署已启动")
+        except Exception as e:
+            log("Agent 自动部署启动失败：%r" % (e,))
+
+    start_daemon()
+
+    start_supervisor()
+
+    boot_guard = os.path.join(APP_DEST, "scripts", "boot_guard.sh")
+    if os.path.exists(boot_guard):
+        try:
+            subprocess.Popen(["bash", boot_guard, "start"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             cwd=APP_DEST, start_new_session=True)
+            log("开机守护已启动（boot_guard.sh）")
+        except Exception as e:
+            log("开机守护启动失败：%r" % (e,))
+
+    gms_script = os.path.join(APP_DEST, "scripts", "install_gms.sh")
+    if os.path.exists(gms_script):
+        try:
+            subprocess.Popen(
+                ["bash", gms_script],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                cwd=APP_DEST, start_new_session=True,
+                env={**os.environ, "TRIM_APPDEST": APP_DEST, "TRIM_PKGVAR": VAR_DIR}
+            )
+            log("GMS安装脚本已启动（如选择了安装则自动执行）")
+        except Exception as e:
+            log("GMS安装脚本启动失败：%r" % (e,))
+
+    # 3.9.2 补：启用时把画面服务拉起来 —— 停用（stop）会把 webrtc 容器一起停掉，
+    # 而启用路径只创建安卓容器；实测「停用→启用」后安卓正常开机、webrtc 容器停在
+    # Exited，8443 一直不监听、画面打不开。这里幂等拉起：容器还在就 start，不在就 compose up。
+    if os.path.exists(COMPOSE):
+        run("docker start androidemu-webrtc >/dev/null 2>&1 || "
+            "docker compose --project-name androidemu -f '%s' up -d webrtc >/dev/null 2>&1" % COMPOSE,
+            timeout=180)
+        log("画面服务（webrtc）已拉起")
+
+    # ADB 转发
+    adb_script = os.path.join(APP_DEST, "scripts", "redroid_adb_forward.sh")
+    if os.path.exists(adb_script):
+        subprocess.Popen(["bash", adb_script, "install"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    log("启动完成")
+
+def stop():
+    log("=== 停止 androidemu ===")
+    ### 3.9.4 加固：先停看护类进程，最后再停容器。
+    ### 原顺序是「compose stop（最多 60 秒）→ 再杀看护」，容器在停机过程中会短暂
+    ### 处于 stopping/exited，boot_guard 与 webrtc_watchdog 仍活着就会把它重新拉起，
+    ### 表现为「点了停用但容器还在跑 / 停用无效」（2026-11-03 实测复现）。
+    stop_gateway()
+    stop_daemon()
+    stop_supervisor()
+    ### 3.9.2 修正：停用后仍有守护残留在宿主（实测 gateway/audio_fix/fix_keystore 三个
+    ### 进程照跑）。容器虽已停、端口已断，但进程占内存、且下次启用会出现双实例互相干扰。
+    ### 这里按「命令行同时含本应用路径与脚本名」精确清理，避免误杀别家同名脚本。
+    _APP = APP_DEST.rstrip("/")
+    _APP2 = os.path.realpath(_APP).rstrip("/")
+    ### 3.9.4：名单补全 —— agent_watchdog_loop.sh / androidemu_daemon.sh / supervisor.sh
+    ### 等此前未列入的常驻看护会把已停的容器重新拉起（实测：stop 返回 0 但 30 秒后
+    ### 容器又 Up，表现为「停用无效」）。
+    for _name in ("boot_guard.sh", "webrtc_watchdog.sh", "fix_keystore.sh",
+                  "fix_gpu_perms.sh", "fix_storage_perm.sh", "fix_app_icons.sh",
+                  "agent_autodeploy.sh", "audio_watchdog.sh", "keep_awake.sh", "gw_socket.sh",
+                  "redroid_adb_forward.sh", "check_abi_apps.sh", "fix_pms_loop.sh",
+                  "agent_watchdog_loop.sh", "androidemu_daemon.sh", "supervisor.sh",
+                  "pull_image.sh", "start_pull_bg.sh", "install_gms.sh"):
+        for _pre in (_APP, _APP2):
+            run("for p in $(ps -eo pid,args | grep -F '%s/scripts/%s' | grep -v grep | awk '{print $1}'); do kill -9 $p 2>/dev/null; done" % (_pre, _name), timeout=20)
+    for _pre in (_APP, _APP2):
+        run("for p in $(ps -eo pid,args | grep -F '%s/server/audio_fix.py' | grep -v grep | awk '{print $1}'); do kill -9 $p 2>/dev/null; done" % _pre, timeout=20)
+        ### 3.9.4：看护类进程已清理，此时再停容器，避免停机过程中被重新拉起
+    if os.path.exists(COMPOSE):
+        run("cd %s && docker compose -p androidemu stop -t 60" % os.path.dirname(COMPOSE), timeout=90)
+        # 兜底：compose 停不掉（容器状态卡死）时强制停止
+        run("docker ps --filter name=androidemu --format '{{.Names}}' | "
+            "xargs -r docker stop -t 20 >/dev/null 2>&1 || true", timeout=120)
+    ### 3.9.4：压制复查 —— 停止后再观察 3 轮，若仍有容器被外部拉起则重复停止。
+    ### 保证「点停用后确实停住」，而不是停完几秒又被某条看护链路拉起。
+    for _round in range(3):
+        r = run("docker ps --filter name=androidemu --format '{{.Names}}'", timeout=15)
+        names = (r.stdout or b"").decode("utf-8", "replace").strip() if r else ""
+        if not names:
+            break
+        log("检测到容器仍在运行（第 %d 轮复查）：%s → 再次停止" % (_round + 1, names.replace("\n", " ")))
+        if os.path.exists(COMPOSE):
+            run("cd %s && docker compose -p androidemu stop -t 20" % os.path.dirname(COMPOSE), timeout=60)
+        run("docker ps --filter name=androidemu --format '{{.Names}}' | "
+            "xargs -r docker stop -t 15 >/dev/null 2>&1 || true", timeout=90)
+        time.sleep(4)
+    log("停止完成")
+
+def status():
+    result = run("docker ps --filter name=androidemu --format '{{.Names}}'", timeout=10)
+    if result and b"androidemu-android" in result.stdout:
+        sys.exit(0)
+    sys.exit(3)
+
+if __name__ == "__main__":
+    action = sys.argv[1] if len(sys.argv) > 1 else "start"
+    if action == "start":
+        start()
+    elif action == "stop":
+        stop()
+    elif action == "status":
+        status()
+    else:
+        print("用法：%s {start|stop|status}" % sys.argv[0])
+        sys.exit(1)

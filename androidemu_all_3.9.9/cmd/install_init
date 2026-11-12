@@ -1,0 +1,301 @@
+#!/bin/bash
+
+### This script is called before the user installs the application.
+### Redroid 要求宿主内核提供 binder 支持（无纯软件替代）：
+###   - x86：通常通过应用中心安装 binder_linux 驱动，产生 /dev/binder；
+###   - ARM：多数设备内核已内置 binder/binderfs，可能没有 /dev/binder 节点，
+###          但 /proc/filesystems 已注册 binder（privileged 容器可自行挂载 binderfs）。
+### 本检测同时兼容「binder_linux 模块」与「内核内置 binderfs」两种形态，
+### 避免 ARM 内置 binder 的设备被误判为不支持而无法安装。
+
+### 3.9.1：升级/安装前先停网关。
+### 原因（群友实测反馈：每次更新后必现 Bad Gateway）：旧网关二进制正在运行时，
+### 升级过程的新文件替换会让旧进程继续跑旧映像（或在 ETXTBSY 下替换失败），
+### 形成「新配置 + 旧网关」混用 —— 协议解析、路由前缀都对不上，表现为 Bad Gateway。
+### 先 stop 释放二进制，升级完成后再由应用启用流程幂等 start。
+_gw_stop() {
+    for _b in "${TRIM_APPDEST}/server/gateway_amd64" "${TRIM_APPDEST}/server/gateway_arm64"; do
+        if [ -x "$_b" ]; then
+            TRIM_APPDEST="${TRIM_APPDEST}" TRIM_PKGVAR="${TRIM_PKGVAR:-/var/apps/androidemu/var}" \
+                "$_b" stop >/dev/null 2>&1 && echo "已停止旧网关：$(basename "$_b")" && return 0
+        fi
+    done
+    return 0
+}
+
+_gw_stop
+
+### 3.9.9：安装窗口 —— 与升级同因同治（重装/更新场景）。
+###   实测 2026-11-09 主 NAS：容器仍在运行时，飞牛 docker-project 的 compose up 与
+###   我们的看护抢建同名容器，报
+###     cannot remove container ...: container is running
+###   安装被判失败并中止，install_callback 未能执行 → profile-level / ports.conf 缺失、
+###   受限档的运行期复核没有启用（选了受限档却查不到状态文件）。
+###   这里先停看护并留下窗口标记（看护见标记不碰容器），把重建交给飞牛；
+###   install_callback 收尾会删标记并重新拉起看护。标记 30 分钟自动失效，
+###   即使本次安装被用户取消，看护也会自行恢复巡检。
+_V_INS="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+mkdir -p "$_V_INS" 2>/dev/null || true
+date +%s > "$_V_INS/.upgrade_window" 2>/dev/null || true
+chmod 644 "$_V_INS/.upgrade_window" 2>/dev/null || true
+for _p in $(ps -eo pid,args 2>/dev/null \
+        | grep -E "androidemu/(target/)?scripts/(boot_guard|webrtc_watchdog)\.sh" \
+        | grep -v grep | awk '{print $1}'); do
+    kill -9 "$_p" 2>/dev/null || true
+    echo "已暂停安装期间可能抢建容器的看护进程：pid=$_p"
+done
+
+binder_supported() {
+    # 1) 老式/模块方式：存在静态 binder 设备节点
+    [ -e /dev/binder ] && return 0
+    [ -e /dev/binder_linux ] && return 0
+    # 2) binderfs 已挂载且非空
+    if [ -d /dev/binderfs ] && [ -n "$(ls -A /dev/binderfs 2>/dev/null)" ]; then
+        return 0
+    fi
+    # 3) 内核已注册 binderfs 文件系统（privileged 容器启动时可自行挂载 binderfs）
+    if grep -qw binder /proc/filesystems 2>/dev/null; then
+        return 0
+    fi
+    # 4) binder 模块已内建或已加载
+    if [ -d /sys/module/binder ] || [ -d /sys/module/binder_linux ]; then
+        return 0
+    fi
+    return 1
+}
+
+### 统一反馈渠道
+FEEDBACK_INFO="反馈：官网 www.lin1740.de5.net"
+
+### 3.9.2：失败原因必须能被看到。原来两处 `> "$TRIM_TEMP_LOGFILE"` 在变量为空时
+### 重定向直接失败，原因彻底丢失，用户只看到飞牛的「执行应用初始化脚本异常」。
+: "${TRIM_TEMP_LOGFILE:=/tmp/androidemu-install-msg.txt}"
+_ae_fail_show() { cat "${TRIM_TEMP_LOGFILE}" >&2 2>/dev/null || true; }
+
+case "$(uname -m 2>/dev/null)" in
+    armv7*|armv6*|armhf)
+        {
+            echo "本机为 32 位 ARM（$(uname -m)），redroid 官方镜像仅提供 arm64 与 x86_64，无法在 32 位系统运行。"
+            echo "请改用 64 位 ARM（aarch64）或 x86_64 设备。$FEEDBACK_INFO"
+        } > "$TRIM_TEMP_LOGFILE"
+        _ae_fail_show
+        exit 1
+        ;;
+esac
+
+
+### 3.9.1：清理上一次「失败安装 / 未清干净的卸载」残留，避免 compose 报
+### network with name androidemu_default already exists / container name already in use。
+### 安全约束：只删「已停止」的容器与「没有容器在用」的网络 —— 升级时容器在跑，一律不动。
+_ae_cleanup_stale() {
+    for _c in androidemu-android androidemu-webrtc; do
+        if docker inspect "$_c" >/dev/null 2>&1; then
+            if [ "$(docker inspect -f '{{.State.Running}}' "$_c" 2>/dev/null)" != "true" ]; then
+                docker rm -f "$_c" >/dev/null 2>&1 || true
+            fi
+        fi
+    done
+    for _n in androidemu_default; do
+        if docker network inspect "$_n" >/dev/null 2>&1; then
+            _u=$(docker network inspect -f '{{len .Containers}}' "$_n" 2>/dev/null || echo 1)
+            [ "$_u" = "0" ] && docker network rm "$_n" >/dev/null 2>&1 || true
+        fi
+    done
+}
+_ae_cleanup_stale
+
+if ! binder_supported; then
+    {
+        echo "未检测到内核 binder 支持，安卓模拟器无法安装/启动（redroid 必须由宿主内核提供 binder，无纯软件替代方案）。"
+        echo "· x86 设备：请先在飞牛应用中心安装并启用依赖应用「binder_linux」，再重新安装本应用；"
+        echo "· ARM 设备：请确认系统内核已启用 CONFIG_ANDROID_BINDER_IPC / binderfs（多数 RK3588 等 ARM 设备已内置）。"
+        echo "处理完成后重新点击安装即可。$FEEDBACK_INFO"
+    } > "$TRIM_TEMP_LOGFILE"
+    _ae_fail_show
+    exit 1
+fi
+
+### 无 /dev/dri（核显/独显）不再中止或告警：install_callback 会自动回退软件渲染
+### （swiftshader）保证开机，ARM 设备首版亦默认软件渲染，属正常支持范围。
+
+### 应用用户访问 Docker socket 的能力由 config/privilege（groupname=docker）声明，
+### fnOS 创建应用用户时即以其为属组，无需在脚本中 usermod 改动系统用户
+### （避免宿主高权限 级系统用户变更，符合最小权限原则）。
+
+### 安装不阻塞：镜像由安装完成后的后台脚本自动拉取（start_pull_bg.sh），
+### 应用面板与启用入口也会在缺镜像时自动触发拉取。此处不再同步拉取，
+### 避免安装过程占用过高资源导致 NAS 网页断连。
+
+### 2.0.18：【关键】安装/升级阶段由应用自己把两个镜像准备好（加速源优先 → 官方回退）。
+### 背景：飞牛 docker-project 会在安装/更新时执行 `docker compose pull`；compose 的
+### pull_policy=missing 只在「本地已有镜像」时才跳过（实测 Skipped），一旦镜像缺失就会
+### 联网拉取 —— 而国内直连 registry-1.docker.io 经常超时，失败后飞牛会回滚（历史上还
+### 出现过程序目录/容器/数据卷被清掉的严重后果）。所以这里主动备齐镜像：
+### 任一源成功即止；全部失败就带中文原因中止本次安装，而不是留下半装状态。
+### 3.8.9：镜像名与版本统一取自「单一可信源」app/docker/runtime.conf（经 scripts/rtconf.sh 载入）
+### —— 换 Android 版本（9~16 任选）只改该文件一处，本回调不写死任何版本号。
+if [ -f "${TRIM_APPDEST}/scripts/rtconf.sh" ]; then
+    # shellcheck disable=SC1091
+    . "${TRIM_APPDEST}/scripts/rtconf.sh"
+    rtconf_load
+fi
+: "${CANON_REDROID:=docker.fnnas.com/redroid/redroid:12.0.0-latest}"
+: "${OFF_REDROID:=redroid/redroid:12.0.0-latest}"
+: "${CANON_WEBRTC:=docker.fnnas.com/buutuu/scrcpy-over-webrtc:latest}"
+: "${OFF_WEBRTC:=buutuu/scrcpy-over-webrtc:latest}"
+### 3.9.4 关键修复：digest 锁定默认值（与 app/scripts/pull_image.sh 保持一致）——
+### 此前这里默认为空，${WEBRTC_DIGEST:-} 判空后升级走 refresh_latest_image 拉取
+### 加速源过期的 latest（0.4.1）覆盖本地，画面服务被回退为旧版。正常路径下
+### 穿云投屏镜像永远固定在发布本包时实测适配的版本；上游发新版经我们适配后
+### 由新应用包统一更新锁定值，用户侧永不自动跟随上游。
+: "${WEBRTC_REPO:=buutuu/scrcpy-over-webrtc}"
+: "${WEBRTC_DIGEST:=sha256:dc6e62393e0e490c79410d8b41ef32896f7a384b97077e4b5cfb9804a4bb2cdd}"
+REDROID_IMAGE="$OFF_REDROID"
+echo "[$(date '+%F %T')] Android ${ANDROID_VER:-12}，将预拉取 $REDROID_IMAGE"
+androidemu_ensure_image() {
+    AE_CANON="$1"; AE_OFFICIAL="$2"; AE_REPO="$3"
+    ### 3.9.4 方案一修复：画面服务镜像 digest 优先于一切（放在 CANON 存在早退之前，
+    ### 否则本地残留 0.4.1 的旧 tag 会被直接放行）。2026-11-01 实测复现的泄漏路径：
+    ### 卸载清掉镜像 tag 后，本函数按 tag 链把加速源上过期的 latest（0.4.1）拉回打上
+    ### CANON，容器随 compose 直接跑旧版。现对 scrcpy-over-webrtc 一律先走 digest：
+    ### ① 本地按内容查找（任一源的 RepoDigest 命中即复用，秒回）；
+    ### ② 逐源按 digest 拉取（内容寻址，任何源拉到都是已适配版本）；
+    ### ③ 全部失败才落到原有同族复用与 tag 链（保底可用性优先，可装但可能旧版）。
+    case "$AE_REPO" in
+        *scrcpy-over-webrtc*)
+            if [ -n "${WEBRTC_DIGEST:-}" ]; then
+                for AE_SRC in docker.m.daocloud.io docker.fnnas.com docker.1ms.run ""; do
+                    if [ -n "$AE_SRC" ]; then
+                        AE_DG="$AE_SRC/${WEBRTC_REPO}@${WEBRTC_DIGEST}"
+                    else
+                        AE_DG="${WEBRTC_REPO}@${WEBRTC_DIGEST}"
+                    fi
+                    if docker image inspect "$AE_DG" >/dev/null 2>&1; then
+                        docker tag "$AE_DG" "$AE_CANON" 2>/dev/null || true
+                        docker tag "$AE_DG" "$AE_OFFICIAL" 2>/dev/null || true
+                        echo "[$(date '+%F %T')] 画面服务镜像 digest 命中本地：$AE_DG → $AE_CANON"
+                        return 0
+                    fi
+                done
+                for AE_SRC in docker.m.daocloud.io docker.fnnas.com docker.1ms.run ""; do
+                    if [ -n "$AE_SRC" ]; then
+                        AE_DG="$AE_SRC/${WEBRTC_REPO}@${WEBRTC_DIGEST}"
+                    else
+                        AE_DG="${WEBRTC_REPO}@${WEBRTC_DIGEST}"
+                    fi
+                    echo "[$(date '+%F %T')] 按 digest 拉取画面服务镜像：$AE_DG"
+                    if timeout 300 docker pull "$AE_DG" >/dev/null 2>&1; then
+                        docker tag "$AE_DG" "$AE_CANON" 2>/dev/null || true
+                        docker tag "$AE_DG" "$AE_OFFICIAL" 2>/dev/null || true
+                        echo "[$(date '+%F %T')] 画面服务镜像按 digest 就绪：$AE_CANON（来源 $AE_DG）"
+                        return 0
+                    fi
+                done
+                echo "[$(date '+%F %T')] 画面服务镜像 digest 路径全失败，回退标签链（保底可用）"
+            fi
+            ;;
+    esac
+    docker image inspect "$AE_CANON" >/dev/null 2>&1 && return 0
+    if docker image inspect "$AE_OFFICIAL" >/dev/null 2>&1; then
+        docker tag "$AE_OFFICIAL" "$AE_CANON" 2>/dev/null || true
+        return 0
+    fi
+    ### 3.9.2 修正（群友实测「应用安装失败：执行应用初始化脚本异常」的根因之一）：
+    ### 原来只认两个精确标签，本地明明有同一镜像（如加速源的 tag、或历史别名标签）
+    ### 也判定"缺失"，然后 4 个源 × timeout 300s = 最长 20 分钟无响应，
+    ### 飞牛等不到返回就判「执行应用初始化脚本异常」。
+    ### 现在：① 先按仓库名在本地找同族镜像直接复用（不联网）；② 拉取超时降到 75s。
+    AE_NAME="${AE_REPO%%:*}"      # redroid/redroid
+    AE_TAG="${AE_REPO##*:}"       # 12.0.0-latest
+    AE_BASE="${AE_NAME##*/}"      # redroid
+    for AE_IMG in $(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null); do
+        case "$AE_IMG" in
+            *"<none>"*) continue ;;
+        esac
+        case "$AE_IMG" in
+            *"/$AE_NAME:$AE_TAG"|"$AE_NAME:$AE_TAG")
+                docker tag "$AE_IMG" "$AE_CANON" 2>/dev/null || true
+                docker tag "$AE_IMG" "$AE_OFFICIAL" 2>/dev/null || true
+                docker image inspect "$AE_CANON" >/dev/null 2>&1 && {
+                    echo "[$(date '+%F %T')] 复用本地镜像：$AE_IMG"
+                    return 0
+                }
+                ;;
+        esac
+        ### 画面服务镜像按 digest 锁定，标签可能是 pinned 等别名 —— 同族即可复用
+        case "$AE_REPO" in
+            *scrcpy-over-webrtc*)
+                case "$AE_IMG" in
+                    *"$AE_BASE"*)
+                        docker tag "$AE_IMG" "$AE_CANON" 2>/dev/null || true
+                        docker tag "$AE_IMG" "$AE_OFFICIAL" 2>/dev/null || true
+                        docker image inspect "$AE_CANON" >/dev/null 2>&1 && {
+                            echo "[$(date '+%F %T')] 复用本地画面服务镜像：$AE_IMG"
+                            return 0
+                        }
+                        ;;
+                esac
+                ;;
+        esac
+    done
+    ### 3.9.4 修复（2026-11-02 用户实测报障）：初始化阶段不再同步拉取大镜像。
+    ### 根因：原逻辑 timeout 75 秒拉 redroid（约 2GB）——10MB/s 也需约 200 秒，必然
+    ### 被 SIGTERM；4 个源各 75 秒累计约 5 分钟，超过飞牛对初始化脚本的等待上限，
+    ### 用户看到的是「所有加速源与 Docker Hub 官方源均不可达」（脚本自己跑完四源）
+    ### 或「执行应用初始化脚本异常」（被外层超时直接杀掉，连弹窗都来不及输出），
+    ### 而实测网络完全正常、加速源也能正常开始拉取——只是被超时反复打断。
+    ### 现改为：本地无镜像时拉起后台拉取（start_pull_bg → pull_image，多源熔断 +
+    ### digest 锁定，就绪后自动创建容器），初始化脚本立即返回，安装秒级完成。
+    if [ -f "${TRIM_APPDEST}/scripts/start_pull_bg.sh" ]; then
+        bash "${TRIM_APPDEST}/scripts/start_pull_bg.sh" >/dev/null 2>&1 || true
+        echo "[$(date '+%F %T')] $AE_REPO 本地缺失，已启动后台拉取（约 2GB，进度见 ${TRIM_PKGVAR:-/var/apps/androidemu/var}/pull-progress.log），就绪后自动拉起容器"
+        return 0
+    fi
+    ### 兜底（无 start_pull_bg 时可执行文件缺失的异常场景）：保留标签链拉取，
+    ### 但超时放宽到 900 秒，避免 2GB 镜像被 75 秒截断。
+    for AE_SRC in docker.fnnas.com docker.m.daocloud.io docker.1ms.run ""; do
+        if [ -n "$AE_SRC" ]; then AE_CAND="$AE_SRC/$AE_REPO"; else AE_CAND="$AE_REPO"; fi
+        echo "[$(date '+%F %T')] 准备镜像：$AE_CAND"
+        if timeout 900 docker pull "$AE_CAND" >/dev/null 2>&1; then
+            docker tag "$AE_CAND" "$AE_CANON" 2>/dev/null || true
+            docker tag "$AE_CAND" "$AE_OFFICIAL" 2>/dev/null || true
+            docker image inspect "$AE_CANON" >/dev/null 2>&1 && return 0
+        fi
+    done
+    return 1
+}
+if ! androidemu_ensure_image "$CANON_REDROID" "$OFF_REDROID" "$OFF_REDROID"; then
+    {
+        echo "无法准备 Redroid 安卓系统镜像（约 2GB）：所有加速源与 Docker Hub 官方源均不可达。"
+        echo "· 请检查 NAS 外网/代理是否正常，或在「Docker → 镜像仓库 → 设置 → 加速源设置」中换成可用的加速源后重试；"
+        echo "· 本次安装已中止，未改动现有安装与数据（安卓数据卷不会被删除）。$FEEDBACK_INFO"
+        echo "· 若处于晚间时段（约 19:00~24:00），国际链路易拥塞、部分加速源可能限速，可改在白天或 24 点后重试（安装失败不会影响现有数据，重装即可）。"
+    } > "${TRIM_TEMP_LOGFILE:-/tmp/androidemu-install-msg.txt}" 2>/dev/null || true
+    _ae_fail_show
+    exit 1
+fi
+if ! androidemu_ensure_image "$CANON_WEBRTC" "$OFF_WEBRTC" "$OFF_WEBRTC"; then
+    {
+        echo "无法准备穿云投屏（WebRTC 云手机画面）镜像：所有加速源与 Docker Hub 官方源均不可达。"
+        echo "请检查 NAS 外网/代理或更换加速源后重试；本次安装已中止，未改动现有安装与数据。$FEEDBACK_INFO"
+        echo "若处于晚间时段（约 19:00~24:00），国际链路易拥塞、部分加速源可能限速，可改在白天或 24 点后重试（安装失败不会影响现有数据，重装即可）。"
+    } > "${TRIM_TEMP_LOGFILE:-/tmp/androidemu-install-msg.txt}" 2>/dev/null || true
+    exit 1
+fi
+
+### 3.9.0：数据卷改为 external（卸载不再连带删除，保留数据重装可恢复）。
+### 必须在这里（安装前检查阶段）就创建 —— 飞牛 docker-project 在安装/更新时会
+### 先执行 compose（Network 创建 → 解析 volumes），若 external 卷不存在会直接
+### 报 `external volume "androidemu-webrtc-data" not found` 并判定安装失败。
+### 幂等：已存在的卷返回 0 且不受影响，不会清空数据。
+for AE_VOL in androidemu-data androidemu-webrtc-data; do
+    if ! docker volume create "$AE_VOL" >/dev/null 2>&1; then
+        {
+            echo "无法创建数据卷 $AE_VOL（Docker 权限不足或 Docker 服务异常）。"
+            echo "请在「Docker」中确认服务正常，并确认本应用已获得 docker 组权限后重试。$FEEDBACK_INFO"
+        } > "${TRIM_TEMP_LOGFILE:-/tmp/androidemu-install-msg.txt}" 2>/dev/null || true
+        exit 1
+    fi
+done
+
+exit 0

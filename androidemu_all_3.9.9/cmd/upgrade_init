@@ -1,0 +1,267 @@
+#!/bin/bash
+
+### 统一反馈渠道
+### 3.9.1：升级/安装前先停网关。
+### 原因（群友实测反馈：每次更新后必现 Bad Gateway）：旧网关二进制正在运行时，
+### 升级过程的新文件替换会让旧进程继续跑旧映像（或在 ETXTBSY 下替换失败），
+### 形成「新配置 + 旧网关」混用 —— 协议解析、路由前缀都对不上，表现为 Bad Gateway。
+### 先 stop 释放二进制，升级完成后再由应用启用流程幂等 start。
+_gw_stop() {
+    for _b in "${TRIM_APPDEST}/server/gateway_amd64" "${TRIM_APPDEST}/server/gateway_arm64"; do
+        if [ -x "$_b" ]; then
+            TRIM_APPDEST="${TRIM_APPDEST}" TRIM_PKGVAR="${TRIM_PKGVAR:-/var/apps/androidemu/var}" \
+                "$_b" stop >/dev/null 2>&1 && echo "已停止旧网关：$(basename "$_b")" && return 0
+        fi
+    done
+    return 0
+}
+
+_gw_stop
+
+### 3.9.9：升级窗口 —— 升级一开始就停掉常驻看护，并留下窗口标记。
+###   飞牛紧接着会执行 docker-project 的 down/pull/up；看护若在这段时间发现
+###   「容器不存在」就 compose up 补建，会与飞牛按固定 container_name 的 up 撞车。
+###   实测 2026-11-08 12:55：升级界面弹「无法更新 androidemu」，
+###   日志为 conflict: container name "/androidemu-webrtc" is already in use。
+###   标记 30 分钟内有效（看护见标记一律不碰容器），upgrade_callback 收尾会删除
+###   标记并按降权方式重新拉起看护；即便升级失败，30 分钟后看护也会自动恢复巡检。
+_V="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+mkdir -p "$_V" 2>/dev/null || true
+date +%s > "$_V/.upgrade_window" 2>/dev/null || true
+chmod 644 "$_V/.upgrade_window" 2>/dev/null || true
+for _p in $(ps -eo pid,args 2>/dev/null \
+        | grep -E "androidemu/(target/)?scripts/(boot_guard|webrtc_watchdog)\.sh" \
+        | grep -v grep | awk '{print $1}'); do
+    kill -9 "$_p" 2>/dev/null || true
+    echo "已暂停升级期间可能抢建容器的看护进程：pid=$_p"
+done
+
+### 3.9.4：升级侧补磁盘预检（与安装侧同口径）——升级虽通常复用本地镜像，
+### 但 compose 重建、容器层写入仍需空间；剩余 <1GB 时宁可提前中止，
+### 避免升级到一半磁盘写满造成半成品状态。
+_disk_free=$(df -Pm /vol1 2>/dev/null | awk 'NR==2{print $4}')
+case "$_disk_free" in ''|*[!0-9]*) _disk_free=0 ;; esac
+if [ "$_disk_free" -gt 0 ] && [ "$_disk_free" -lt 1024 ]; then
+    {
+        echo "磁盘剩余空间不足（${_disk_free}MB < 1GB），升级可能中途失败。"
+        echo "· 请清理磁盘空间（删除不需要的文件/镜像）后重新升级；"
+        echo "· 本次升级已中止，未改动现有安装与数据（安卓数据卷不会被删除）。$FEEDBACK_INFO"
+    } > "${TRIM_TEMP_LOGFILE:-/tmp/androidemu-upgrade-msg.txt}" 2>/dev/null || true
+    exit 1
+fi
+
+FEEDBACK_INFO="反馈：官网 www.lin1740.de5.net"
+
+### upgrade_init：升级前脚本。
+### 关键：必须在此处创建 /docker/docker-compose.yaml 真实文件——飞牛 docker-project 机制
+### 升级时把相对路径 docker 解析为根目录 /docker/，找不到 compose 文件就报
+### "open /docker/docker-compose.yaml: no such file or directory"，导致升级失败。
+
+COMPOSE="${TRIM_APPDEST}/docker/docker-compose.yaml"
+
+### 0) 缓存标签秒级恢复（核心修复，v1.0.42）：
+###    飞牛升级时 docker-project 会 down→pull→up；此前每次升级官方名镜像被删，
+###    pull 必须重下约 2GB 且国内到 Docker Hub 间歇超时 → 升级必失败。
+###    安装/后台拉取成功时会额外打缓存标签 androidemu-cache/*（飞牛按官方名
+###    清理镜像，缓存标签能存活）。此处把缓存标签恢复为官方名，compose pull
+###    发现本地已有镜像直接跳过，升级零网络、秒级完成。
+restore_img_from_cache() {
+    CANON="$1"; OFFICIAL="$2"; CACHE="$3"
+    if ! docker image inspect "$CANON" >/dev/null 2>&1 && docker image inspect "$CACHE" >/dev/null 2>&1; then
+        docker tag "$CACHE" "$CANON" 2>/dev/null || true
+    fi
+    if ! docker image inspect "$OFFICIAL" >/dev/null 2>&1; then
+        if docker image inspect "$CANON" >/dev/null 2>&1; then
+            docker tag "$CANON" "$OFFICIAL" 2>/dev/null || true
+        elif docker image inspect "$CACHE" >/dev/null 2>&1; then
+            docker tag "$CACHE" "$OFFICIAL" 2>/dev/null || true
+        fi
+    fi
+}
+if [ -f "${TRIM_APPDEST}/scripts/rtconf.sh" ]; then
+    # shellcheck disable=SC1091
+    . "${TRIM_APPDEST}/scripts/rtconf.sh"
+    rtconf_load
+fi
+: "${CANON_REDROID:=docker.fnnas.com/redroid/redroid:12.0.0-latest}"
+: "${OFF_REDROID:=redroid/redroid:12.0.0-latest}"
+: "${CANON_WEBRTC:=docker.fnnas.com/buutuu/scrcpy-over-webrtc:latest}"
+### 3.9.4 关键修复：digest 锁定默认值（与 app/scripts/pull_image.sh 保持一致）——
+### 此前这里默认为空，${WEBRTC_DIGEST:-} 判空后升级走 refresh_latest_image 拉取
+### 加速源过期的 latest（0.4.1）覆盖本地，画面服务被回退为旧版。正常路径下
+### 穿云投屏镜像永远固定在发布本包时实测适配的版本；上游发新版经我们适配后
+### 由新应用包统一更新锁定值，用户侧永不自动跟随上游。
+: "${WEBRTC_REPO:=buutuu/scrcpy-over-webrtc}"
+: "${WEBRTC_DIGEST:=sha256:dc6e62393e0e490c79410d8b41ef32896f7a384b97077e4b5cfb9804a4bb2cdd}"
+: "${OFF_WEBRTC:=buutuu/scrcpy-over-webrtc:latest}"
+: "${CACHE_REDROID:=androidemu-cache/redroid:12.0.0}"
+: "${CACHE_WEBRTC:=androidemu-cache/webrtc:latest}"
+restore_img_from_cache "$CANON_REDROID" "$OFF_REDROID" "$CACHE_REDROID"
+restore_img_from_cache "$CANON_WEBRTC" "$OFF_WEBRTC" "$CACHE_WEBRTC"
+
+### 3.8.9：【问题4 修复】升级时把「穿云投屏（latest 浮动标签）」尽力刷新到最新版。
+### 背景：穿云投屏镜像 tag 是 latest，但升级流程里 compose 的 pull_policy=missing 与
+###   androidemu_ensure_image 的「本地已存在即跳过」都会让旧镜像一直留着 —— 于是
+###   「上传新应用包更新后，穿云投屏容器版本不更新」。安卓镜像（2GB）保持原策略不动，
+###   只对 latest 浮动标签做「尽力刷新」：联网成功就用最新版，失败则沿用本地旧版，
+###   绝不因刷新失败而中断升级（离线升级仍然可用）。
+### 同时把刷新前的镜像 ID 记为备份（$VAR_DIR/webrtc_prev_image），供升级回调做健康回滚。
+### 兼容性冒烟测试：新镜像必须仍具备本应用定制 entrypoint 所依赖的关键路径，
+### 否则判定「上游结构已变化」，不采用该镜像（保留旧版），避免画面服务起不来。
+webrtc_image_compatible() {
+    docker run --rm --user "$(id -u):$(id -g)" --entrypoint /bin/sh "$1" -c \
+        'test -f /app/entrypoint.sh && test -x /app/webrtc-signaling && test -x /usr/bin/turnserver && test -d /app/agent_binaries' \
+        >/dev/null 2>&1
+}
+refresh_latest_image() {
+    AE_REPO="$1"; AE_CANON="$2"; AE_OFFICIAL="$3"; AE_CACHE="$4"
+    ### 只有浮动标签（:latest）才刷新；固定版本标签（如 :12.0.0-latest / :0.3.9）不刷新
+    case "$AE_REPO" in
+        *:latest) : ;;
+        *) return 0 ;;
+    esac
+    _prev=$(docker image inspect -f '{{.Id}}' "$AE_CANON" 2>/dev/null)
+    [ -n "$_prev" ] && echo "$_prev" > "${TRIM_PKGVAR:-/var/apps/androidemu/var}/webrtc_prev_image" 2>/dev/null || true
+    for AE_SRC in docker.fnnas.com docker.m.daocloud.io docker.1ms.run ""; do
+        if [ -n "$AE_SRC" ]; then AE_CAND="$AE_SRC/$AE_REPO"; else AE_CAND="$AE_REPO"; fi
+        echo "[$(date '+%F %T')] 刷新 latest 镜像：$AE_CAND"
+        if timeout 300 docker pull "$AE_CAND" >/dev/null 2>&1; then
+            ### 冒烟测试：结构不兼容则保留旧版（不采纳新镜像），升级继续
+            if ! webrtc_image_compatible "$AE_CAND"; then
+                echo "[$(date '+%F %T')] 新镜像未通过兼容性冒烟测试（上游目录结构变化），保留现有版本"
+                return 0
+            fi
+            docker tag "$AE_CAND" "$AE_CANON" 2>/dev/null || true
+            docker tag "$AE_CAND" "$AE_OFFICIAL" 2>/dev/null || true
+            docker tag "$AE_CAND" "$AE_CACHE" 2>/dev/null || true
+            _now=$(docker image inspect -f '{{.Id}}' "$AE_CANON" 2>/dev/null)
+            if [ -n "$_prev" ] && [ "$_prev" != "$_now" ]; then
+                echo "[$(date '+%F %T')] 穿云投屏镜像已更新到最新版（${_prev} -> ${_now}），旧版保留为回滚备份"
+            else
+                echo "[$(date '+%F %T')] 穿云投屏镜像已是最新（${_now}）"
+            fi
+            return 0
+        fi
+    done
+    echo "[$(date '+%F %T')] 刷新穿云投屏镜像失败（网络不可达），沿用本地现有版本，升级继续"
+    return 0
+}
+### 3.9.1：镜像按 WEBRTC_DIGEST 锁定时跳过 latest 刷新 —— 上游推送新 latest 不再影响
+### 已装用户（配置与镜像版本永远对应）；跟随上游改用「发布新版应用包（换 digest）」。
+if [ -n "${WEBRTC_DIGEST:-}" ]; then
+    echo "[$(date '+%F %T')] 穿云投屏镜像已按 digest 锁定（${WEBRTC_DIGEST}），跳过 latest 刷新"
+else
+    refresh_latest_image "$WEBRTC_REPO:$WEBRTC_TAG" "$CANON_WEBRTC" "$OFF_WEBRTC" "$CACHE_WEBRTC"
+fi
+
+### 2.0.18：【关键】安装/升级阶段由应用自己把两个镜像准备好（加速源优先 → 官方回退）。
+### 背景：飞牛 docker-project 会在安装/更新时执行 `docker compose pull`；compose 的
+### pull_policy=missing 只在「本地已有镜像」时才跳过（实测 Skipped），一旦镜像缺失就会
+### 联网拉取 —— 而国内直连 registry-1.docker.io 经常超时，失败后飞牛会回滚（历史上还
+### 出现过程序目录/容器/数据卷被清掉的严重后果）。所以这里主动备齐镜像：
+### 任一源成功即止；全部失败就带中文原因中止本次安装，而不是留下半装状态。
+androidemu_ensure_image() {
+    AE_CANON="$1"; AE_OFFICIAL="$2"; AE_REPO="$3"
+    ### 3.9.9：升级时先按锁定 digest 纠正画面服务内容。
+    ### restore_img_from_cache 可能把旧版缓存（androidemu-cache/webrtc:latest）恢复成
+    ### CANON，而下面「tag 存在即放行」会让升级后继续跑旧版。这里先把 CANON / OFFICIAL /
+    ### CACHE 三个 tag 统一指到锁定版本内容；取不到时按 digest 拉取，全失败才沿用本地
+    ### 现有镜像（保底可用，不中断升级）。
+    case "$AE_REPO" in
+        *scrcpy-over-webrtc*)
+            if [ -n "${WEBRTC_DIGEST:-}" ]; then
+                _dg="$(docker images --digests --format '{{.Digest}} {{.ID}}' 2>/dev/null \
+                       | awk -v d="$WEBRTC_DIGEST" '$1==d {print $2; exit}')"
+                if [ -n "$_dg" ]; then
+                    docker tag "$_dg" "$AE_CANON" 2>/dev/null || true
+                    docker tag "$_dg" "$AE_OFFICIAL" 2>/dev/null || true
+                    docker tag "$_dg" "${CACHE_WEBRTC:-androidemu-cache/webrtc:latest}" 2>/dev/null || true
+                    echo "[$(date '+%F %T')] 升级：画面服务已按锁定版本内容纠正（${_dg}）"
+                    return 0
+                fi
+                for AE_SRC in docker.fnnas.com docker.m.daocloud.io docker.1ms.run ""; do
+                    if [ -n "$AE_SRC" ]; then AE_DG="$AE_SRC/${WEBRTC_REPO}@${WEBRTC_DIGEST}"; else AE_DG="${WEBRTC_REPO}@${WEBRTC_DIGEST}"; fi
+                    if docker image inspect "$AE_DG" >/dev/null 2>&1; then
+                        docker tag "$AE_DG" "$AE_CANON" 2>/dev/null || true
+                        docker tag "$AE_DG" "$AE_OFFICIAL" 2>/dev/null || true
+                        docker tag "$AE_DG" "${CACHE_WEBRTC:-androidemu-cache/webrtc:latest}" 2>/dev/null || true
+                        return 0
+                    fi
+                done
+                for AE_SRC in docker.fnnas.com docker.m.daocloud.io docker.1ms.run ""; do
+                    if [ -n "$AE_SRC" ]; then AE_DG="$AE_SRC/${WEBRTC_REPO}@${WEBRTC_DIGEST}"; else AE_DG="${WEBRTC_REPO}@${WEBRTC_DIGEST}"; fi
+                    if timeout 300 docker pull "$AE_DG" >/dev/null 2>&1; then
+                        docker tag "$AE_DG" "$AE_CANON" 2>/dev/null || true
+                        docker tag "$AE_DG" "$AE_OFFICIAL" 2>/dev/null || true
+                        docker tag "$AE_DG" "${CACHE_WEBRTC:-androidemu-cache/webrtc:latest}" 2>/dev/null || true
+                        echo "[$(date '+%F %T')] 升级：画面服务已按 digest 拉取锁定版本"
+                        return 0
+                    fi
+                done
+                echo "[$(date '+%F %T')] 升级：锁定版本暂不可取，沿用本地现有画面服务镜像（不中断升级）"
+            fi
+            ;;
+    esac
+    docker image inspect "$AE_CANON" >/dev/null 2>&1 && return 0
+    if docker image inspect "$AE_OFFICIAL" >/dev/null 2>&1; then
+        docker tag "$AE_OFFICIAL" "$AE_CANON" 2>/dev/null || true
+        return 0
+    fi
+    for AE_SRC in docker.fnnas.com docker.m.daocloud.io docker.1ms.run ""; do
+        if [ -n "$AE_SRC" ]; then AE_CAND="$AE_SRC/$AE_REPO"; else AE_CAND="$AE_REPO"; fi
+        echo "[$(date '+%F %T')] 准备镜像：$AE_CAND"
+        if timeout 300 docker pull "$AE_CAND" >/dev/null 2>&1; then
+            docker tag "$AE_CAND" "$AE_CANON" 2>/dev/null || true
+            docker tag "$AE_CAND" "$AE_OFFICIAL" 2>/dev/null || true
+            docker image inspect "$AE_CANON" >/dev/null 2>&1 && return 0
+        fi
+    done
+    return 1
+}
+if ! androidemu_ensure_image "$CANON_REDROID" "$OFF_REDROID" "$OFF_REDROID"; then
+    {
+        echo "无法准备 Redroid 安卓系统镜像（约 2GB）：所有加速源与 Docker Hub 官方源均不可达。"
+        echo "· 请检查 NAS 外网/代理是否正常，或在「Docker → 镜像仓库 → 设置 → 加速源设置」中换成可用的加速源后重试；"
+        echo "· 本次升级已中止，未改动现有安装与数据（安卓数据卷不会被删除）。$FEEDBACK_INFO"
+        echo "· 若处于晚间时段（约 19:00~24:00），国际链路易拥塞、部分加速源可能限速，可改在白天或 24 点后重试（安装失败不会影响现有数据，重装即可）。"
+    } > "${TRIM_TEMP_LOGFILE:-/tmp/androidemu-install-msg.txt}" 2>/dev/null || true
+    exit 1
+fi
+if ! androidemu_ensure_image "$CANON_WEBRTC" "$OFF_WEBRTC" "$OFF_WEBRTC"; then
+    {
+        echo "无法准备穿云投屏（WebRTC 云手机画面）镜像：所有加速源与 Docker Hub 官方源均不可达。"
+        echo "请检查 NAS 外网/代理或更换加速源后重试；本次升级已中止，未改动现有安装与数据。$FEEDBACK_INFO"
+        echo "若处于晚间时段（约 19:00~24:00），国际链路易拥塞、部分加速源可能限速，可改在白天或 24 点后重试（安装失败不会影响现有数据，重装即可）。"
+    } > "${TRIM_TEMP_LOGFILE:-/tmp/androidemu-install-msg.txt}" 2>/dev/null || true
+    exit 1
+fi
+### 缓存 tag 同步（供下次升级秒级恢复）
+docker tag "$CANON_REDROID" "$CACHE_REDROID" 2>/dev/null || true
+docker tag "docker.m.daocloud.io/${REDROID_REPO}:${REDROID_TAG}" "$CACHE_REDROID" 2>/dev/null || true
+docker tag "$CANON_WEBRTC" "$CACHE_WEBRTC" 2>/dev/null || true
+### 3.9.9：digest 锁定时，缓存只从「已按锁定内容纠正的 CANON」写入。
+### 不再用 daocloud 的 latest 回打缓存 —— 该 tag 可能是过期旧版，会覆盖缓存，
+### 导致下一次升级 restore_img_from_cache 又把旧内容恢复成 CANON。
+
+### 1. 应用用户访问 Docker socket 的能力由 config/privilege（groupname=docker）声明，
+###    无需在脚本中 usermod 改动系统用户（避免宿主高权限 级系统用户变更）。
+
+### 2. 创建 /docker/docker-compose.yaml 真实文件（飞牛 docker-project 升级必需）
+###    先按宿主架构校准（tune_compose.sh：GPU 直通/软件渲染、binderfs 设备裁剪），
+###    再复制校准后的版本到 /docker——飞牛升级流程随后会以该文件执行 down/pull/up，
+###    若保留不存在的 /dev/dri、/dev/binder 设备直通，up 阶段会直接创建容器失败。
+mkdir -p /docker 2>/dev/null || true
+if [ -f "$COMPOSE" ]; then
+    if [ -f "${TRIM_APPDEST}/scripts/tune_compose.sh" ]; then
+        bash "${TRIM_APPDEST}/scripts/tune_compose.sh" "$COMPOSE" || true
+    fi
+    cp -f "$COMPOSE" /docker/docker-compose.yaml 2>/dev/null || true
+    chmod 644 /docker/docker-compose.yaml 2>/dev/null || true
+fi
+
+### 3.9.0：数据卷为 external，飞牛 docker-project 升级会先 down/pull/up，
+### 若卷缺失会报 `external volume ... not found` 导致更新失败。升级前幂等补建。
+docker volume create androidemu-data >/dev/null 2>&1 || true
+docker volume create androidemu-webrtc-data >/dev/null 2>&1 || true
+
+exit 0

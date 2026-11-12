@@ -1,0 +1,52 @@
+{
+  "comment": "androidemu redroid 容器 seccomp 过滤（denylist / 默认放行，仅拒绝下列系统调用）",
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "archMap": [
+    { "architecture": "SCMP_ARCH_X86_64", "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"] },
+    { "architecture": "SCMP_ARCH_AARCH64", "subArchitectures": ["SCMP_ARCH_ARM"] }
+  ],
+  "syscalls": [
+    {
+      "comment": "内核模块加载/卸载：系统内高权限 可借此把代码放进宿主内核，是最直接的逃逸路径之一",
+      "names": ["init_module", "finit_module", "delete_module"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "comment": "kexec：用新内核替换当前内核（kexec_load / kexec_file_load）",
+      "names": ["kexec_load", "kexec_file_load"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "comment": "reboot：容器与宿主共用内核，容器内 reboot 会重启整台 NAS（防止误操作与恶意重启）",
+      "names": ["reboot"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "comment": "swap：宿主 swap 与容器共用，禁止容器内开关宿主交换分区",
+      "names": ["swapon", "swapoff"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "comment": "acct：进程记账，与安卓无关",
+      "names": ["acct"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "comment": "iopl/ioperm：直接访问 IO 端口（x86），安卓与穿云投屏都不需要",
+      "names": ["iopl", "ioperm"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "comment": "settimeofday/clock_settime：容器与宿主共享系统时钟，禁止容器改宿主时间；容器内 date 读到的时间仍与宿主一致",
+      "names": ["settimeofday", "clock_settime"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    }
+  ]
+}
