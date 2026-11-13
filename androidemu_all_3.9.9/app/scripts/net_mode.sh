@@ -161,6 +161,16 @@ esac
 [ -f "$COMPOSE" ] || { echo "net_mode: compose 不存在：$COMPOSE"; exit 0; }
 
 ### 修改 environment 块中的五个键（3.9.1：优先 Go 版 editcompose 结构化编辑，awk 回退）
+###
+### 3.9.9 修复（实测 2026-11-13，群友机器 WEB_PORT=8440）：
+###   SIGNALING_PORT 是「容器内监听端口」，必须与 compose ports 的**容器侧**一致
+###   （compose 模板与 install_callback 都把它固定为 8443，只改宿主侧）。
+###   旧实现把 SIGNALING_PORT 也写成 WEB_PORT，于是用户把端口改成 8440 后：
+###     映射 8440(宿主) -> 8443(容器)，而服务在容器内听 8440
+###   → 宿主怎么连都不通（docker-proxy 转发到容器 8443，没人监听），
+###     表现就是状态页「投屏端口无响应 + EOF」，容器内日志却是
+###     "Listening on [::]:8440"。
+###   只有对外端口（EXTERNAL_SIGNALING_PORT）才应跟随 WEB_PORT。
 ### 注意：这五个键都在 **webrtc** 服务的 environment 里，不是 redroid！
 ### 历史 bug：曾把服务名写成 redroid，editcompose 返回成功但什么都没改（静默失效），
 ### 表现为 net_mode 报告 USE_TLS=true 而 compose/容器仍是旧值。
@@ -175,7 +185,7 @@ _edit_compose_env() {
     "$GWBIN" editcompose "$COMPOSE" set-env webrtc "PUBLIC_IP=$PUBLIC_IP_FOR_CONTAINER" >/dev/null 2>&1 || return 1
     "$GWBIN" editcompose "$COMPOSE" set-env webrtc "USE_TLS=$TLS" >/dev/null 2>&1 || return 1
     "$GWBIN" editcompose "$COMPOSE" set-env webrtc "EXTERNAL_SIGNALING_PORT=$EXT" >/dev/null 2>&1 || return 1
-    "$GWBIN" editcompose "$COMPOSE" set-env webrtc "SIGNALING_PORT=$P_WEB" >/dev/null 2>&1 || return 1
+    "$GWBIN" editcompose "$COMPOSE" set-env webrtc "SIGNALING_PORT=8443" >/dev/null 2>&1 || return 1
     "$GWBIN" editcompose "$COMPOSE" set-env webrtc "EXTERNAL_TURN_PORT=$P_TURN" >/dev/null 2>&1 || return 1
     # 写后必须校验：editcompose 可能「静默成功」或留下重复键（compose 后者生效，
     # 会盖掉新值）。任一键不存在 / 不唯一 / 值不对，都交给 awk 回退重写。
@@ -184,11 +194,12 @@ _edit_compose_env() {
     done
     grep -q -- "- USE_TLS=$TLS" "$COMPOSE" || return 1
     grep -q -- "- PUBLIC_IP=$PUBLIC_IP_FOR_CONTAINER" "$COMPOSE" || return 1
+    grep -q -- "- SIGNALING_PORT=8443" "$COMPOSE" || return 1
     return 0
 }
 if ! _edit_compose_env; then
     TMP="$(mktemp)" || exit 0
-    awk -v pub="$PUBLIC_IP_FOR_CONTAINER" -v tls="$TLS" -v ext="$EXT" -v sig="$P_WEB" -v turn="$P_TURN" '
+    awk -v pub="$PUBLIC_IP_FOR_CONTAINER" -v tls="$TLS" -v ext="$EXT" -v sig="8443" -v turn="$P_TURN" '
         /^  redroid:/ { inw=0 }
         /^  webrtc:/ { inw=1 }
         !inw { print; next }
@@ -210,7 +221,7 @@ mkdir -p /docker 2>/dev/null || true
 cp -f "$COMPOSE" /docker/docker-compose.yaml 2>/dev/null || true
 chmod 644 /docker/docker-compose.yaml 2>/dev/null || true
 
-echo "net_mode[$MODE]: PUBLIC_IP(容器)=$PUBLIC_IP_FOR_CONTAINER USE_TLS=$TLS EXTERNAL_SIGNALING_PORT=$EXT SIGNALING_PORT=$P_WEB TURN=$P_TURN ADB=$P_ADB"
+echo "net_mode[$MODE]: PUBLIC_IP(容器)=$PUBLIC_IP_FOR_CONTAINER USE_TLS=$TLS EXTERNAL_SIGNALING_PORT=$EXT SIGNALING_PORT=8443(容器内固定) TURN=$P_TURN ADB=$P_ADB"
 
 if [ "$NO_RESTART" = "1" ]; then
     echo "net_mode: --no-restart，仅写配置（安装/升级流程稍后统一启动容器）"
