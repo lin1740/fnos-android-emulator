@@ -104,6 +104,30 @@ fi
 [ "$HARD" = "0" ] && exit 0
 
 log(){ echo "[$(date '+%F %T')] harden_system: $*"; }
+
+### 3.9.9：先判断 /system 到底能不能写。
+###   redroid 的 /system 是镜像只读层，且本应用并没有把 build.prop 绑定挂载进容器
+###   （tune_compose.sh 里没有这一项），所以 ro.build.type / ro.build.tags /
+###   ro.debuggable 在容器内**改不掉**。而旧逻辑仍然走「改 → docker restart → 复核」：
+###   复核必然失败，30 分钟节流一过又重启一次。实测日志 21:06:34 与 21:10:56 连续两次，
+###   redroid 的 init 不响应 SIGTERM，每次 restart 都被 SIGKILL（退出码 137），
+###   boot_guard 看到容器宕机 301 秒就判定「应用已停用」，直接停掉画面服务 ——
+###   用户看到的就是「应用莫名其妙没了 + 启用时报 docker不可用」。
+###   现在：只读时只做「删 su」这一件真正有意义的安全动作，属性改不掉就记录在案，
+###   不再重启容器。可写时（例如以后接入身份伪装挂载）才走原来的改写+重启流程。
+_WRITABLE=$(docker exec "$C" sh -c 'if echo x > /system/.ae_wtest 2>/dev/null; then rm -f /system/.ae_wtest; echo 1; else echo 0; fi' 2>/dev/null | tr -d '\r\n')
+if [ "$_WRITABLE" != "1" ]; then
+    docker exec "$C" sh -c 'rm -f /system/xbin/su /system/bin/su /sbin/su 2>/dev/null; true' >/dev/null 2>&1 || true
+    _SUCHK=$(docker exec "$C" sh -c 'ls /system/xbin/su /system/bin/su 2>/dev/null' | tr -d '\r\n')
+    if [ -n "$_SUCHK" ]; then
+        log "系统分区只读：su 仍存在（$_SUCHK），需人工处理；调试特征无法在容器内持久修改，跳过改写与容器重启（避免反复重启被判为应用停用）"
+    else
+        log "系统分区只读：已确认无 su；调试特征（type/tags/debuggable）无法在容器内持久修改，跳过改写与容器重启（避免反复重启被判为应用停用）"
+    fi
+    echo "$_CID $(date +%s)" > "$STAMP" 2>/dev/null || true
+    exit 0
+fi
+
 log "检测到 userdebug 调试特征 → 应用新手机画像（删 su + 属性调整）"
 docker exec "$C" sh -c "
 rm -f /system/xbin/su /system/bin/su /sbin/su 2>/dev/null
