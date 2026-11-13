@@ -414,14 +414,58 @@ func statusPageHTML(errMsg string) []byte {
 		case "installing", "no_container", "booting", "docker_unavailable":
 			errHtml = "<div class='notice'>提示：Android 系统正在准备中，页面会自动刷新。" +
 				"首次安装需要拉取约 2GB 系统镜像，通常 1-5 分钟，无需任何操作。</div>"
+		case "upstream_down":
+			// 3.9.9：容器在跑、安卓也起来了，只是投屏端口没应答。原来这里把裸错误
+			// （实测用户看到的就是一行「EOF」）用红框甩出来，既看不懂也不知道做什么。
+			// 改为可操作提示，技术细节缩到小字里备查。
+			errHtml = "<div class='notice'>投屏服务暂时没有应答。常见原因：刚刚重启、服务还在初始化；" +
+				"或投屏容器卡住。可先等 10 秒（页面会自动刷新），仍不恢复就点下方「重启投屏服务」。</div>" +
+				"<p style='font-size:12px;color:#999;margin:6px 0'>技术信息：" + htmlEscape(errMsg) + "</p>"
 		default:
-			errHtml = "<div class='error'>" + errMsg + "</div>"
+			errHtml = "<div class='error'>" + htmlEscape(errMsg) + "</div>"
 		}
+	}
+	// 上游地址直接摆出来：端口被自定义过、或与 compose 映射不一致时，
+	// 用户/维护者一眼就能看出网关连的是哪个端口，不用猜。
+	upstream := fmt.Sprintf("%s:%d（配置 %s）", UPSTREAM_HOST, UPSTREAM_PORT, protoName(USE_TLS))
+	// 异常阶段自动刷新，省掉「刷新页面」这一步；正常进面板后不再刷（不能打断会话）。
+	auto := "0"
+	switch stage {
+	case "installing", "no_container", "booting", "docker_unavailable", "upstream_down":
+		auto = "1"
 	}
 	html := strings.NewReplacer(
 		"{{STAGE}}", stage, "{{TITLE}}", title, "{{DESC}}", desc,
-		"{{ERR}}", errHtml, "{{ROWS}}", rows).Replace(statusTemplate)
+		"{{ERR}}", errHtml, "{{ROWS}}", rows,
+		"{{UPSTREAM}}", upstream, "{{AUTO}}", auto).Replace(statusTemplate)
 	return []byte(html)
+}
+
+// htmlEscape 只处理状态页会用到的几个字符，避免技术信息里的尖括号破坏结构。
+func htmlEscape(s string) string {
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
+}
+
+// upstreamWebOK：投屏端口是否真的有服务在应答。
+// 「容器 Up + surfaceflinger 在跑」不等于 8443 能应答 —— 实测出现过健康状态显示
+// 「运行正常」、页面同时报「画面服务未响应 + EOF」，用户完全无从下手。
+// 判定口径：TLS 握手成功，或明文请求拿到合法 HTTP 响应（复用协议探测的结果）。
+var (
+	webOKMu  sync.Mutex
+	webOKAt  time.Time
+	webOKVal bool
+)
+
+func upstreamWebOK() bool {
+	webOKMu.Lock()
+	defer webOKMu.Unlock()
+	if time.Since(webOKAt) < 5*time.Second {
+		return webOKVal
+	}
+	v := probeUpstreamTLS()
+	webOKVal = v == 1 || v == 0
+	webOKAt = time.Now()
+	return webOKVal
 }
 
 func checkContainerHealth() map[string]interface{} {
@@ -473,6 +517,12 @@ func checkContainerHealth() map[string]interface{} {
 	}
 	h["surfaceflinger_running"] = sf
 	h["agent_running"] = agent
+	// 3.9.9：投屏端口真实探活。只在安卓已启动时做，避免启动阶段白等两次 3 秒超时。
+	webOK := false
+	if bootCompleted {
+		webOK = upstreamWebOK()
+	}
+	h["web_ok"] = webOK
 	switch {
 	case oom:
 		h["status"] = "oom_killed"
@@ -483,6 +533,9 @@ func checkContainerHealth() map[string]interface{} {
 	case bootCompleted && !sf:
 		h["status"] = "surfaceflinger_dead"
 		h["detail"] = "安卓已启动但surfaceflinger未运行，画面服务异常"
+	case bootCompleted && !webOK:
+		h["status"] = "webrtc_down"
+		h["detail"] = fmt.Sprintf("安卓已启动，但投屏端口 %d 没有应答（投屏容器可能在重启或已卡住）", UPSTREAM_PORT)
 	case bootCompleted:
 		h["status"] = "healthy"
 		h["detail"] = "安卓系统运行正常"
@@ -541,8 +594,17 @@ func apiHealthFix(action string) []byte {
 		} else {
 			setMsg(false, err.Error())
 		}
+	case "restart_webrtc":
+		// 3.9.9：投屏容器（androidemu-webrtc）才是「画面服务」本体。
+		// 原来三个动作里没有任何一个会重启它 —— 端口无应答时用户只能干等。
+		err := exec.Command(bin("docker"), "restart", "androidemu-webrtc").Run()
+		if err == nil {
+			setMsg(true, "投屏服务正在重启，约 15 秒后请刷新页面")
+		} else {
+			setMsg(false, err.Error())
+		}
 	default:
-		result["message"] = "未知操作，支持: restart_container, fix_gpu, restart_surfaceflinger"
+		result["message"] = "未知操作，支持: restart_container, restart_webrtc, fix_gpu, restart_surfaceflinger"
 	}
 	b, _ := json.Marshal(result)
 	return b

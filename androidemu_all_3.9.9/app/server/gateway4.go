@@ -153,14 +153,16 @@ code{background:#e9ecef;padding:2px 6px;border-radius:4px;font-size:13px}
 <tr><th>容器名</th><th>状态</th></tr>
 {{ROWS}}
 </table>
+<p style="font-size:12px;color:#999;margin:6px 0">网关上游：{{UPSTREAM}}</p>
 <h3 style="font-size:15px;margin:20px 0 8px">健康状态</h3>
 <div id="health-status" class="tips" style="margin-top:0">
 <p style="margin:0">正在检测...</p>
 </div>
 <div id="health-actions" style="margin-top:12px;display:none">
+<button onclick="fixAction('restart_webrtc')" style="padding:8px 16px;margin-right:8px;border:1px solid #d9534f;background:#fff;color:#d9534f;border-radius:6px;cursor:pointer">重启投屏服务</button>
 <button onclick="fixAction('fix_gpu')" style="padding:8px 16px;margin-right:8px;border:1px solid #4a90d9;background:#fff;color:#4a90d9;border-radius:6px;cursor:pointer">修复GPU/画面</button>
 <button onclick="fixAction('restart_container')" style="padding:8px 16px;margin-right:8px;border:1px solid #f0ad4e;background:#fff;color:#f0ad4e;border-radius:6px;cursor:pointer">重启安卓容器</button>
-<button onclick="fixAction('restart_surfaceflinger')" style="padding:8px 16px;border:1px solid #999;background:#fff;color:#666;border-radius:6px;cursor:pointer">重启画面服务</button>
+<button onclick="fixAction('restart_surfaceflinger')" style="padding:8px 16px;border:1px solid #999;background:#fff;color:#666;border-radius:6px;cursor:pointer">重启安卓画面合成</button>
 </div>
 <script>
 function fixAction(a){
@@ -180,6 +182,9 @@ fetch("/app/androidemu/api/status").then(r=>r.json()).then(d=>{
     "boot_timeout":["启动超时","#fff3cd","#856404"],
     "oom_killed":["内存不足被杀死","#f8d7da","#721c24"],
     "surfaceflinger_dead":["画面服务异常","#f8d7da","#721c24"],
+    /* 3.9.9：容器在跑、安卓也启动了，但投屏端口没应答 —— 原来这里会显示「运行正常」，
+       与页面顶部的「画面服务未响应」自相矛盾，用户不知道该干什么 */
+    "webrtc_down":["投屏服务无响应","#f8d7da","#721c24"],
     /* 3.9.5：安装后容器还没起来是正常过程，改中性色；真正异常（OOM/画面服务）仍是红 */
     "not_running":["容器未运行（等待启动）","#e7f1ff","#0b4f8a"],
     "unknown":["未知","#eee","#666"]
@@ -189,12 +194,28 @@ fetch("/app/androidemu/api/status").then(r=>r.json()).then(d=>{
   el.innerHTML="<p style=\"margin:0\"><b>状态：</b><span style=\"color:"+s[2]+"\">"+s[0]+"</span></p>"
     +"<p style=\"margin:4px 0\"><b>详情：</b>"+(h.detail||"")+"</p>"
     +"<p style=\"margin:4px 0\"><b>运行时长：</b>"+(uptime||"未知")+" | <b>boot完成：</b>"+(h.boot_completed?"是":"否")
-    +" | <b>OOM：</b>"+(h.oom_killed?"是":"否")+" | <b>画面服务：</b>"+(h.surfaceflinger_running?"运行中":"未运行")+"</p>";
+    +" | <b>OOM：</b>"+(h.oom_killed?"是":"否")+" | <b>画面服务：</b>"+(h.surfaceflinger_running?"运行中":"未运行")
+    +" | <b>投屏端口：</b>"+(h.web_ok?"可访问":"无响应")+"</p>";
   if(h.status!=="healthy"&&h.status!=="booting"&&h.status!=="not_running"){
     actions.style.display="block";
   }
+  // 页面本身处于「画面服务未响应」时，探活可能有瞬时差异，这里再兜一次：
+  // 只要代理连不上上游，就把修复按钮摆出来，别让用户对着红框干瞪眼。
+  var _ps=document.getElementById("page-stage");
+  if(_ps&&_ps.getAttribute("data-stage")==="upstream_down"){actions.style.display="block";}
 });
+// 3.9.9：异常阶段自动刷新（10 秒一次，最多 30 次 ≈ 5 分钟），正常进面板后不再刷。
+(function(){
+  if("{{AUTO}}"!=="1")return;
+  try{
+    var k="ae_auto_refresh",n=parseInt(sessionStorage.getItem(k)||"0",10)||0;
+    if(n>=30){sessionStorage.removeItem(k);return;}
+    sessionStorage.setItem(k,String(n+1));
+  }catch(e){}
+  setTimeout(function(){location.reload();},10000);
+})();
 </script>
+<div id="page-stage" data-stage="{{STAGE}}" style="display:none"></div>
 <div class="tips">
 <h3>常见问题排查</h3>
 <ul>
@@ -218,11 +239,12 @@ fetch("/app/androidemu/api/status").then(r=>r.json()).then(d=>{
 
 // 结构化编辑本应用 compose（缩进块级，足够覆盖 services 下的标量/列表/environment）
 // 用法：editcompose <file> <op> args...
-//   set-scalar <service> <key> <value>
-//   set-env    <service> <KEY> <VALUE>    （VALUE 为 "-" 时删除该项）
-//   set-image  <service> <value>
-//   add-item   <service> <key> <value>    （如 devices 列表，幂等）
-//   del-item   <service> <key> <value>
+//
+//	set-scalar <service> <key> <value>
+//	set-env    <service> <KEY> <VALUE>    （VALUE 为 "-" 时删除该项）
+//	set-image  <service> <value>
+//	add-item   <service> <key> <value>    （如 devices 列表，幂等）
+//	del-item   <service> <key> <value>
 func editCompose(args []string) (rc int) {
 	defer func() {
 		if r := recover(); r != nil {
