@@ -69,22 +69,29 @@ echo "download_houdini: 源分支=${_SGM_BRANCH}（Android ${ANDROID_VER}），�
 ### 原回退链 —— 此前固定 gh-proxy 在前，实测它可能只有 0.15-0.6MB/s 而"没失败只是慢"，
 ### 导致安装/卸载重装动辄多等 4-10 分钟。测速失败（代理挂了）则维持原顺序。
 _dl_speed() {  # $1=完整URL，返回下载速度（字节/秒，失败输出 0）
-    curl -s -o /dev/null -m 8 -r 0-1048575 -w '%{speed_download}' "$1" 2>/dev/null \
+    curl -s -o /dev/null -m 12 -r 0-4194303 -w '%{speed_download}' "$1" 2>/dev/null \
         || echo 0
 }
 _probe_urls=(
     "https://gh-proxy.com/${_SG}"
     "https://ghfast.top/${_SG}"
+    "${_SG}"
 )
 _p1=$(_dl_speed "${_probe_urls[0]}")
 _p2=$(_dl_speed "${_probe_urls[1]}")
-case "$_p1$_p2" in ''|*[!0-9.]*) _p1=0; _p2=0 ;; esac
-if [ "$(awk -v a="$_p1" -v b="$_p2" 'BEGIN{print (a>=b)?1:0}')" = "1" ]; then
-    _PX1="https://gh-proxy.com"; _PX2="https://ghfast.top"
-else
-    _PX1="https://ghfast.top"; _PX2="https://gh-proxy.com"
-fi
-echo "download_houdini: 测速 gh-proxy=${_p1%%.*}B/s ghfast=${_p2%%.*}B/s → 优先 $_PX1"
+_p3=$(_dl_speed "${_probe_urls[2]}")
+case "$_p1$_p2$_p3" in ''|*[!0-9.]*) _p1=${_p1:-0}; _p2=${_p2:-0}; _p3=${_p3:-0} ;; esac
+### 3.9.9：三源排序（含直连）。此前只比较两个代理，而 ghfast 长期 403、
+### 直连从未参与比较 —— 代理都慢时没有第三种选择，只能硬拉。
+_ORDER=$(printf '%s %s\n' "$_p1" "https://gh-proxy.com" "$_p2" "https://ghfast.top" "$_p3" "DIRECT" \
+    | awk 'NF==2{print}' | sort -rn | awk '{print $2}' | tr '\n' ' ')
+_PX1=$(echo "$_ORDER" | awk '{print $1}')
+_PX2=$(echo "$_ORDER" | awk '{print $2}')
+if [ "$_PX1" = "DIRECT" ]; then _PX1=""; fi
+if [ "$_PX2" = "DIRECT" ]; then _PX2=""; fi
+[ -n "$_PX1" ] || _PX1="https://gh-proxy.com"
+[ -n "$_PX2" ] || _PX2="https://ghfast.top"
+echo "download_houdini: 测速 gh-proxy=${_p1%%.*}B/s ghfast=${_p2%%.*}B/s 直连=${_p3%%.*}B/s → 优先 $_PX1"
 
 ### 3.9.7：按 2026-11-05 实测结果精简回退链（1MB 取测速）：
 ###   gh-proxy.com/_SG  200  约 10MB/s   ← 唯一又快又稳的主包源
@@ -98,6 +105,7 @@ echo "download_houdini: 测速 gh-proxy=${_p1%%.*}B/s ghfast=${_p2%%.*}B/s → �
 DOWNLOAD_URLS=(
     "${_PX1}/${_SG}"
     "${_PX2}/${_SG}"
+    "${_SG}"
     "${_PX1}/${_AR}"
 )
 
