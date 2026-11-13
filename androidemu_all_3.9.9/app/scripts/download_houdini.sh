@@ -65,49 +65,33 @@ HOUDINI_ASSET="houdini-${ANDROID_VER}.0.0-android${ANDROID_VER}.tar.gz"
 _SU="https://github.com/supremeful/houdini/releases/download/${HOUDINI_TAG}/${HOUDINI_ASSET}"
 _AR="https://github.com/Cyosai/libhoudini-UnofficialArchive/releases/download/Ninth-series/houdini_9.0.5a_y+z.51068.zip"
 echo "download_houdini: 源分支=${_SGM_BRANCH}（Android ${ANDROID_VER}），整包约 150-250MB，请耐心等待"
-### 3.9.4：下载前对两个 GitHub 加速代理做 1MB 测速（2 秒上限），按速度排序后再走
-### 原回退链 —— 此前固定 gh-proxy 在前，实测它可能只有 0.15-0.6MB/s 而"没失败只是慢"，
-### 导致安装/卸载重装动辄多等 4-10 分钟。测速失败（代理挂了）则维持原顺序。
 _dl_speed() {  # $1=完整URL，返回下载速度（字节/秒，失败输出 0）
-    curl -s -o /dev/null -m 12 -r 0-4194303 -w '%{speed_download}' "$1" 2>/dev/null \
+    ### 8MB 样本、12 秒上限：1MB 太小，缓存命中会给出虚高速度，选源必错。
+    curl -s -o /dev/null -m 12 -r 0-8388607 -w '%{speed_download}' "$1" 2>/dev/null \
         || echo 0
 }
+### 3.9.9 实测（2026-11-13，各拉 8MB，样本足够排除缓存假象）：
+###   可用：gh-proxy.com 200 / 134KB/s；直连 codeload 200 / 18KB/s
+###   失效：ghfast.top 403、ghproxy.net 403、gh.llkk.cc 000、ghp.ci 000、moeyy 000、
+###         gh.api.99988866.xyz 000、ghproxy.cc 000、gh-proxy.net 302、
+###         hub.gitmirror.com 000、gh.6yit.com 000、ghp.arislee.top 000、
+###         gh-proxy.top 000、ghps.cc 404
+### 失效源已全部移除，只留「代理」与「直连」两条真实可用的路，别再逐个空耗超时。
 _probe_urls=(
     "https://gh-proxy.com/${_SG}"
-    "https://ghfast.top/${_SG}"
     "${_SG}"
 )
 _p1=$(_dl_speed "${_probe_urls[0]}")
 _p2=$(_dl_speed "${_probe_urls[1]}")
-_p3=$(_dl_speed "${_probe_urls[2]}")
-case "$_p1$_p2$_p3" in ''|*[!0-9.]*) _p1=${_p1:-0}; _p2=${_p2:-0}; _p3=${_p3:-0} ;; esac
-### 3.9.9：三源排序（含直连）。此前只比较两个代理，而 ghfast 长期 403、
-### 直连从未参与比较 —— 代理都慢时没有第三种选择，只能硬拉。
-_ORDER=$(printf '%s %s\n' "$_p1" "https://gh-proxy.com" "$_p2" "https://ghfast.top" "$_p3" "DIRECT" \
-    | awk 'NF==2{print}' | sort -rn | awk '{print $2}' | tr '\n' ' ')
-_PX1=$(echo "$_ORDER" | awk '{print $1}')
-_PX2=$(echo "$_ORDER" | awk '{print $2}')
-if [ "$_PX1" = "DIRECT" ]; then _PX1=""; fi
-if [ "$_PX2" = "DIRECT" ]; then _PX2=""; fi
-[ -n "$_PX1" ] || _PX1="https://gh-proxy.com"
-[ -n "$_PX2" ] || _PX2="https://ghfast.top"
-echo "download_houdini: 测速 gh-proxy=${_p1%%.*}B/s ghfast=${_p2%%.*}B/s 直连=${_p3%%.*}B/s → 优先 $_PX1"
+case "$_p1$_p2" in ''|*[!0-9.]*) _p1=${_p1:-0}; _p2=${_p2:-0} ;; esac
+echo "download_houdini: 测速 代理=${_p1%%.*}B/s 直连=${_p2%%.*}B/s"
+if [ "$(awk -v a="$_p1" -v b="$_p2" 'BEGIN{print (a>=b)?1:0}')" = "1" ]; then
+    DOWNLOAD_URLS=("https://gh-proxy.com/${_SG}" "${_SG}" "https://gh-proxy.com/${_AR}")
+else
+    DOWNLOAD_URLS=("${_SG}" "https://gh-proxy.com/${_SG}" "https://gh-proxy.com/${_AR}")
+fi
+echo "download_houdini: 首选 ${DOWNLOAD_URLS[0]}（共 ${#DOWNLOAD_URLS[@]} 条候选）"
 
-### 3.9.7：按 2026-11-05 实测结果精简回退链（1MB 取测速）：
-###   gh-proxy.com/_SG  200  约 10MB/s   ← 唯一又快又稳的主包源
-###   ghfast.top/_SG    403（当前失效，保留作自动降级的备选代理）
-###   直连 codeload     200  25KB/s      ← 淘汰（比代理慢 400 倍）
-###   ghproxy.net/_SG   403              ← 淘汰（已失效）
-###   _SU（supremeful v12.0.0）三个 URL 全部 404 ← 淘汰（release 不存在）
-###   _AR（houdini 9 系列）两个代理 206 可用      ← 只留一个作最后兜底
-### 保留 3 个必要的：测速胜者主包 → 备选代理主包 → 老版本兜底。
-### 主包失败才会走到兜底，慢源与失效源不再逐个空耗 1800 秒超时。
-DOWNLOAD_URLS=(
-    "${_PX1}/${_SG}"
-    "${_PX2}/${_SG}"
-    "${_SG}"
-    "${_PX1}/${_AR}"
-)
 
 TMP_DIR="$(mktemp -d)"
 TMP_FILE="${TMP_DIR}/houdini.pkg"
