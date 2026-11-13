@@ -1,0 +1,47 @@
+name: Sync houdini mirror to R2
+
+# 只在需要时跑：仓库公开，这条 workflow 不下载源码以外的任何东西，
+# 唯一的动作是「比对上游 commit sha，有变化才重新上传 houdini 包」。
+on:
+  schedule:
+    # 北京时间每周一 03:00（UTC 周日 19:00）
+    - cron: '0 19 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write R2 credentials from secrets
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+        run: |
+          set -euo pipefail
+          test -n "${R2_ACCOUNT_ID:-}" || { echo "缺少 secret R2_ACCOUNT_ID"; exit 1; }
+          test -n "${R2_ACCESS_KEY:-}" || { echo "缺少 secret R2_ACCESS_KEY"; exit 1; }
+          {
+            echo "ACCOUNT_ID=${R2_ACCOUNT_ID}"
+            echo "BUCKET=${R2_BUCKET:-xz-fnos}"
+            echo "ACCESS_KEY=${R2_ACCESS_KEY}"
+            echo "SECRET_KEY=${R2_SECRET_KEY}"
+            echo "PUBLIC_BASE=${R2_PUBLIC_BASE:-https://lin338.de5.net}"
+          } > tools/r2_credentials.txt
+          chmod 600 tools/r2_credentials.txt
+
+      - name: Check upstream and sync if changed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 tools/sync_r2_houdini.py
+
+      - name: Clean up credentials
+        if: always()
+        run: rm -f tools/r2_credentials.txt
