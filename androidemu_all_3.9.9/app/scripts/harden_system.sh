@@ -105,24 +105,47 @@ fi
 
 log(){ echo "[$(date '+%F %T')] harden_system: $*"; }
 
-### 3.9.9：先判断 /system 到底能不能写。
-###   redroid 的 /system 是镜像只读层，且本应用并没有把 build.prop 绑定挂载进容器
-###   （tune_compose.sh 里没有这一项），所以 ro.build.type / ro.build.tags /
-###   ro.debuggable 在容器内**改不掉**。而旧逻辑仍然走「改 → docker restart → 复核」：
-###   复核必然失败，30 分钟节流一过又重启一次。实测日志 21:06:34 与 21:10:56 连续两次，
-###   redroid 的 init 不响应 SIGTERM，每次 restart 都被 SIGKILL（退出码 137），
-###   boot_guard 看到容器宕机 301 秒就判定「应用已停用」，直接停掉画面服务 ——
-###   用户看到的就是「应用莫名其妙没了 + 启用时报 docker不可用」。
-###   现在：只读时只做「删 su」这一件真正有意义的安全动作，属性改不掉就记录在案，
-###   不再重启容器。可写时（例如以后接入身份伪装挂载）才走原来的改写+重启流程。
-_WRITABLE=$(docker exec "$C" sh -c 'if echo x > /system/.ae_wtest 2>/dev/null; then rm -f /system/.ae_wtest; echo 1; else echo 0; fi' 2>/dev/null | tr -d '\r\n')
+### 3.9.9：先判断属性到底能不能改。
+###   关键：判据必须是 /system/build.prop 本身，不是 /system 目录。
+###   实测（2026-11-13，x86 NAS）：`echo x > /system/.ae_wtest` 成功（目录可写），
+###   但 `/system/build.prop` 是宿主 props 的只读绑定挂载（btrfs ro），
+###   写入报 "Read-only file system"。上一版按目录可写判断，会误走
+###   「改写 → docker restart」路径：改写必然失败、重启后属性照旧、
+###   30 分钟节流一过再重启，正是「应用莫名其妙没了 + 启用来 docker不可用」的成因。
+###   现在按 build.prop 能否原样回写判定（写回内容与原文完全一致，幂等无害）。
+###   只读时只做真正有效的两件事：删 su、补齐宿主侧身份伪装属性（下次容器重建生效），
+###   绝不重启容器。可写时才走原来的改写 + 重启（仅老镜像无挂载的场景）。
+APP_DIR="${TRIM_APPDEST:-/var/apps/androidemu/target}"
+_WRITABLE=$(docker exec -u 0 "$C" sh -c '
+if cat /system/build.prop > /data/local/tmp/.bpw 2>/dev/null; then
+    if cat /data/local/tmp/.bpw > /system/build.prop 2>/dev/null; then echo 1; else echo 0; fi
+else echo 0; fi
+rm -f /data/local/tmp/.bpw 2>/dev/null' 2>/dev/null | tr -d '\r\n')
 if [ "$_WRITABLE" != "1" ]; then
-    docker exec "$C" sh -c 'rm -f /system/xbin/su /system/bin/su /sbin/su 2>/dev/null; true' >/dev/null 2>&1 || true
-    _SUCHK=$(docker exec "$C" sh -c 'ls /system/xbin/su /system/bin/su 2>/dev/null' | tr -d '\r\n')
+    ### su 位于可写的 overlay 层，这里能真正删掉（实测 su=无）；删不掉则 bind 空文件遮罩
+    docker exec -u 0 "$C" sh -c '
+for p in /system/bin/su /system/xbin/su /sbin/su; do
+    [ -e "$p" ] || continue
+    rm -f "$p" 2>/dev/null
+    [ -e "$p" ] && { : > /data/local/tmp/.empty_su 2>/dev/null; mount -o bind /data/local/tmp/.empty_su "$p" 2>/dev/null || chmod 000 "$p" 2>/dev/null; }
+done; true' >/dev/null 2>&1 || true
+    _SUCHK=$(docker exec -u 0 "$C" sh -c 'ls /system/bin/su /system/xbin/su /sbin/su 2>/dev/null' | tr -d '\r\n')
+    ### 属性改不掉的根因在宿主侧：容器内的 build.prop 就是宿主 props 的只读挂载。
+    ### props 缺失/不合规时补一次（apply_rebrand 幂等、会同时注入 compose 挂载），
+    ### 下次容器重建自动生效；本次不重启，避免被 boot_guard 判成「应用已停用」。
+    _pf="$VAR_DIR/props/system/build.prop"
+    if [ -x "$APP_DIR/scripts/apply_rebrand.sh" ] && [ -w "$VAR_DIR" ]; then
+        if [ ! -s "$_pf" ] \
+           || ! grep -q '^ro\.build\.type=user' "$_pf" 2>/dev/null \
+           || ! grep -q '^ro\.debuggable=0' "$_pf" 2>/dev/null; then
+            log "宿主身份伪装属性缺失或不合规 → 后台重建（不重启容器，下次容器重建后生效）"
+            ( TRIM_PKGVAR="$VAR_DIR" TRIM_PKGAPPDIR="$APP_DIR" nohup bash "$APP_DIR/scripts/apply_rebrand.sh" >/dev/null 2>&1 & ) || true
+        fi
+    fi
     if [ -n "$_SUCHK" ]; then
-        log "系统分区只读：su 仍存在（$_SUCHK），需人工处理；调试特征无法在容器内持久修改，跳过改写与容器重启（避免反复重启被判为应用停用）"
+        log "系统分区只读：su 未能清除（$_SUCHK），需人工处理；调试特征改由宿主侧属性提供，跳过改写与容器重启（避免反复重启被判为应用停用）"
     else
-        log "系统分区只读：已确认无 su；调试特征（type/tags/debuggable）无法在容器内持久修改，跳过改写与容器重启（避免反复重启被判为应用停用）"
+        log "系统分区只读：已确认无 su；调试特征由宿主侧身份伪装属性提供（本次未改容器、未重启）"
     fi
     echo "$_CID $(date +%s)" > "$STAMP" 2>/dev/null || true
     exit 0
