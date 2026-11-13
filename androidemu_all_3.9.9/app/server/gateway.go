@@ -1,15 +1,16 @@
 // androidemu 3.9.1 gateway（Go 实现，行为对齐 gateway.py）
 //
 // 子命令：serve | start | stop | restart | status | supervise | probe | editcompose
-//   serve      前台运行代理（内部）
-//   start      确保守护+代理在跑（健康则不动，避免掐断在线会话）
-//   stop       停止守护+代理并清理 socket
-//   restart    stop + start
-//   status     打印守护/代理/socket/版本/上游
-//   supervise  守护循环（内部）：flock 互斥、VAR_DIR 变更自退、自愈重监听、
-//              清理本应用上一版网关残留、看护音频守护
-//   probe      通过 socket 探活一次
-//   editcompose 结构化编辑 compose（供 tune_resources/net_mode/set_ports 调用）
+//
+//	serve      前台运行代理（内部）
+//	start      确保守护+代理在跑（健康则不动，避免掐断在线会话）
+//	stop       停止守护+代理并清理 socket
+//	restart    stop + start
+//	status     打印守护/代理/socket/版本/上游
+//	supervise  守护循环（内部）：flock 互斥、VAR_DIR 变更自退、自愈重监听、
+//	           清理本应用上一版网关残留、看护音频守护
+//	probe      通过 socket 探活一次
+//	editcompose 结构化编辑 compose（供 tune_resources/net_mode/set_ports 调用）
 //
 // 启动器（cmd/main、gw_socket.sh）使用本二进制（Go 版为唯一网关实现；uninstall 流程
 // 对上一版遗留的 gateway.py 仅做停止清理）。
@@ -45,13 +46,13 @@ var (
 	INTERVAL      = envInt("GW_CHECK_INTERVAL", 20)
 	WS_PING       = envInt("GW_WS_PING", 10)
 
-	PID_FILE   = vfile("gateway.pid")
-	CHILD_PID  = vfile("gateway_child.pid")
-	VER_FILE   = vfile("gateway.ver")
-	LOCK_FILE  = vfile("gateway.lock")
-	LOG_FILE   = vfile("gateway.log")
-	STATUS_FILE= vfile("gw_status")
-	ADMIN_CONF = vfile("gw_admin.conf")
+	PID_FILE    = vfile("gateway.pid")
+	CHILD_PID   = vfile("gateway_child.pid")
+	VER_FILE    = vfile("gateway.ver")
+	LOCK_FILE   = vfile("gateway.lock")
+	LOG_FILE    = vfile("gateway.log")
+	STATUS_FILE = vfile("gw_status")
+	ADMIN_CONF  = vfile("gw_admin.conf")
 
 	ADMIN_USER = "admin"
 	ADMIN_PASS = "admin123"
@@ -316,6 +317,8 @@ func loadConf() {
 			}
 		}
 	}
+	// 3.9.9：配置只作兜底，容器在跑就以实际端口映射为准。
+	syncUpstreamPortFromDocker()
 	if b, err := os.ReadFile(filepath.Join(APP_DEST, "docker", "docker-compose.yaml")); err == nil {
 		// 关键：只认 environment 列表里的真实配置行，不能全文搜 "USE_TLS=false" ——
 		// 实测 compose 的注释里就有这句话（历史说明文字），会把 TLS 模式误判成明文，

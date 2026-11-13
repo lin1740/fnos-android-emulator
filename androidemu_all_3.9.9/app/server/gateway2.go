@@ -653,3 +653,41 @@ func streamMJPG(conn net.Conn) {
 	logf("MJPEG 流结束，共 %d 帧，错误 %d 次", frames, errors)
 	conn.Close()
 }
+
+// syncUpstreamPortFromDocker 以投屏容器的实际端口映射为准修正上游端口。
+//
+// 背景（实测 2026-11-13，群友机器）：画面服务映射为「宿主 8440 → 容器 8443」，而
+// ports.conf 里仍写着 8443；宿主 8443 上是飞牛自己的 Web 桌面 —— 网关按配置连 8443
+// 就连到飞牛桌面去了：TLS 握手成功，但 HTTP 层被拒/断开，最终表现为「画面服务未响应
+// + EOF」。用户点容器上的 8443 链接会直接跳到飞牛桌面，正好印证端口被别的服务占着。
+//
+// 处理：只要容器在跑，就以 docker 的实际映射为准；读不到映射（容器没起）才用配置值。
+func syncUpstreamPortFromDocker() {
+	out, code := outOf(exec.Command(bin("docker"), "port", "androidemu-webrtc", "8443"))
+	if code != 0 || strings.TrimSpace(out) == "" {
+		return
+	}
+	best := 0
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		i := strings.LastIndex(line, ":")
+		if i < 0 {
+			continue
+		}
+		p, err := strconv.Atoi(line[i+1:])
+		if err != nil || p <= 0 || p > 65535 {
+			continue
+		}
+		// 优先取 IPv4 那条（0.0.0.0:PORT），否则取先读到的
+		if best == 0 || strings.HasPrefix(line, "0.0.0.0:") {
+			best = p
+		}
+	}
+	if best > 0 && best != UPSTREAM_PORT {
+		logf("上游端口修正：ports.conf=%d，容器实际映射=%d → 按实际端口连接（避免连到宿主上其它 HTTPS 服务）", UPSTREAM_PORT, best)
+		UPSTREAM_PORT = best
+	}
+}
