@@ -2,7 +2,7 @@
 
 **中文** | [English](README.en.md)
 
-![version](https://img.shields.io/badge/version-v3.9.8-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
+![version](https://img.shields.io/badge/version-v3.9.9-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
 
 📚 **使用手册与常见问题**：见本文档下方各章节
 
@@ -34,6 +34,7 @@
 - [已知限制](#已知限制)
 - [问题、建议反馈链接和渠道](#问题建议反馈链接和渠道)
 - [对发布者和其他贡献者的支持](#对发布者和其他贡献者的支持)
+- [源码结构与构建](#源码结构与构建)
 - [开源许可和免责声明](#开源许可和免责声明)
 - [致谢和导向链接](#致谢和导向链接)
 
@@ -929,7 +930,7 @@ docker top androidemu-android | awk 'NR>1 && $1=="root"' | head
 |---|---|
 | 应用本体（`cmd/main`，网关与守护入口） | `docker-androidemu`（包用户） |
 | `boot_guard` / `webrtc_watchdog` / `agent_autodeploy` 等守护脚本 | `docker-androidemu` |
-| 投屏 agent（`cloudphone-agent`） | 容器内 `shell`（uid 2000，等同 `adb shell`） |
+| 投屏 agent（`cloudphone-agent`） | 容器内 `root`（app_process 启动 scrcpy server 的硬要求） |
 | 后台 dexopt 排程 | 容器内 `shell`（uid 2000） |
 | 画面服务 coturn / webrtc-signaling | 容器内 `appuser` |
 | 画面服务启动脚本（PID1） | 容器内 `root`（需写 `/etc/coturn`、创建 appuser 后再降权启动服务） |
@@ -937,7 +938,7 @@ docker top androidemu-android | awk 'NR>1 && $1=="root"' | head
 
 最后两行属**容器命名空间内**的进程，不是宿主侧进程。容器内 root 无法操作宿主：没有宿主目录的可写挂载，没有额外 capability（仅 `CAP_SYS_NICE` 给画面服务），另有自定义 seccomp 过滤 `insmod` / `kexec` / `reboot` / `swapon` 等。
 
-**若需要完全不出现容器内 root**：安装向导第二档选「无 root」，安装后不创建安卓容器，整机既无特权容器也无容器内 root，面板仍可打开（提示无 root 模式）。
+**若需要「用户拿不到 root」**：安装向导选「无 root」档——功能全部可用，但容器内不留 su、`adb root` 被系统拒绝、ADB 转发只绑 127.0.0.1，运行期由 `scripts/root_lockdown.sh` 持续复核（状态见 `var/root-lockdown.status`）。
 
 **同类应用对照（同一账号下已上架的应用，实测/源码核对）**
 
@@ -957,12 +958,12 @@ docker top androidemu-android | awk 'NR>1 && $1=="root"' | head
 
 | 级别 | 内容 | 适用 |
 |---|---|---|
-| **无 root**（最严格） | 安装后**不创建也不启动安卓容器**：整机没有特权容器、没有容器内 root，也没有任何 root 进程；应用面板仍可打开，云手机功能不可用（面板会提示当前为无 root 模式）。选定后要改档需重新安装 | 需要「可以完全不用 root 运行」的场景 |
+| **无 root**（最严格） | 功能全开（安卓、投屏、ADB 装应用都正常）；但容器内不留 `su`、`adbd` 不以 root 运行、`adb root` 被系统拒绝、ADB 转发强制只绑 `127.0.0.1`；容器内高危系统调用仍按 denylist 拒绝。运行期由 `scripts/root_lockdown.sh` 幂等复核 | 不想让任何人（包括自己）从外部拿到容器 root 的场景 |
 | **仅必要权限**（默认） | 保留自定义 seccomp 过滤：禁止加载/卸载内核模块、`kexec`、重启整机、开关交换分区、修改系统时间、直接访问 IO 端口。安卓正常使用（开机、投屏、音频、ADB、安装应用、运行游戏）不受影响 | 绝大多数用户 |
 | **全部权限** | 解除上述过滤（`seccomp=unconfined`），容器内可执行这些高危操作 | 明确知道后果、NAS 只有自己使用的调试场景 |
 
 - 选择结果会写到 `/vol1/@appdata/androidemu/root-level`，升级和后续启用都会沿用，不会因为重启被重置；想改级别就重新安装并在向导里改选。
-- **选「无 root」档时不会创建安卓容器**，整机不出现特权容器与容器内 root；选另外两档时，安卓容器必须以 Docker 特权模式运行——这是 redroid 跑 Android 的硬性前提（非特权容器 `/sys` 只读，`system_server`、`installd`、`netd` 会直接崩溃，系统起不来；已实测，即使给足全部 capability 与设备权限也一样）。向导里已明确提示：不接受可以退出安装或选择「无 root」档。
+- **三档的安卓容器都以 Docker 特权模式运行**——这是 redroid 跑 Android 的硬性前提（非特权容器 `/sys` 只读，`system_server`、`installd`、`netd` 会直接崩溃，系统起不来；已实测，即使给足全部 capability 与设备权限也一样）。因此「无 root」档的含义是**关闭用户可达的 root 入口**（无 su、`adb root` 被拒、ADB 只绑本机），而不是不使用特权容器；应用本体在所有档位都不申请宿主 root。向导里已明确提示：不接受可以取消安装。
 - 本应用**不申请宿主 root**：应用本体 `run-as=package`，宿主侧不存在以 root 常驻的本应用进程；安装、升级、卸载过程也不会创建任何以 root 身份运行的临时容器（删除数据在应用自带的安卓容器内完成、由包用户收尾；显卡节点的放权也在应用自己的容器内进行，不改宿主设备权限、不额外起容器）。容器内的 root 只在该容器命名空间内生效，与宿主机 root 是两回事。
 - 选择后可在容器内核对：`docker exec androidemu-android grep Seccomp /proc/1/status`——「仅必要权限」为 `Seccomp: 2`，「全部权限」为 `Seccomp: 0`。
 
@@ -1490,6 +1491,8 @@ A: 正常 Android 12 启动后内存应在 300MB 以上（单个安卓容器内�
 > ⚠️ **先看自动诊断，不要用 `docker logs` 排查**：本应用为省性能关闭了串口控制台（`androidboot.console=0`），因此 **`docker logs androidemu-android` 恒为空是正常的**（实测 0 字节、0 行），`docker logs | grep error` 只会一片空白——这不是故障，也不是"没有日志"。真实启动日志只存在于容器内 logcat。
 > **3.8.9 起新增「开机守护」**（`scripts/boot_guard.sh`）：持续巡检 boot 状态，把诊断（含真实 logcat 证据）写入 `/var/apps/androidemu/var/boot_diag.status`；**并在有明确 GPU/DRM 崩溃证据时自动回退软件渲染并重建容器**（一次性），通常无需人工干预。
 > **GPU 检测**：安装时读取 `/sys/class/drm/card*/device/uevent` 的 `DRIVER`，识别到虚拟显卡（`vmwgfx` / `virtio_gpu` / `bochs` / `simpledrm` / `qxl` / `cirrus` / `vboxvideo` 等）或占位节点时**直接预置软件渲染**，不再进入 GPU 直通；开机守护在 90 秒内发现 `surfaceflinger` 反复重启也会提前回退。旧版本残留的「已回退」标记现在会与当前渲染模式做一致性校验，不会再挡死自愈。
+> **画面服务重建策略**：看护发现画面端口（默认 8443）未监听时不会立刻重建，而是要求「端口持续不通满 90 秒」并且期间没有命中「用户停用」「安卓容器刚重建（120 秒内）」这两类信号，才执行重建。这样做的原因是飞牛停用会先停画面服务、后停安卓容器，停用全过程最长可达一分钟：若在窗口内重建，用户会看到「点了停用、面板却还能打开」。代价是真实故障的自愈时间最长约 1.5 分钟（正常情况下画面容器自身的重启策略会在几秒内恢复，看护只是兜底）。
+> **端口与日志归属**：画面端口以 `/var/apps/androidemu/var/ports.conf` 的实际值为准，自定义端口后安卓侧巡检同样按该值判断；`docker/.env` 与 `var/*.log` 在安装、升级收尾统一交还应用用户，保证后台守护（以应用用户运行）能继续读写。
 
 **1. 确认启动状态：**
 ```bash
@@ -1824,6 +1827,79 @@ OpenGL ES 渲染：主流 ARM SoC（Mali/Adreno/VideoCore）与 x86 AMD/Intel �
 如果你觉得这个软件很好，或者对发布者本身感到满意的，通过官网主页：https://www.lin1740.de5.net/ ，点击"赞赏支持一下"进行扫对应的码即可完成赞赏，希望能多多赞赏支持一下，让发布者和其他贡献者得以继续维护软件，无论赞赏多少或者是不赞赏，都在此感谢；在支付的时候请在备注上标注赞赏，感谢。
 或者给一个 star 支持一下项目也行。
 
+
+---
+
+## 源码结构与构建
+
+本仓库的 `androidemu_all_3.9.9/` 是一份完整可打包的 FPK 源码树，与发布包内容一一对应。
+
+### 目录结构
+
+```
+androidemu_all_3.9.9/
+├── manifest                   # 应用清单：版本、名称、依赖应用、资源声明
+├── LICENSE                    # 使用许可、权限与安全边界说明
+├── ICON.PNG / ICON_256.PNG    # 应用图标
+├── wizard/                    # 安装 / 升级 / 卸载向导（JSON）
+│   ├── install                #   含运行级别、GMS、分辨率、端口、网络方式等步骤
+│   ├── upgrade
+│   └── uninstall
+├── config/                    # 应用中心「配置」页
+│   ├── privilege
+│   └── resource
+├── cmd/                       # 生命周期回调（飞牛以应用包用户身份执行）
+│   ├── main                   #   启动入口（Python，负责拉起网关与各类守护）
+│   ├── install_init / install_callback
+│   ├── upgrade_init / upgrade_callback
+│   └── uninstall_init / uninstall_callback
+├── scripts/                   # 宿主侧 Go 守护与其 shell 外壳
+└── app/                       # 应用本体（打包进 app.tgz）
+    ├── server/                #   统一网关 gateway_<arch>（Go）、音频守护
+    ├── scripts/               #   容器启停、开机守卫、热更与各类巡检脚本
+    ├── docker/                #   docker-compose 与容器初始化文件
+    ├── hwenc/                 #   硬件视频编码驱动与说明
+    ├── translation/           #   32 位 ARM 翻译层文件
+    ├── ui/                    #   面板静态资源
+    └── docs/                  #   技术评估文档
+```
+
+### 打包成 fpk
+
+`fpk` 本身是一个**未压缩的 tar 包**，根层放 `manifest`、`wizard`、`config`、`cmd`、`scripts` 与应用本体 `app.tgz`：
+
+```bash
+cd androidemu_all_3.9.9
+
+# 1) 应用本体
+tar --owner=0 --group=0 -cf ../app.tgz -C app .
+
+# 2) 组装 fpk（注意是纯 tar，不要加 -z）
+tar --owner=0 --group=0 -cf ../androidemu_all_3.9.9.fpk \
+    manifest LICENSE ICON.PNG ICON_256.PNG wizard config cmd scripts app.tgz
+```
+
+打包时必须保留可执行位（`0755`）：所有 `.sh`、`.py`、无扩展名脚本（`cmd/main`、`cmd/*_callback`、`wizard/*`）以及 `gateway_*`、`daemon_*`、`supervisor*` 二进制。权限丢失会导致安装后回调直接无法执行。
+
+### 编译 Go 网关
+
+`app/server/gateway_amd64`、`app/server/gateway_arm64` 是**提交进仓库的编译产物**，源码为 `app/server/*.go`（纯标准库，无第三方依赖）：
+
+```bash
+cd app/server
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o gateway_amd64 .
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o gateway_arm64 .
+```
+
+**只改 `.go` 不重新编译，打出来的包仍然跑旧逻辑**，两个架构都要重新生成。
+
+### 提交 / 二次开发注意事项
+
+1. **不要提交 `__pycache__` 与 `*.pyc`**：Python 运行时缓存对运行没有任何作用，却会让打包文件计数对不上，也容易被误认为残留文件。
+2. **保持 LF 行尾**：仓库根 `.gitattributes` 已设 `* -text`，`core.autocrlf` 也应为 `false`。一旦被转成 CRLF，打包后脚本会报 `$'\r': command not found`，安装直接失败。
+3. **保留可执行位**：在 Windows 上克隆后，git 拿不到 Unix 权限位（默认全变 `644`）。提交前需用 `git update-index --chmod=+x <文件>` 逐个补回；可用发布包内 tar 的权限作为权威对照。
+4. **改动前先看 `manifest` 的依赖声明**：应用依赖飞牛应用中心的 `binder_linux` 提供内核 binder，缺失或未启用时应用中心会阻止安装。
+5. **改端口逻辑要成对改**：`ports.conf` 的 `WEB_PORT`、compose 的端口映射、网关读取的上游端口三处必须一致，否则会出现「容器端口正常但面板连不上」。
 
 ---
 

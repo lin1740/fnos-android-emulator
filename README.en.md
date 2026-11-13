@@ -2,7 +2,7 @@
 
 [中文](README.md) | **English**
 
-![version](https://img.shields.io/badge/version-v3.9.8-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
+![version](https://img.shields.io/badge/version-v3.9.9-blue) ![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-orange) ![image](https://img.shields.io/badge/image-~2GB-green) ![stars](https://img.shields.io/github/stars/lin1740/fnos-android-emulator) ![last-commit](https://img.shields.io/github/last-commit/lin1740/fnos-android-emulator) ![license](https://img.shields.io/github/license/lin1740/fnos-android-emulator)
 
 📚 **User Manual & FAQ**: See sections below
 
@@ -34,6 +34,7 @@ Based on Android container + Scrcpy over WebRTC (screen service) dual-container 
 - [Known Limitations](#known-limitations)
 - [Feedback Links & Channels](#feedback-links--channels)
 - [Support the Publisher & Contributors](#support-the-publisher--contributors)
+- [Source Layout & Build](#source-layout--build)
 - [Open Source License & Disclaimer](#open-source-license--disclaimer)
 - [Acknowledgements & Links](#acknowledgements--links)
 
@@ -915,7 +916,7 @@ Actual runtime identity of each component:
 |---|---|
 | App itself (`cmd/main`, gateway and supervisors) | `docker-androidemu` (package user) |
 | `boot_guard` / `webrtc_watchdog` / `agent_autodeploy` | `docker-androidemu` |
-| Streaming agent (`cloudphone-agent`) | container `shell` (uid 2000, same as `adb shell`) |
+| Streaming agent (`cloudphone-agent`) | container `root` (required by `app_process` when starting the scrcpy server) |
 | Background dexopt scheduling | container `shell` (uid 2000) |
 | coturn / webrtc-signaling | container `appuser` |
 | Streaming entrypoint (PID1) | container `root` (must write `/etc/coturn`, create appuser, then drop privileges for the services) |
@@ -923,7 +924,7 @@ Actual runtime identity of each component:
 
 The last two rows are processes **inside the container namespace**, not on the host. Container root cannot touch the host: no writable host bind mounts, no extra capabilities (only `CAP_SYS_NICE` for the streaming container), and a custom seccomp filter blocks `insmod` / `kexec` / `reboot` / `swapon` and friends.
 
-**If you need zero in-container root**: pick "No root" in step 2 of the wizard. The Android container is then never created, so there is no privileged container and no in-container root at all; the panel still opens and states it is in no-root mode.
+**If you need "the user cannot obtain root"**: pick the "No root" level in the wizard. Every feature stays available, but the container ships without `su`, `adbd` never runs as root, `adb root` is refused by the system, and the ADB forward is pinned to `127.0.0.1`; `scripts/root_lockdown.sh` re-verifies this continuously (state in `var/root-lockdown.status`).
 
 **Comparison with sibling apps (already published under the same account)**
 
@@ -943,12 +944,12 @@ Step 2 of the install wizard, "Privilege Level", lets the user pick a runtime le
 
 | Level | Content | For |
 |---|---|---|
-| **No root** (strictest) | After install the Android container is **not created and not started**: no privileged container, no in-container root, no root process on the host. The panel still opens, but the phone feature is unavailable (the panel states it is running in no-root mode). Switching back requires a reinstall | When you need proof the app can run with zero root |
+| **No root** (strictest) | Every feature works (Android, streaming, installing APKs over ADB); but the container keeps no `su`, `adbd` never runs as root, `adb root` is refused, and the ADB forward is pinned to `127.0.0.1`. Dangerous syscalls stay blocked by the denylist. Re-verified at runtime by `scripts/root_lockdown.sh` | When nobody — including you — should be able to obtain container root from outside |
 | **Required only** (default) | Keeps the custom seccomp filter: blocks loading/unloading kernel modules, `kexec`, rebooting the host, toggling swap, changing system time, and direct IO port access. Normal Android use (boot, streaming, audio, ADB, installing apps, gaming) is unaffected | Almost everyone |
 | **Full** | Lifts the above filter (`seccomp=unconfined`); those high-risk operations become available inside the container | Debugging on a NAS you own, when you know the consequences |
 
 - The choice is stored in `/vol1/@appdata/androidemu/root-level` and honoured on upgrade and every start — it is not reset by reboots. To change it, reinstall and pick again.
-- **With "No root" the Android container is never created**, so no privileged container and no in-container root exist. With the other two levels the Android container must run with Docker privileged mode — a hard requirement of redroid: in an unprivileged container `/sys` is read-only and `system_server`, `installd`, `netd` crash immediately, so Android never boots (measured; even with all capabilities and all devices granted). The wizard states this explicitly and tells users to abort the install if they don't accept it.
+- **All three levels run the Android container in Docker privileged mode** — a hard requirement of redroid: in an unprivileged container `/sys` is read-only and `system_server`, `installd`, `netd` crash immediately, so Android never boots (measured; even with all capabilities and all devices granted). "No root" therefore means **closing every user-reachable root entry** (no `su`, `adb root` refused, ADB bound to localhost only), not dropping privileged mode. The app itself never requests host root at any level. The wizard states this explicitly and tells users to abort if they don't accept it.
 - This app **does not request host root**: it runs as `run-as=package`, and no host-side process of this app runs as root; install, upgrade and uninstall never create any temporary root container (data removal happens inside the app's own Android container and is finished by the package user; GPU device-node permissions are relaxed inside that same container, without touching host device permissions and without any extra container). Root inside the container lives only in that container's namespace and is unrelated to host root.
 - Verify afterwards: `docker exec androidemu-android grep Seccomp /proc/1/status` — `Seccomp: 2` for "Required only", `Seccomp: 0` for "Full".
 
@@ -1471,6 +1472,8 @@ docker exec androidemu-android getprop sys.boot_completed
 
 > ⚠️ **Do not troubleshoot with `docker logs`**: this app disables the serial console for performance (`androidboot.console=0`), so **`docker logs androidemu-android` is always empty** (verified: 0 bytes / 0 lines). `docker logs | grep error` returns nothing — that is expected, not a sign that "there are no logs". Real boot logs exist only in the container's logcat.
 > Since v3.8.9 a **boot guard** (`scripts/boot_guard.sh`) continuously watches the boot state, writes diagnostics (with real logcat evidence) to `/var/apps/androidemu/var/boot_diag.status`, and **automatically falls back to software rendering and recreates the container when there is clear GPU/DRM crash evidence** (one-shot), so manual intervention is usually unnecessary.
+> **Signaling-service rebuild policy**: when the guard sees the signaling port (8443 by default) not listening, it does not rebuild immediately. It waits until the port has stayed down for **90 seconds** and none of the "user stopped the app" or "Android container was just recreated (within 120s)" signals is present. The reason is that fnOS stops the signaling service first and the Android container afterwards, and the whole stop can take up to a minute — rebuilding inside that window makes the panel reachable again right after the user pressed Stop. The trade-off is that real failures take up to ~1.5 minutes to self-heal (normally the container's own restart policy recovers within seconds; the guard is only a fallback).
+> **Port and log ownership**: the signaling port is read from `/var/apps/androidemu/var/ports.conf`, so the Android-side checks follow a custom port as well; `docker/.env` and `var/*.log` are handed back to the application user at the end of install/upgrade, so background guards (running as that user) can keep reading and writing them.
 
 ```bash
 cat /var/apps/androidemu/var/boot_diag.status         # diagnostics written by the guard
@@ -1791,6 +1794,79 @@ TLS per network mode plus the dedicated toggle (`scripts/net_mode.sh`):
 If you find this app useful or are satisfied with the publisher, visit the official website: https://www.lin1740.de5.net/ , click "Appreciate / Support" and scan the corresponding QR code to complete a donation. Your generous support is much appreciated — it helps the publisher and other contributors continue maintaining the app. Any amount or no donation is appreciated; please note "donation" in payment remarks, thanks.
 Or give a star to support the project.
 
+
+---
+
+## Source Layout & Build
+
+`androidemu_all_3.9.9/` in this repository is a complete, buildable FPK source tree that matches the released package one-to-one.
+
+### Directory layout
+
+```
+androidemu_all_3.9.9/
+├── manifest                   # app manifest: version, name, dependent app, resources
+├── LICENSE                    # license, permission and security-boundary notes
+├── ICON.PNG / ICON_256.PNG    # app icons
+├── wizard/                    # install / upgrade / uninstall wizards (JSON)
+│   ├── install                #   root level, GMS, resolution, ports, network mode
+│   ├── upgrade
+│   └── uninstall
+├── config/                    # app-center "Configuration" page
+│   ├── privilege
+│   └── resource
+├── cmd/                       # lifecycle callbacks (run as the app package user)
+│   ├── main                   #   start entry (Python, brings up gateway and daemons)
+│   ├── install_init / install_callback
+│   ├── upgrade_init / upgrade_callback
+│   └── uninstall_init / uninstall_callback
+├── scripts/                   # host-side Go daemons and their shell wrappers
+└── app/                       # payload (packed into app.tgz)
+    ├── server/                #   unified gateway gateway_<arch> (Go), audio daemon
+    ├── scripts/               #   container control, boot guard, hotfix and checks
+    ├── docker/                #   docker-compose and container init files
+    ├── hwenc/                 #   hardware video encoder driver and notes
+    ├── translation/           #   32-bit ARM translation layer files
+    ├── ui/                    #   panel static assets
+    └── docs/                  #   technical evaluation documents
+```
+
+### Packing into an fpk
+
+An `fpk` is an **uncompressed tar** whose root holds `manifest`, `wizard`, `config`, `cmd`, `scripts` and the payload `app.tgz`:
+
+```bash
+cd androidemu_all_3.9.9
+
+# 1) payload
+tar --owner=0 --group=0 -cf ../app.tgz -C app .
+
+# 2) assemble the fpk (plain tar, do NOT add -z)
+tar --owner=0 --group=0 -cf ../androidemu_all_3.9.9.fpk \
+    manifest LICENSE ICON.PNG ICON_256.PNG wizard config cmd scripts app.tgz
+```
+
+Executable bits (`0755`) must be preserved: every `.sh`, `.py`, extension-less script (`cmd/main`, `cmd/*_callback`, `wizard/*`) plus the `gateway_*`, `daemon_*` and `supervisor*` binaries. Losing them makes the callbacks unrunnable after installation.
+
+### Building the Go gateway
+
+`app/server/gateway_amd64` and `app/server/gateway_arm64` are **compiled artifacts committed to this repository**; sources are `app/server/*.go` (standard library only, no third-party deps):
+
+```bash
+cd app/server
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o gateway_amd64 .
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o gateway_arm64 .
+```
+
+**Editing `.go` without rebuilding ships the old logic** — regenerate both architectures.
+
+### Contribution notes
+
+1. **Never commit `__pycache__` or `*.pyc`**: runtime caches are useless at run time but break file-count checks and look like leftovers.
+2. **Keep LF line endings**: `.gitattributes` sets `* -text` and `core.autocrlf` must stay `false`. CRLF makes packaged scripts fail with `$'\r': command not found`.
+3. **Preserve executable bits**: after cloning on Windows, git cannot see Unix modes (everything becomes `644`). Restore them with `git update-index --chmod=+x <file>`, using the released package's tar modes as the authority.
+4. **Read the `manifest` dependency first**: the app depends on fnOS app `binder_linux` for kernel binder; if missing or disabled the app center blocks installation.
+5. **Change ports in pairs**: `WEB_PORT` in `ports.conf`, the compose port mapping and the gateway's upstream port must agree, otherwise the panel cannot connect even though the container exposes the right port.
 
 ---
 
