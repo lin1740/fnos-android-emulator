@@ -71,25 +71,31 @@ _dl_speed() {  # $1=完整URL，返回下载速度（字节/秒，失败输出 0
         || echo 0
 }
 ### 3.9.9 实测（2026-11-13，各拉 8MB，样本足够排除缓存假象）：
-###   可用：gh-proxy.com 200 / 134KB/s；直连 codeload 200 / 18KB/s
-###   失效：ghfast.top 403、ghproxy.net 403、gh.llkk.cc 000、ghp.ci 000、moeyy 000、
-###         gh.api.99988866.xyz 000、ghproxy.cc 000、gh-proxy.net 302、
-###         hub.gitmirror.com 000、gh.6yit.com 000、ghp.arislee.top 000、
-###         gh-proxy.top 000、ghps.cc 404
-### 失效源已全部移除，只留「代理」与「直连」两条真实可用的路，别再逐个空耗超时。
-_probe_urls=(
-    "https://gh-proxy.com/${_SG}"
-    "${_SG}"
-)
-_p1=$(_dl_speed "${_probe_urls[0]}")
-_p2=$(_dl_speed "${_probe_urls[1]}")
-case "$_p1$_p2" in ''|*[!0-9.]*) _p1=${_p1:-0}; _p2=${_p2:-0} ;; esac
-echo "download_houdini: 测速 代理=${_p1%%.*}B/s 直连=${_p2%%.*}B/s"
-if [ "$(awk -v a="$_p1" -v b="$_p2" 'BEGIN{print (a>=b)?1:0}')" = "1" ]; then
-    DOWNLOAD_URLS=("https://gh-proxy.com/${_SG}" "${_SG}" "https://gh-proxy.com/${_AR}")
-else
-    DOWNLOAD_URLS=("${_SG}" "https://gh-proxy.com/${_SG}" "https://gh-proxy.com/${_AR}")
-fi
+###   自建分发(R2+CF)：296KB/s（cf-cache HIT，支持 Range/206，可续传可并发）
+###   gh-proxy.com  ：137KB/s（死源已全部删除，别再逐个空耗超时）
+###   直连 codeload ：18KB/s（慢，仅作末位兜底）
+### 注意：R2 目前只镜像了 hpe 分支（Android 12 默认）。其它分支回退 GitHub 两条路，
+###       以后要补充分支，把包放进同一 R2 桶的 houdini/ 前缀并在这里加一行即可。
+_R2=""
+[ "$_SGM_BRANCH" = "hpe" ] && _R2="https://lin338.de5.net/houdini/hpe.tar.gz"
+
+_p0=0
+[ -n "$_R2" ] && _p0=$(_dl_speed "$_R2")
+_p1=$(_dl_speed "https://gh-proxy.com/${_SG}")
+_p2=$(_dl_speed "${_SG}")
+case "${_p0}${_p1}${_p2}" in ''|*[!0-9.]*) _p0=${_p0:-0}; _p1=${_p1:-0}; _p2=${_p2:-0} ;; esac
+echo "download_houdini: 测速 自建=${_p0%%.*}B/s 代理=${_p1%%.*}B/s 直连=${_p2%%.*}B/s"
+
+### 按实测速度排序，最快的先上；全部为 0 时仍按后两条候选顺序兜底
+_ORDER=$( { [ -n "$_R2" ] && printf '%s %s\n' "$_p0" "$_R2"
+            printf '%s %s\n' "$_p1" "https://gh-proxy.com/${_SG}"
+            printf '%s %s\n' "$_p2" "${_SG}"; } | awk 'NF==2' | sort -rn | awk '{print $2}' )
+DOWNLOAD_URLS=()
+while IFS= read -r _u; do [ -n "$_u" ] && DOWNLOAD_URLS+=("$_u"); done <<EOF
+$_ORDER
+EOF
+[ "${#DOWNLOAD_URLS[@]}" -eq 0 ] && DOWNLOAD_URLS=("https://gh-proxy.com/${_SG}" "${_SG}")
+DOWNLOAD_URLS+=("https://gh-proxy.com/${_AR}")
 echo "download_houdini: 首选 ${DOWNLOAD_URLS[0]}（共 ${#DOWNLOAD_URLS[@]} 条候选）"
 
 
