@@ -270,7 +270,7 @@ func handleRequest(conn net.Conn) {
 			out = append(out, fmt.Sprintf("Content-Length: %d", len(body)))
 		}
 		out = append(out, "Accept-Encoding: identity", "Connection: close")
-		return uu, []byte(strings.Join(out, "\r\n")+"\r\n\r\n"), nil
+		return uu, []byte(strings.Join(out, "\r\n") + "\r\n\r\n"), nil
 	}
 
 	var u net.Conn
@@ -545,7 +545,7 @@ func translationCrashWatcher() {
 		time.Sleep(30 * time.Second)
 		// 关键：native 崩溃（SIGILL/SIGSEGV）记录在 crash 缓冲区，只读 main 缓冲区会漏检，
 		// 导致「翻译层崩溃自动切换」的看护永远不触发（实测飞牛 App 在模拟器内闪退漏检）。
-		out, _ := outOf(exec.Command("docker", "exec", "androidemu-android", "logcat", "-d", "-b", "crash,main", "-t", "200"))
+		out, _ := outOf(exec.Command(bin("docker"), "exec", "androidemu-android", "logcat", "-d", "-b", "crash,main", "-t", "200"))
 		crashed := strings.Contains(out, "Undefined instruction") || strings.Contains(out, "SIGILL") ||
 			(strings.Contains(out, "ndk_translation") && strings.Contains(out, "Undefined"))
 		if !crashed {
@@ -575,7 +575,7 @@ func translationCrashWatcher() {
 			logf("翻译层：检测到 ARM 翻译崩溃 → 自动切换到 Intel houdini（谷歌翻译层不支持该应用的指令集）")
 		}
 		// 注意：挂载变更必须 force-recreate，restart 不会重新应用卷挂载
-		exec.Command("bash", "-c",
+		exec.Command(bin("bash"), "-c",
 			"cd "+APP_DEST+"/docker && bash ../scripts/tune_compose.sh docker-compose.yaml && docker compose -p androidemu up -d --force-recreate redroid").Run()
 	}
 }
@@ -610,7 +610,6 @@ func serve() {
 
 // ---------------------------------------------------------------- 降权与守护
 
-
 func containsInt(list []int, v int) bool {
 	for _, x := range list {
 		if x == v {
@@ -636,7 +635,10 @@ func supervise() {
 			varIno = s.Ino
 		}
 	}
-	logf("守护启动 pid=%d 版本=%s 检查间隔 %ds", os.Getpid(), VERSION, INTERVAL)
+	// 3.9.9：把实际 PATH 与 docker 解析结果写进日志。历史故障（容器在跑、
+	// 状态页却一直显示「正在安装中」）就是 PATH 缺 /usr/bin 导致网关拿不到 docker，
+	// 有这一行就能一眼看出是环境问题还是容器问题。
+	logf("守护启动 pid=%d 版本=%s 检查间隔 %ds（PATH=%s，docker=%s）", os.Getpid(), VERSION, INTERVAL, os.Getenv("PATH"), bin("docker"))
 	if !startServerThread() {
 		logf("守护启动后代理未能监听，将在循环内重试")
 	}
@@ -677,7 +679,7 @@ func supervise() {
 		if fileExists(daemonSh) && !audioWatchdogOK() {
 			if time.Since(lastAudio) > 60*time.Second {
 				lastAudio = time.Now()
-				cmd := exec.Command("bash", daemonSh, "start")
+				cmd := exec.Command(bin("bash"), daemonSh, "start")
 				cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 				cmd.Dir = "/"
 				if err := cmd.Start(); err == nil {

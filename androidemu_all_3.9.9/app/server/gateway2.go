@@ -120,9 +120,9 @@ func sendErr(conn net.Conn, code int, text string) {
 // 弹成全局错误提示（群友实测）。改成 JSON，前端可自行判断是否重试。
 // 状态码仍为 502，不改变任何前端已有的错误处理分支。
 func sendUpstreamJSON(conn net.Conn, detail string) {
-    b := []byte(`{"error":"upstream_not_ready","detail":"` + detail + `"}`)
-    hdr := fmt.Sprintf("HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: %d\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", len(b))
-    conn.Write(append([]byte(hdr), b...))
+	b := []byte(`{"error":"upstream_not_ready","detail":"` + detail + `"}`)
+	hdr := fmt.Sprintf("HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: %d\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", len(b))
+	conn.Write(append([]byte(hdr), b...))
 }
 
 func httpReason(code int) string {
@@ -327,7 +327,7 @@ func checkTCPPort(port int) bool {
 }
 
 func checkUDPPort(port int) bool {
-	out, code := outOf(exec.Command("ss", "-lun"))
+	out, code := outOf(exec.Command(bin("ss"), "-lun"))
 	if code != 0 {
 		return false
 	}
@@ -335,7 +335,7 @@ func checkUDPPort(port int) bool {
 }
 
 func dockerContainers() map[string]string {
-	out, code := outOf(exec.Command("docker", "ps", "-a", "--filter", "name=androidemu", "--format", "{{.Names}}|{{.Status}}"))
+	out, code := outOf(exec.Command(bin("docker"), "ps", "-a", "--filter", "name=androidemu", "--format", "{{.Names}}|{{.Status}}"))
 	m := map[string]string{}
 	if code != 0 {
 		return m
@@ -348,15 +348,41 @@ func dockerContainers() map[string]string {
 	return m
 }
 
+// dockerOK 判断「网关这一侧到底能不能用 docker」。
+// 与 dockerContainers() 的区别：容器数为 0 有两种完全不同的原因 ——
+//
+//	① 真的还没建容器（首次安装拉镜像中）→ 该提示「正在安装中」；
+//	② 网关进程拿不到 docker 命令/守护（PATH 缺 /usr/bin、docker 未起）→ 提示「正在安装中」
+//	   会误导用户白等，必须单独区分。（3.9.9 实测：容器在跑却一直显示安装中即此因）
+func dockerOK() bool {
+	dockerChkMu.Lock()
+	defer dockerChkMu.Unlock()
+	if time.Since(dockerChkAt) < 5*time.Second {
+		return dockerChkVal
+	}
+	out, code := outOf(exec.Command(bin("docker"), "version", "--format", "{{.Server.Version}}"))
+	dockerChkVal = code == 0 && strings.TrimSpace(out) != ""
+	dockerChkAt = time.Now()
+	return dockerChkVal
+}
+
+var (
+	dockerChkMu  sync.Mutex
+	dockerChkAt  time.Time
+	dockerChkVal bool
+)
+
 func statusPageHTML(errMsg string) []byte {
 	containers := dockerContainers()
 	boot := false
 	if st, ok := containers["androidemu-android"]; ok && strings.Contains(st, "Up") {
-		out, code := outOf(exec.Command("docker", "exec", "androidemu-android", "getprop", "sys.boot_completed"))
+		out, code := outOf(exec.Command(bin("docker"), "exec", "androidemu-android", "getprop", "sys.boot_completed"))
 		boot = code == 0 && strings.TrimSpace(out) == "1"
 	}
 	var stage, title, desc string
 	switch {
+	case len(containers) == 0 && !dockerOK():
+		stage, title, desc = "docker_unavailable", "暂时读不到容器状态", "网关暂时无法访问 Docker 服务。请点下方「刷新」重试；若一直这样，请在应用中心「停用」后再「启用」。"
 	case len(containers) == 0:
 		stage, title, desc = "installing", "正在安装中", "应用正在后台拉取安卓镜像（约 2GB）并启动容器，请耐心等待 1-5 分钟后刷新页面。"
 	case containers["androidemu-android"] == "":
@@ -373,7 +399,11 @@ func statusPageHTML(errMsg string) []byte {
 		rows += "<tr><td>" + name + "</td><td>" + st + "</td></tr>"
 	}
 	if rows == "" {
-		rows = "<tr><td colspan='2'>暂无容器（首次安装正在拉取镜像）</td></tr>"
+		if dockerOK() {
+			rows = "<tr><td colspan='2'>暂无容器（首次安装正在拉取镜像）</td></tr>"
+		} else {
+			rows = "<tr><td colspan='2'>未能读取容器列表（Docker 服务暂不可用）</td></tr>"
+		}
 	}
 	errHtml := ""
 	if errMsg != "" {
@@ -381,7 +411,7 @@ func statusPageHTML(errMsg string) []byte {
 		// connection refused）直接抛给用户 —— 那只是「容器还没起来」的正常中间
 		// 状态，红色技术报错会让用户误以为安装失败、产生大量无效反馈。
 		switch stage {
-		case "installing", "no_container", "booting":
+		case "installing", "no_container", "booting", "docker_unavailable":
 			errHtml = "<div class='notice'>提示：Android 系统正在准备中，页面会自动刷新。" +
 				"首次安装需要拉取约 2GB 系统镜像，通常 1-5 分钟，无需任何操作。</div>"
 		default:
@@ -400,8 +430,15 @@ func checkContainerHealth() map[string]interface{} {
 		"oom_killed": false, "surfaceflinger_running": false,
 		"agent_running": false, "detail": "",
 	}
-	out, code := outOf(exec.Command("docker", "ps", "--filter", "name=androidemu-android", "--format", "{{.Status}}|{{.RunningFor}}"))
+	out, code := outOf(exec.Command(bin("docker"), "ps", "--filter", "name=androidemu-android", "--format", "{{.Status}}|{{.RunningFor}}"))
 	if code != 0 || strings.TrimSpace(out) == "" {
+		// 3.9.9：区分「容器确实没起来」与「网关这一侧读不到 docker」。
+		// 后者若报「安卓容器未运行」，用户会以为容器挂了，实际容器跑得好好的。
+		if !dockerOK() {
+			h["status"] = "unknown"
+			h["detail"] = "网关暂时无法访问 Docker 服务，容器状态未知"
+			return h
+		}
 		h["status"] = "not_running"
 		h["detail"] = "安卓容器未运行"
 		return h
@@ -412,10 +449,10 @@ func checkContainerHealth() map[string]interface{} {
 	} else {
 		h["container_status"] = line
 	}
-	out, code = outOf(exec.Command("docker", "exec", "androidemu-android", "getprop", "sys.boot_completed"))
+	out, code = outOf(exec.Command(bin("docker"), "exec", "androidemu-android", "getprop", "sys.boot_completed"))
 	bootCompleted := code == 0 && strings.TrimSpace(out) == "1"
 	h["boot_completed"] = bootCompleted
-	out, code = outOf(exec.Command("docker", "inspect", "-f", "{{.State.StartedAt}}", "androidemu-android"))
+	out, code = outOf(exec.Command(bin("docker"), "inspect", "-f", "{{.State.StartedAt}}", "androidemu-android"))
 	uptime := int64(0)
 	if code == 0 {
 		if t, err := time.Parse(time.RFC3339, strings.TrimSpace(out)); err == nil {
@@ -423,10 +460,10 @@ func checkContainerHealth() map[string]interface{} {
 		}
 	}
 	h["uptime_seconds"] = uptime
-	out, code = outOf(exec.Command("docker", "inspect", "-f", "{{.State.OOMKilled}}", "androidemu-android"))
+	out, code = outOf(exec.Command(bin("docker"), "inspect", "-f", "{{.State.OOMKilled}}", "androidemu-android"))
 	oom := code == 0 && strings.TrimSpace(out) == "true"
 	h["oom_killed"] = oom
-	out, code = outOf(exec.Command("docker", "exec", "androidemu-android", "ps", "-A"))
+	out, code = outOf(exec.Command(bin("docker"), "exec", "androidemu-android", "ps", "-A"))
 	sf := false
 	agent := false
 	if code == 0 {
@@ -460,11 +497,11 @@ func apiStatus() []byte {
 	containers := dockerContainers()
 	boot := false
 	if _, ok := containers["androidemu-android"]; ok {
-		out, code := outOf(exec.Command("docker", "exec", "androidemu-android", "getprop", "sys.boot_completed"))
+		out, code := outOf(exec.Command(bin("docker"), "exec", "androidemu-android", "getprop", "sys.boot_completed"))
 		boot = code == 0 && strings.TrimSpace(out) == "1"
 	}
 	ports := map[string]interface{}{
-		"8443_tcp": map[string]interface{}{"name": "Web界面/信令", "listening": checkTCPPort(8443)},
+		"8443_tcp": map[string]interface{}{"name": "Web界面/信令", "listening": checkTCPPort(UPSTREAM_PORT)},
 		"3478_tcp": map[string]interface{}{"name": "TURN中继(TCP)", "listening": checkTCPPort(3478)},
 		"3478_udp": map[string]interface{}{"name": "TURN中继(UDP)", "listening": checkUDPPort(3478)},
 		"5556_tcp": map[string]interface{}{"name": "ADB调试", "listening": checkTCPPort(5556)},
@@ -485,7 +522,7 @@ func apiHealthFix(action string) []byte {
 	}
 	switch action {
 	case "restart_container":
-		cmd := exec.Command("docker", "restart", "androidemu-android")
+		cmd := exec.Command(bin("docker"), "restart", "androidemu-android")
 		err := cmd.Run()
 		if err == nil {
 			setMsg(true, "容器重启命令已发送，等待1-2分钟后刷新页面")
@@ -493,12 +530,12 @@ func apiHealthFix(action string) []byte {
 			setMsg(false, err.Error())
 		}
 	case "fix_gpu":
-		exec.Command("docker", "exec", "-u", "0", "androidemu-android", "chmod", "0666", "/dev/dri/renderD128").Run()
-		exec.Command("docker", "exec", "-u", "0", "androidemu-android", "chmod", "0666", "/dev/dri/card0").Run()
-		exec.Command("docker", "exec", "-u", "0", "androidemu-android", "setprop", "ctl.restart", "surfaceflinger").Run()
+		exec.Command(bin("docker"), "exec", "-u", "0", "androidemu-android", "chmod", "0666", "/dev/dri/renderD128").Run()
+		exec.Command(bin("docker"), "exec", "-u", "0", "androidemu-android", "chmod", "0666", "/dev/dri/card0").Run()
+		exec.Command(bin("docker"), "exec", "-u", "0", "androidemu-android", "setprop", "ctl.restart", "surfaceflinger").Run()
 		setMsg(true, "GPU修复已执行（/dev/dri放权 + 重启surfaceflinger），等待30秒后刷新页面")
 	case "restart_surfaceflinger":
-		err := exec.Command("docker", "exec", "-u", "0", "androidemu-android", "setprop", "ctl.restart", "surfaceflinger").Run()
+		err := exec.Command(bin("docker"), "exec", "-u", "0", "androidemu-android", "setprop", "ctl.restart", "surfaceflinger").Run()
 		if err == nil {
 			setMsg(true, "surfaceflinger重启命令已发送")
 		} else {
