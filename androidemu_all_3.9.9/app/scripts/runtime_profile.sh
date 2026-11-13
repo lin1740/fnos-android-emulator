@@ -29,6 +29,12 @@ esac
 
 [ -f "$COMPOSE" ] || { echo "runtime_profile: compose 不存在：$COMPOSE"; exit 0; }
 
+### 3.9.9：启动前先让局域网直连自愈 —— 容器若挂着已不可用的 macvlan 网络，
+### 启用/升级时会在 attach 阶段直接失败（operation not supported），整个应用起不来。
+if [ -f "${APP_DIR}/scripts/lan_bridge.sh" ]; then
+    TRIM_PKGVAR="$VAR_DIR" bash "${APP_DIR}/scripts/lan_bridge.sh" precheck >/dev/null 2>&1 || true
+fi
+
 SECCOMP_JSON="${APP_DIR}/docker/androidemu-redroid-seccomp.json"
 
 ### 3.9.9：受限档 = 功能全开 + 关闭用户可达的 调试入口。
