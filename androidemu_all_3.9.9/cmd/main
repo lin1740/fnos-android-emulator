@@ -431,6 +431,46 @@ def start():
         except Exception as e:
             log("设备自愈异常：%r" % (e,))
     _selfheal_compose()
+    ### 3.9.9：UDP 中继段端口残留（实测 2026-11-14，群友「停用→启用 / 重启飞牛」后必现）：
+    ###   报 "failed to bind host port for 0.0.0.0:50019->172.22.0.2:50019/udp:
+    ###   address already in use"，飞牛侧只显示「docker 不可用」，看不出真实原因。
+    ###   旧容器停掉后 Docker 的整段端口转发并不总是立即释放，新容器就绑不上。
+    ###   处理：仅在「本应用容器当前不在运行」时做占用探测（避免误删运行中的容器），
+    ###   探测到占用后，先把处于 exited/created/dead 的本应用容器删掉（数据都在数据卷，
+    ###   不受影响），再让 turn_ports.sh 做一次预检换段（占用者若是外部程序，换段解决）。
+    def _ae_relay_port_busy():
+        import socket as _sk
+        for _p in range(50000, 50030):
+            _sock = _sk.socket(_sk.AF_INET, _sk.SOCK_DGRAM)
+            try:
+                _sock.bind(("0.0.0.0", _p))
+            except OSError:
+                return _p
+            finally:
+                _sock.close()
+        return 0
+    _relay_busy = _ae_relay_port_busy()
+    if _relay_busy:
+        _any_running = False
+        for _cname in ("androidemu-webrtc", "androidemu-android"):
+            _r = run("docker inspect -f '{{.State.Status}}' %s 2>/dev/null" % _cname, timeout=15)
+            _sv = ((_r.stdout or b"").decode("utf-8", "replace").strip() if _r else "")
+            if _sv == "running":
+                _any_running = True
+        if _any_running:
+            log("中继段端口 %d 被占用，但本应用容器在运行 → 可能属正常映射，跳过清理" % _relay_busy)
+        else:
+            log("中继段端口 %d 被占用且本应用容器未运行 → 清理残留端点" % _relay_busy)
+            for _cname in ("androidemu-webrtc", "androidemu-android"):
+                _r = run("docker inspect -f '{{.State.Status}}' %s 2>/dev/null" % _cname, timeout=15)
+                _sv = ((_r.stdout or b"").decode("utf-8", "replace").strip() if _r else "")
+                if _sv in ("exited", "created", "dead"):
+                    log("%s 处于 %s → 删除以释放端口与网络端点（数据在卷内）" % (_cname, _sv))
+                    run("docker rm -f %s >/dev/null 2>&1 || true" % _cname, timeout=60)
+            _tp = os.path.join(APP_DEST, "scripts", "turn_ports.sh")
+            if os.path.exists(_tp):
+                run("bash '%s' >/dev/null 2>&1" % _tp, timeout=180)
+                log("已执行中继段占用预检（占用者为外部程序时已自动换段）")
     ### 3.9.4：清理 compose 因名字冲突产生的孤儿容器（形如 <hash>_androidemu-android）。
     ### 这类容器是 compose 在旧容器未删除时新建又被改名留下的，会让看护、修复脚本
     ### 按名字找不到目标容器，也会占着数据卷/网络造成下次创建的诡异失败。
