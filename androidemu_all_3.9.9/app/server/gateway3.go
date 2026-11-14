@@ -887,6 +887,19 @@ func start() int {
 			SOCK_PATH, UPSTREAM_PORT, tls, PREFIX, VERSION)
 		return 0
 	}
+	// 3.9.9：区分「入口没建出来」和「入口有了、上游还没应答」。
+	// probeOnce() 要求 2xx~3xx，上游（画面服务）尚在启动时会拿到 502，于是这里
+	// 曾打出「入口尚未就绪」并返回 1 —— 实测（2026-11-14 群友机器）命令跑完 5 秒后
+	// app.sock 已是 200，纯属误报，反而让人以为没修好。只要守护在、socket 能连上，
+	// 入口就是可用的；上游就绪与否由状态页体现，不该算启动失败。
+	if fileExists(SOCK_PATH) && daemonPID() != 0 {
+		if c, err := net.DialTimeout("unix", SOCK_PATH, 3*time.Second); err == nil {
+			c.Close()
+			fmt.Printf("gateway: 网关入口已就绪：%s（上游 127.0.0.1:%d 暂未应答，待画面服务启动后自动恢复）\n",
+				SOCK_PATH, UPSTREAM_PORT)
+			return 0
+		}
+	}
 	fmt.Printf("gateway: 已启动守护但入口尚未就绪（详见 %s）\n", LOG_FILE)
 	return 1
 }
