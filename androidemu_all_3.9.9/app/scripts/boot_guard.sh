@@ -346,6 +346,27 @@ once(){
             "若长期不运行：在应用中心「停用 → 启用」，或查看 $LOG"
         return 0
     fi
+    ### 3.9.9：agent 缺失自愈，**不依赖 boot_completed**。
+    ### 实测（2026-11-14 群友机器）：信令容器重启 → agent 的注册连接被 1006 掐断 →
+    ### 它重连 wss://172.22.0.2:8443 一直 connection refused → 进程随后消失。
+    ### 面板表现为「0 台在线 / 设备离线」，WebRTC 与 WS 两条通道一起连不上。
+    ### 而下面那些 agent 巡检全部写在 `if booted` 里，容器 boot_completed 为空时
+    ### （本文件开头记录的历史案例）整块都不执行 —— agent 掉了就永远没人拉起。
+    ### 这里独立判断：容器在跑、但容器内没有 agent 进程，就补一次部署（2 分钟一次）。
+    if [ -f "$APP_DIR/scripts/agent_autodeploy.sh" ]; then
+        _ag_missing=$(docker exec -u 0 "$C" sh -c 'pidof cloudphone-agent 2>/dev/null | head -1' 2>/dev/null | tr -d '\r\n')
+        if [ -z "$_ag_missing" ]; then
+            _ag_mf="$VAR_DIR/.agent_missing_ts"
+            _ag_last=$(cat "$_ag_mf" 2>/dev/null || echo 0)
+            case "$_ag_last" in ''|*[!0-9]*) _ag_last=0 ;; esac
+            _ag_now=$(date +%s)
+            if [ $(( _ag_now - _ag_last )) -ge 120 ]; then
+                log "容器在跑但容器内 agent 进程不存在（面板会显示设备离线）→ 重新部署 agent"
+                echo "$_ag_now" > "$_ag_mf" 2>/dev/null || true
+                ( TRIM_APPDEST="$APP_DIR" TRIM_PKGVAR="$VAR_DIR" nohup bash "$APP_DIR/scripts/agent_autodeploy.sh" >>"$LOG" 2>&1 & ) || true
+            fi
+        fi
+    fi
     if booted; then
         ### 开机成功：清掉"卡住计时"与"DRI 放权已做过"的一次性标记（下次开机仍可重新生效）；
         ### gpu_fallback.done（软件渲染回退）保持持久，避免来回切换。
