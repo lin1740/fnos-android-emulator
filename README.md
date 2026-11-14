@@ -733,7 +733,7 @@ deploy:
 
 本应用把宿主 GPU 的**图形**能力直通给安卓容器（GPU host 模式：`/dev/dri` 设备直通 + 共享宿主 mesa/驱动栈），按平台能力自动选路线、自动回退，无需用户干预。
 
-> **视频硬件编码已提供，硬件解码默认不启用**：3.9.9 起内置硬件视频编码，默认开启，安装向导可关闭 —— 在受支持的驱动族内由宿主 GPU 编码画面；超出编码尺寸上限、驱动不受支持、或宿主未授予包用户访问 `/dev/dri/renderD*` 的权限时自动回退软件编码，不会因硬编不可用而影响出图。**硬件解码**默认走软件解码：包内已附上游 v0.2.0 的 H.264/HEVC/VP9 VA-API 解码组件，但默认不登记解码器，需执行 `bash /vol1/@appcenter/androidemu/scripts/hwenc_ctl.sh decode on` 才启用；该开关默认关闭，要求宿主 VA-API 可用并先验证播放不黑屏/花屏，检测不通过时会拒绝启用并保持软解。当前实际状态以 `/vol1/@appdata/androidemu/hwenc.status` 与 `hwenc.decode` 为准。
+> **视频硬件编码与硬件解码均已提供，且默认开启**：3.9.9 起内置宿主 GPU 硬件编码与基于上游 v0.2.0 的 H.264/HEVC/VP9 VA-API 解码组件。两者都在运行时按 `vainfo` 报告的**实际能力**决定：驱动不支持、宿主未授予包用户 `/dev/dri/renderD*` 访问权、或 VA-API 没有对应入口时，自动回退软件编解码，不影响出图。编码尺寸上限按驱动分档（现代 Intel/AMD 可到 3840×2160，传统 radeon 驱动保守取 1920×1088），可用 `hwenc.maxsize` 覆盖。硬编可在安装向导关闭；硬解可执行 `hwenc_ctl.sh decode off` 关闭。实际状态以 `hwenc.status` / `hwenc.decode` 为准。
 
 ### 1. 视频硬编解码（三层架构）
 
@@ -743,7 +743,7 @@ deploy:
 
 - **宿主编码 daemon**（3.9.9 已提供）：随包附带并按需启动，经标准 VAAPI 接口（Intel iHD/i965、AMD radeonsi/r600）对接宿主 GPU，把容器内的编码请求落到显卡上；安装向导里可以关闭；
 - **自动能力探测**（已实现）：`hwenc_ctl.sh` 读取 vainfo 的编码能力，不在受支持驱动族内、或画面尺寸超出编码上限时直接使用软件编码，不会出现「硬编失败导致黑屏/花屏」；
-- **容器内解码组件**（默认未登记）：上游 v0.2.0 的 HIDL 组件已随包附带，内含 `c2.hardware.decoder.{h264,hevc,vp9}`；默认不在 `media_codecs.xml` 登记，播放走软解。执行 `hwenc_ctl.sh decode on` 才会登记解码器并切换到带硬解的宿主 daemon，检测不通过则拒绝启用、保持原状。
+- **容器内解码组件**（默认登记）：上游 v0.2.0 的 HIDL 组件随包附带，内含 `c2.hardware.decoder.{h264,hevc,vp9}`；`hwenc_ctl.sh enable` 时会按本次探测到的解码能力登记到 `media_codecs.xml` 并换用带硬解的宿主 daemon。缺 `daemon-hwdec`、`vainfo` 不可用或 VA-API 未报解码入口时，自动只登记编码器、播放走软解，编码链路不受影响。
 
 **宿主侧能力评估**（基于驱动与上游真机验证，**不是本应用当前已交付的功能**）：
 
@@ -756,10 +756,10 @@ deploy:
 | AMD GCN 早期卡（R9 270/280 等，radeon 驱动） | ❌ | ✅ | 驱动架构性限制（源码级确认） |
 | AMD legacy（HD 2000~6000，TeraScale） | ✅ H264 | 部分型号 | 老卡 UVD 通道 |
 | AMD APU（Kaveri 等 GCN APU） | ❌ | ✅ | 同独显逻辑，切 amdgpu 可解硬解 |
-| NVIDIA（NVDEC/NVENC，GTX 10 系+） | ✅ | ✅ | 上游真机验证 1050Ti；3.8.9 起挂载完整用户态驱动栈 |
+| NVIDIA（NVDEC / NVENC，GTX 10 系+） | ✅（NVDEC，VA-API 报 VLD 时） | 取决于 `vainfo` 是否报 EncSlice | 上游只验证了 Tier 7 的 NVDEC 解码；编码若走 `nvidia-vaapi-driver` 通常无 EncSlice，会自动回退软编，硬解不受影响 |
 | ARM Mali（Panfrost） | 走 V4L2 路线（对接开发中） | 待上游 | 图形渲染已实测 ✅ |
 
-> 以上为宿主 GPU 自身能力。**视频编码**自 3.9.9 起由宿主侧 daemon 接管（默认开启）；**视频解码**仍为软件实现 —— 容器内没有解码 HAL，软解不影响播放，只是 CPU 占用更高。
+> 以上为宿主 GPU 自身能力，实际是否启用以 `vainfo` 探测为准，不按厂商一刀切。**视频编码**由宿主侧 daemon 接管（默认开启）；**视频解码**默认开启 H.264/HEVC/VP9 VA-API 硬解，能力不足自动回退软解。传统 radeon 驱动的 1920×1088 上限来自一台 Kaveri APU 的实测，仅对该档保守生效；现代 AMD 独显/APU 与 Intel 走更大上限。NVIDIA 的 `nvidia-vaapi-driver` 通常只报 `VAEntrypointVLD`（NVDEC 解码），没有 `EncSlice` 时硬编会如实回退软编，但硬解仍可用。
 
 ### 2. 音频路径（无需硬件加速）
 
@@ -1745,7 +1745,7 @@ docker rm -f androidemu-android androidemu-webrtc 2>/dev/null
 ```
 
 ### Q: 视频为什么不走硬件解码？播放器提示「硬解失败已切换软解」
-默认走软解是刻意设置，不是故障：3.9.9 虽随包附带上游 v0.2.0 的 H.264/HEVC/VP9 VA-API 解码组件，但硬解接错会黑屏/花屏，比软解卡更糟，因此默认不登记解码器，播放一律软解（主流核显设备 1080p 可跑 40~60fps，抖音、飞牛影视等正常使用）。需要可自行执行 `bash /vol1/@appcenter/androidemu/scripts/hwenc_ctl.sh decode on`，前提是宿主 VA-API 可用且已验证出图正常；检测不通过时开关会直接拒绝、保持软解。**投屏推流这一侧是硬件编码**（3.9.9 起默认开启）：由宿主 GPU 编码画面，减轻 CPU 负担；驱动不受支持、尺寸超限或宿主 DRI 节点不可访问时自动回退软编，不影响出图。
+硬解默认开启，不是刻意走软解：3.9.9 随包附带上游 v0.2.0 的 H.264/HEVC/VP9 VA-API 解码组件，`enable` 时按 `vainfo` 实际报告的解码入口决定是否登记。若缺 `daemon-hwdec`、`vainfo` 跑不起来（常见于包用户缺 `video`/`render` 组）或没有解码入口，就自动只保留编码链路、播放回退软解（主流核显 1080p 软解 40~60fps，抖音、飞牛影视正常使用）。投屏推流这一侧是硬件编码，尺寸超限、驱动不支持或宿主 DRI 节点不可访问时同样自动回退软编。
 
 ### Q: 重启容器或重启 NAS 后，开启音频连接失败 / 没声音
 3.9.1 及之前版本存在音频修复守护的锁竞争缺陷（容器重启后 Opus 编码器修复可能长时间无法执行），3.9.2 已修复：守护会等待重试并在必要时无锁执行修复，容器重启后音频编码器自动恢复。如仍遇到，升级到 3.9.2+ 即愈；也可手动执行 `bash /vol1/@appcenter/androidemu/scripts/audio_watchdog.sh fix` 立即修复。
@@ -1803,7 +1803,7 @@ OpenGL ES 渲染：主流 ARM SoC（Mali/Adreno/VideoCore）与 x86 AMD/Intel �
 > **关于独立 Docker 容器版**：本项目目前以飞牛应用中心 FPK 包形式发布，暂不提供独立 Docker Compose 部署方案。独立 Docker 容器版本计划在应用中心上架稳定后另行提供，敬请期待。
 
 1. **音频**：OPUS 音频编码器（Codec2）自 v3.8.9 起已修复，默认开启；3.9.2 修复了容器重启后音频修复守护锁竞争失效的问题（重启后自动自愈）。注意：音量大小与宿主系统实际音量匹配（容器内设100但宿主系统只设50，则按50输出）
-7. **视频编码/解码**：投屏推流的**硬件编码**自 3.9.9 起提供，默认开启、安装向导可关闭，受支持驱动族内由宿主 GPU 编码，驱动不支持或宿主 DRI 节点不可访问时自动回退软编；**硬件解码**默认关闭，包内附上游 v0.2.0 的 VA-API 解码组件，需 `hwenc_ctl.sh decode on` 手动开启并验证出图正常，播放默认走软解
+7. **视频编码/解码**：**硬件编码与硬件解码默认开启**，按 `vainfo` 实际能力生效；驱动不支持、尺寸超限或宿主 DRI 节点不可访问时分别自动回退软编/软解。尺寸上限按驱动分档，不按厂商一刀切。硬编可在安装向导关闭，硬解用 `hwenc_ctl.sh decode off` 关闭。
 2. **外网访问**：飞牛反向代理只透传 TCP，WebRTC 媒体流（UDP）无法通过，自动降级为 WebSocket 投屏
 3. **飞牛 APP**：部分版本 WebView 对 WebSocket 代理支持有限，建议用手机浏览器
 4. **ARM 应用兼容性**：含反模拟器检测或复杂 JIT 的 ARM64 应用可能闪退（属翻译层能力边界）

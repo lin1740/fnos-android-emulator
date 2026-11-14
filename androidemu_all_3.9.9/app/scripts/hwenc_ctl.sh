@@ -31,10 +31,11 @@ RUN_USER="${TRIM_RUN_USERNAME:-docker-androidemu}"
 CT="androidemu-android"
 ART="$APP_DIR/hwenc/artifacts/android11-hidl"
 DAEMON_BIN="$APP_DIR/hwenc/bin/daemon"
-### 3.9.9：硬件解码为**独立可选档**。原有 daemon 是 HWDEC=0（只编码）编译的；
-### daemon-hwdec 是同一份源码加 -DHAVE_HWDEC、静态链精简 libavcodec 编出来的，
-### 由 GitHub Actions 生成。两者并存，默认仍用旧 daemon —— 硬解没验证出图之前，
-### 绝不替换现有编码链路。开启方式：hwenc_ctl.sh decode on。
+### 3.9.9-r13：硬件解码**默认开启**。daemon-hwdec 是同一份源码加 -DHAVE_HWDEC
+### 编出来的，与只编码的 daemon 并存。运行时按宿主 VA-API 的真实能力决定：
+### 有解码入口就换 daemon-hwdec 并登记 Decoders；缺二进制、vainfo 不可用或
+### 没有解码入口时自动退回「只编码 daemon + 软件解码」，编码链路完全不受影响。
+### 用户可执行 hwenc_ctl.sh decode off 显式关闭（写 hwenc.decode=off）。
 DAEMON_HWDEC="$APP_DIR/hwenc/bin/daemon-hwdec"
 DECODE_CONF="$VAR_DIR/hwenc.decode"
 LOG="$VAR_DIR/hwenc.log"
@@ -73,6 +74,73 @@ dex() { docker exec "$CT" sh -c "$1" 2>/dev/null; }
 daemon_pids() {
     pgrep -x daemon 2>/dev/null
     pgrep -x daemon-hwdec 2>/dev/null
+}
+
+### 3.9.9-r13：硬解默认开；只有显式写入 off 才关闭。
+decode_enabled() {
+    [ "$(cat "$DECODE_CONF" 2>/dev/null | tr -d '\r\n')" = "off" ] && return 1
+    return 0
+}
+
+### 从 vainfo 的**实际输出**识别 libva 驱动，不按 /sys/module 猜厂商。
+### 返回 iHD / radeonsi / radeonsi-legacy / nvidia / unknown
+va_driver_name() {
+    local _v
+    _v=$(vainfo 2>/dev/null | grep -m1 -i 'Driver version' | tr 'A-Z' 'a-z')
+    case "$_v" in
+        *nvidia*)                    echo nvidia; return 0 ;;
+        *intel*|*ihd*|*i965*)        echo iHD; return 0 ;;
+        *radeonsi*|*gallium*|*mesa*)
+            ### 读 card* 实际绑定的内核驱动（radeon / amdgpu），不能只看模块是否加载：
+            ### 实测 Kaveri 机器上 amdgpu 模块也在，但 device/driver 指向 radeon。
+            local _k="" _p
+            for _p in /sys/class/drm/card[0-9]*/device/driver; do
+                [ -e "$_p" ] || continue
+                _k=$(readlink -f "$_p" 2>/dev/null | awk -F/ '{print $NF}')
+                break
+            done
+            case "$_k" in
+                radeon) echo radeonsi-legacy ;;
+                *)      echo radeonsi ;;
+            esac
+            return 0 ;;
+        *) echo unknown; return 0 ;;
+    esac
+}
+
+### 编码/解码尺寸上限按驱动分档，不再把一台 Kaveri(VCE 2.0) 的 1920x1088
+### 套到所有显卡。可用 $VAR_DIR/hwenc.maxsize（如 3840x2160）显式覆盖。
+### 未知驱动与 radeon 传统驱动保守取 1920x1088（有实测），现代 iHD/amdgpu
+### 取 3840x2160；MediaCodecList 选不中时 verify()/do_resync() 仍会自动回退软编。
+hwenc_max_size() {
+    local _ov
+    _ov=$(cat "$VAR_DIR/hwenc.maxsize" 2>/dev/null | tr -d '\r\n')
+    case "$_ov" in [0-9]*x[0-9]*) echo "$_ov"; return 0 ;; esac
+    case "$(va_driver_name)" in
+        radeonsi-legacy|unknown) echo "1920x1088" ;;
+        *)                      echo "3840x2160" ;;
+    esac
+}
+
+### 解码能力：NVIDIA 的 nvidia-vaapi-driver 通常只报 VAEntrypointVLD(NVDEC)，
+### 没有 EncSlice；硬解不该被「硬编入口」挡住。
+detect_decode() {
+    _WHY=""
+    [ -x "$DAEMON_HWDEC" ] || { _WHY="缺少 daemon-hwdec 二进制"; return 1; }
+    command -v vainfo >/dev/null 2>&1 || { _WHY="宿主缺少 vainfo"; return 1; }
+    local _va
+    _va=$(vainfo 2>/dev/null) || { _WHY="包用户无法运行 vainfo（检查 video/render 组）"; return 1; }
+    echo "$_va" | grep -qE 'VAEntrypoint(VLD|EncSlice|EncPicture|EncSliceLP)' \
+        || { _WHY="VA-API 未报告任何解码入口"; return 1; }
+    return 0
+}
+
+### 本次 enable 是否真的启用硬解；能力不足只降级硬解，不影响硬编。
+decode_capable() {
+    decode_enabled || { log "硬件解码：用户已关闭"; return 1; }
+    [ -x "$DAEMON_HWDEC" ] || { log "硬件解码默认开启，但缺少 daemon-hwdec → 本次回退软解"; return 1; }
+    detect_decode || { log "硬件解码默认开启，但 $_WHY → 本次回退软解"; return 1; }
+    return 0
 }
 
 ### ---------------------------------------------------------------------------
@@ -120,11 +188,8 @@ detect() {
     ### 但本组件走 Codec2 HIDL + 宿主 daemon，是另一套机制 —— 实测在 AMD Kaveri
     ### (A8-7500 / VCE 2.0) 上可用，上限 1920x1088。故这里只警告不拒绝，
     ### 但要在启用结果里明确告知：竖屏分辨率（手机/平板）用不上硬件编码。
-    _KDRV=""
-    [ -d /sys/module/amdgpu ] && _KDRV="amdgpu"
-    [ -d /sys/module/radeon ] && _KDRV="radeon"
-    if [ "$_KDRV" = "radeon" ]; then
-        _WARN_RADEON="AMD 传统 radeon 驱动（GCN 1.0/2.0）：硬件编码上限约 1920x1088，仅横屏可用"
+    if [ "$(va_driver_name)" = "radeonsi-legacy" ]; then
+        _WARN_RADEON="radeon 传统驱动：尺寸上限按 1920x1088 保守处理；现代 AMD 卡可切 amdgpu，或写 $VAR_DIR/hwenc.maxsize 覆盖"
     fi
 
     if ! docker inspect "$CT" >/dev/null 2>&1; then
@@ -171,6 +236,10 @@ res_summary() {
 ### ---------------------------------------------------------------------------
 inject() {
     log "注入组件到容器 /vendor"
+    local _max
+    _max=$(hwenc_max_size)
+    log "编解码尺寸上限：$_max（驱动 $(va_driver_name)；可用 $VAR_DIR/hwenc.maxsize 覆盖）"
+    dex "echo '$_max' > /data/local/tmp/hwenc-maxsize" >/dev/null 2>&1
     docker cp "$ART/." "$CT:/data/local/tmp/hwenc-pkg/" >/dev/null 2>&1 || {
         dex "mkdir -p /data/local/tmp/hwenc-pkg" >/dev/null
         docker cp "$ART/." "$CT:/data/local/tmp/hwenc-pkg/" >/dev/null 2>&1
@@ -192,13 +261,14 @@ cp -f $P/etc/seccomp_policy/* /vendor/etc/seccomp_policy/
     ### media_codecs.xml 登记（必须，否则 Codec2InfoBuilder 报 not found in xml）
     dex '
 set -e
+M=$(cat /data/local/tmp/hwenc-maxsize)
 BK=/data/local/tmp/hwenc-backup
 mkdir -p $BK
 [ -f /vendor/etc/media_codecs.xml ] && [ ! -f $BK/media_codecs.xml.orig ] && cp -f /vendor/etc/media_codecs.xml $BK/media_codecs.xml.orig
 if ! grep -q "c2.hardware.encoder.h264" /vendor/etc/media_codecs.xml; then
   cat > /data/local/tmp/hwenc-frag.xml <<"FRAG"
         <MediaCodec name="c2.hardware.encoder.h264" type="video/avc">
-            <Limit name="size" min="32x32" max="1920x1088" />
+            <Limit name="size" min="32x32" max="__AE_MAX__" />
             <Limit name="alignment" value="2x2" />
             <Limit name="block-size" value="16x16" />
             <Limit name="blocks-per-second" range="1-489600" />
@@ -206,47 +276,63 @@ if ! grep -q "c2.hardware.encoder.h264" /vendor/etc/media_codecs.xml; then
             <Feature name="intra-refresh" />
         </MediaCodec>
 FRAG
+  sed -i "s|__AE_MAX__|$M|g" /data/local/tmp/hwenc-frag.xml
   sed -i "/<Encoders>/r /data/local/tmp/hwenc-frag.xml" /vendor/etc/media_codecs.xml
 else
-  ### 已存在条目时纠正 size 声明：旧写法 max="4096x4096" 会让 MediaCodecList 误以为
-  ### 能编 1080x2340，结果选中硬件编码器后在 daemon 侧被拒（vaCreateContext failed），
-  ### 整条编码失败且不会退回软件 —— 实测踩过。声明值必须与真实能力一致。
-  sed -i "s|name=\"size\" min=\"32x32\" max=\"[0-9]*x[0-9]*\"|name=\"size\" min=\"32x32\" max=\"1920x1088\"|" /vendor/etc/media_codecs.xml
+  ### 已存在条目时按当前驱动上限纠正 size 声明（旧写法 4096x4096 会让
+  ### MediaCodecList 误选硬编后被 daemon 拒绝且不回退，实测踩过）。
+  sed -i "s|name=\"size\" min=\"32x32\" max=\"[0-9]*x[0-9]*\"|name=\"size\" min=\"32x32\" max=\"$M\"|" /vendor/etc/media_codecs.xml
 fi
 ' || { log "media_codecs.xml 登记失败"; return 1; }
 
-    ### 3.9.9：可选硬件解码。注入的 C2 VAAPI 服务本身已经实现了
-    ### c2.hardware.decoder.{h264,hevc,vp9}（二进制内可查），缺的只是 XML 声明；
-    ### 默认不写，只有 `decode on` 时才登记。声明上限取 1920x1088（与编码侧一致，
-    ### 大于此尺寸不会被选中，自动回落软件解码，避免误选导致黑屏）。
-    if [ "$(cat "$DECODE_CONF" 2>/dev/null | tr -d '\r\n')" = "on" ]; then
-        dex '
+    ### 3.9.9-r13：硬解默认开启。只有本次能力探测通过（有解码入口 + daemon-hwdec
+    ### 可用）才登记 Decoders；否则自动只走软件解码，编码链路完全不受影响。
+    if [ "${_DECODE_ON:-0}" = "1" ]; then
+        local _ndec
+        ### 显式 -u 0：dex() 用容器默认用户，部分 redroid 镜像下写 /data/local/tmp
+        ### 与 /vendor/etc 会静默失败；实测显式 -u 0 才能稳定登记。
+        _ndec=$(docker exec -u 0 "$CT" sh -c '
 set -e
+M=$(cat /data/local/tmp/hwenc-maxsize)
+### redroid 的 media_codecs.xml 原文件只有 <Encoders>，解码器在 Include 里，
+### 没有 <Decoders> 段 —— 旧代码直接 sed "/<Decoders>/r" 什么都不会插入，
+### 却无条件报「已登记 3 个」。必须先建段再插入。
+if ! grep -q "<Decoders>" /vendor/etc/media_codecs.xml; then
+  ### 用 printf 生成段文件再 r 插入：Android toybox sed 的替换串里 \n 不可靠。
+  printf "    <Decoders>\n    </Decoders>\n" > /data/local/tmp/hwdec-section.xml
+  sed -i "/<MediaCodecs>/r /data/local/tmp/hwdec-section.xml" /vendor/etc/media_codecs.xml
+fi
 if ! grep -q "c2.hardware.decoder.h264" /vendor/etc/media_codecs.xml; then
   cat > /data/local/tmp/hwdec-frag.xml <<"FRAG"
         <MediaCodec name="c2.hardware.decoder.h264" type="video/avc">
-            <Limit name="size" min="32x32" max="1920x1088" />
+            <Limit name="size" min="32x32" max="__AE_MAX__" />
             <Limit name="alignment" value="2x2" />
             <Limit name="block-size" value="16x16" />
             <Feature name="adaptive-playback" />
         </MediaCodec>
         <MediaCodec name="c2.hardware.decoder.hevc" type="video/hevc">
-            <Limit name="size" min="32x32" max="1920x1088" />
+            <Limit name="size" min="32x32" max="__AE_MAX__" />
             <Limit name="alignment" value="2x2" />
             <Limit name="block-size" value="16x16" />
             <Feature name="adaptive-playback" />
         </MediaCodec>
         <MediaCodec name="c2.hardware.decoder.vp9" type="video/x-vnd.on2.vp9">
-            <Limit name="size" min="32x32" max="1920x1088" />
+            <Limit name="size" min="32x32" max="__AE_MAX__" />
             <Limit name="alignment" value="2x2" />
             <Limit name="block-size" value="16x16" />
             <Feature name="adaptive-playback" />
         </MediaCodec>
 FRAG
+  sed -i "s|__AE_MAX__|$M|g" /data/local/tmp/hwdec-frag.xml
   sed -i "/<Decoders>/r /data/local/tmp/hwdec-frag.xml" /vendor/etc/media_codecs.xml
 fi
-' || { log "硬件解码器登记失败（保持编码链路不变）"; }
-        log "已登记 3 个硬件解码器（h264/hevc/vp9）"
+grep -c "c2.hardware.decoder" /vendor/etc/media_codecs.xml
+' 2>/dev/null | tr -d '\r\n')
+        if [ "${_ndec:-0}" -ge 3 ]; then
+            log "已登记 $_ndec 个硬件解码器（h264/hevc/vp9）"
+        else
+            log "硬件解码器登记异常（实际 ${_ndec:-0} 个），播放由系统回落软解；编码链路不受影响"
+        fi
     fi
 
     ### dma_heap 权限：实测在 libion 未被替换的前提下，0444 也能正常分配（c2.android
@@ -293,32 +379,37 @@ daemon_start() {
     ### 硬解开启时换用带 HAVE_HWDEC 的 daemon；缺失该文件则保持旧 daemon 并打日志，
     ### 不会因为一个可选组件没构建好就把编码链路弄坏。
     _run_daemon="$DAEMON_BIN"
-    if [ "$(cat "$DECODE_CONF" 2>/dev/null | tr -d '\r\n')" = "on" ]; then
-        if [ -x "$DAEMON_HWDEC" ]; then
-            _run_daemon="$DAEMON_HWDEC"
-            log "硬件解码：已启用，使用 daemon-hwdec"
-        else
-            log "硬件解码：标记已开但缺少 daemon-hwdec，本次仍用只编码 daemon"
-        fi
+    if [ "${_DECODE_ON:-0}" = "1" ] && [ -x "$DAEMON_HWDEC" ]; then
+        _run_daemon="$DAEMON_HWDEC"
+        log "硬件解码：已启用，使用 daemon-hwdec"
+    else
+        log "硬件解码：本次未启用，使用只编码 daemon（播放走软解）"
     fi
     cd "$APP_DIR/hwenc/bin" || return 1
     ### 3.9.9：显式指定 libva 驱动。实测 2026-11-09 daemon 继承了宿主环境里的
     ### LIBVA_DRIVER_NAME=nvidia，日志报「vaInitialize failed / No NVIDIA VA-API decode」。
     ### 编码走 legacy 后端不受影响，但解码初始化会白跑一次；这里按实际内核模块纠正。
+    ### 3.9.9-r13：libva 驱动按 vainfo 实际输出识别（含 NVIDIA），不按内核模块猜；
+    ### 识别不了就不设置，交给 libva 自选，避免写错驱动导致 vaInitialize 失败。
     local _drv=""
-    if [ -d /sys/module/amdgpu ] || [ -d /sys/module/radeon ]; then
-        _drv=radeonsi
-    elif [ -d /sys/module/i915 ] || [ -d /sys/module/xe ]; then
-        _drv=iHD
-    fi
+    case "$(va_driver_name)" in
+        iHD)                      _drv=iHD ;;
+        radeonsi|radeonsi-legacy) _drv=radeonsi ;;
+        nvidia)                   _drv=nvidia ;;
+        *)                        _drv="" ;;
+    esac
     ### setsid -f 彻底脱离会话，否则 SSH/回调结束时被回收（实测）
-    ### 上游 v0.2.0 release 明写：Intel 上默认 legacy 编码后端会产生畸形 P 帧，
-    ### 必须走 REDROID_FORGE_ENCODE_BACKEND=ffmpeg；AMD 用 ffmpeg 后端反而会 GPU hang。
-    ### ffmpeg 后端与硬解共用一个 HAVE_HWDEC 开关，所以只在 Intel + decode on 时启用。
+    ### 上游 v0.2.0：Intel legacy 后端的 P 帧畸形，必须走 ffmpeg 后端；
+    ### AMD RX 480 / Ryzen 5700G 的 legacy 后端实测正常，只有 Polaris/GFX8 老卡
+    ### 用 ffmpeg 会 GPU hang —— 这是单台老卡的问题，不能推广到整个厂商。
+    ### 因此 Intel 默认启用；其它厂商可写 $VAR_DIR/hwenc.backend=ffmpeg 显式启用。
     _extra_env=""
-    if [ "$_run_daemon" = "$DAEMON_HWDEC" ] && { [ -d /sys/module/i915 ] || [ -d /sys/module/xe ]; }; then
+    local _backend
+    _backend=$(cat "$VAR_DIR/hwenc.backend" 2>/dev/null | tr -d '\r\n')
+    if [ "$_run_daemon" = "$DAEMON_HWDEC" ] && \
+       { [ "$(va_driver_name)" = "iHD" ] || [ "$_backend" = "ffmpeg" ]; }; then
         _extra_env="REDROID_FORGE_ENCODE_BACKEND=ffmpeg"
-        log "检测到 Intel 显卡：同时启用 ffmpeg 编码后端（避开 legacy 的 P 帧畸形码流）"
+        log "启用 ffmpeg 编码后端（Intel 默认 / 其它厂商由 hwenc.backend 显式指定）"
     fi
     ### 3.9.9-r12：绝不留下 root 常驻父进程。
     ### · 应用回调本身就是包用户 → 直接 exec，无需降权（在非 root 下调 setpriv
@@ -497,6 +588,13 @@ rm -rf /data/local/tmp/hwenc-pkg /data/local/tmp/hwenc-frag.xml /data/local/tmp/
 do_enable() {
     log "===== 启用硬件视频编码 ====="
     log "分辨率配置：$(res_summary)"
+    _DECODE_ON=0
+    if decode_capable; then
+        _DECODE_ON=1
+        log "硬件解码：本次启用（h264/hevc/vp9）"
+    else
+        log "硬件解码：本次不启用，播放走软件解码（编码链路不受影响）"
+    fi
 
     if ! detect; then
         log "前置检测未通过：$_WHY"
@@ -548,7 +646,7 @@ do_enable() {
 
     rm -f "$HINT"
     echo "enabled" > "$STATUS"
-    log "启用成功：≤1920x1088 走硬件编码，更高分辨率退回软件编码"
+    log "启用成功：≤$(hwenc_max_size) 走硬件编码，更高分辨率退回软件编码"
     ### 立刻按当前实际分辨率校准一次（避免启用时正处在手机/平板分辨率而错选硬件编码器）
     do_resync
     log "提示：容器重启后需 repair（boot_guard 会自动执行）；分辨率切换后需 resync"
@@ -593,8 +691,8 @@ do_repair() {
 ### MediaCodecList 的选择 —— 超限分辨率（手机 1080x2340 / 平板 1200x2000）仍会选中
 ### c2.hardware.encoder.h264，然后在 daemon 侧被 vaCreateContext 拒绝，整条编码失败
 ### 且不会自动退回软件编码（MediaCodec 不做运行时 fallback），投屏直接黑。
-### 结论：只能按当前实际分辨率切换 ccodec —— ≤1920x1088 用 4（Codec2 硬件优先），
-### 超限用 0（OMX 软件），每次切换后重启 media 使其生效。
+### 结论：按当前实际分辨率与**当前驱动的尺寸上限**（hwenc_max_size）切换 ccodec ——
+### 未超限用 4（Codec2 硬件优先），超限用 0（OMX 软件），重启 media 使其生效。
 ### ---------------------------------------------------------------------------
 current_wh() {
     local raw ov
@@ -627,7 +725,9 @@ do_resync() {
     [ -z "$cur" ] && { log "resync：取不到当前分辨率，跳过"; return 0; }
     w=${cur%x*}; h=${cur#*x}
 
-    if [ "${w:-0}" -le 1920 ] && [ "${h:-9999}" -le 1088 ]; then
+    local _mx _mw _mh
+    _mx=$(hwenc_max_size); _mw=${_mx%x*}; _mh=${_mx#*x}
+    if [ "${w:-0}" -le "${_mw:-1920}" ] && [ "${h:-9999}" -le "${_mh:-1088}" ]; then
         target=4
     else
         target=0
@@ -684,7 +784,7 @@ do_status() {
         echo "硬件编码器   : $(dex 'dumpsys media.player 2>/dev/null | grep -c "c2.hardware.encoder.h264"') 处"
         echo "硬件解码器   : $(dex 'dumpsys media.player 2>/dev/null | grep -c "c2.hardware.decoder"') 处"
     fi
-    echo "硬件解码开关 : $(cat "$DECODE_CONF" 2>/dev/null || echo 'off（默认）')"
+    echo "硬件解码开关 : $(decode_enabled && echo 'on（默认开启）' || echo off)   驱动/上限: $(va_driver_name) / $(hwenc_max_size)"
     echo "hwdec daemon : $([ -x "$DAEMON_HWDEC" ] && echo 已安装 || echo '未安装（先在 CI 构建）')"
     echo "daemon 进程  : $([ -n "$(daemon_pids | head -1)" ] && echo 运行中 || echo 未运行)"
     echo "daemon 用户  : $([ -n "$(daemon_pids | head -1)" ] && ps -o user= -p "$(daemon_pids | head -1)" | tr -d ' ' || echo -)"
@@ -705,9 +805,8 @@ do_decode() {
                 echo "硬件解码不可用：缺少 $DAEMON_HWDEC（需先用 CI 构建该二进制）"
                 return 1
             fi
-            if ! detect; then
-                echo "宿主 VA-API 检测未通过（$_WHY），硬解通常也不可用；开关未改动"
-                [ -n "${_HINT:-}" ] && echo "修复提示：$_HINT"
+            if ! detect_decode; then
+                echo "宿主 VA-API 解码能力检测未通过（$_WHY），硬解将自动回退软解；开关未改动"
                 return 1
             fi
             echo on > "$DECODE_CONF" || return 1
@@ -718,7 +817,7 @@ do_decode() {
             log "硬件解码开关：off（回到纯硬编 + 软解）"
             ;;
         status|*)
-            echo "硬件解码：$(cat "$DECODE_CONF" 2>/dev/null || echo off)   daemon-hwdec：$([ -x "$DAEMON_HWDEC" ] && echo 已安装 || echo 未安装)"
+            echo "硬件解码：$(decode_enabled && echo 'on（默认开启）' || echo off)   daemon-hwdec：$([ -x "$DAEMON_HWDEC" ] && echo 已安装 || echo 未安装)"
             return 0
             ;;
     esac

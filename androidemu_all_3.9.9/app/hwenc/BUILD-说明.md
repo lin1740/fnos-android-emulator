@@ -1,8 +1,8 @@
 # 视频硬编解码实验组件（redroid-hwenc）构建与状态说明
 
-> **实验组件，默认不启用。** 本目录是上游开源项目 redroid-hwenc
+> **硬编硬解默认开启，能力不足自动回退。** 本目录是上游开源项目 redroid-hwenc
 > （github.com/fogelmanjg/redroid-hwenc，Apache-2.0）v0.2.0 的产物与源码。
-> 用户在安装向导中选择「启用」时才会部署；未启用时不影响应用任何正常功能。
+> 运行时按 `vainfo` 的实际能力决定是否部署硬解组件；检测不通过时只保留编码链路或回退软编/软解，不影响应用任何正常功能。
 
 ## 一、这是什么
 
@@ -58,13 +58,13 @@ sudo apt-get install -y libva-dev libdrm-dev libegl1-mesa-dev gcc make pkg-confi
 # libgbm-dev 若与系统 Mesa 版本冲突，用 apt-get download + dpkg-deb -x 取 gbm.h/gbm.pc
 # Vulkan Video 头（vk_video/*.h）Debian 12 的 libvulkan-dev 未提供，
 # 需从 KhronosGroup/Vulkan-Headers 的 include/vk_video/ 取 5 个文件
-make            # legacy 后端（AMD 用这个）
+make            # legacy 后端（AMD RX 480 / Ryzen 5700G 实测正常）
 make HWDEC=1    # 额外编入 ffmpeg 后端（Intel 必须）
 ```
 
 **Intel 必须用 ffmpeg 后端**，否则码流畸形、ffprobe 每帧报 `Overread SPS by 3 bits`：
 编译 `make HWDEC=1` + 运行 `REDROID_FORGE_ENCODE_BACKEND=ffmpeg`。
-**AMD 一律用 legacy**（Polaris 用 ffmpeg 后端会 GPU hang）。
+**AMD 不要一概而论**：上游 README 记录 RX 480、Ryzen 5700G 的 legacy 后端 P 帧 `decodes clean`；只有 Polaris/GFX8 老卡用 ffmpeg 后端会 GPU hang。因此 Intel 默认切 ffmpeg，AMD/其它厂商保持 legacy，但可用 `hwenc.backend=ffmpeg` 显式开启 —— 单一型号的实测不推广到整个厂商。
 
 ### 3.9.9 实际交付状态（重要）
 
@@ -73,12 +73,12 @@ make HWDEC=1    # 额外编入 ffmpeg 后端（Intel 必须）
 - Intel 机器仍在用 legacy 后端，正是上面那段「码流畸形」的场景，也是
   部分机器投屏卡顿的成因之一。
 
-现在改为**两个二进制并存**，默认行为完全不变：
+现在改为**两个二进制并存**，硬解默认开启、能力不足自动回退：
 
 | 文件 | 编译方式 | 用途 |
 |---|---|---|
-| `bin/daemon` | `make`（HWDEC=0） | 默认，纯硬编，AMD 用 |
-| `bin/daemon-hwdec` | `-DHAVE_HWDEC`，链 libavcodec/libavutil | `hwenc_ctl.sh decode on` 时启用，带硬解；Intel 同时自动切 ffmpeg 编码后端 |
+| `bin/daemon` | `make`（HWDEC=0） | 只编码；硬解能力不足时自动回退用它 |
+| `bin/daemon-hwdec` | `-DHAVE_HWDEC`，链 libavcodec/libavutil | **默认启用**（按 `vainfo` 解码能力判定），带硬解；Intel 同时自动切 ffmpeg 编码后端 |
 
 `daemon-hwdec` 在 Debian 12（fnOS 同一用户态）上编译，命令：
 
