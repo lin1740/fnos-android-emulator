@@ -697,6 +697,38 @@ func versionAssets(body []byte) []byte {
 	})
 }
 
+// LATENCY_MUTE_JS —— 屏蔽上游的「检测到网络延迟高」弹窗。
+//
+// 背景（实测 2026-11-14）：投屏 agent 运行在安卓容器内，其候选地址是 Docker 内网
+// （172.22.0.x），宿主浏览器无法路由，因此 P2P 直连在本架构下不可能成功，画面必然
+// 走本机 coturn 中继（界面显示 UDP relay）。多一跳后局域网延迟约 35~50ms，完全可用，
+// 但上游前端的阈值判得偏低，会在局域网环境反复弹出「检测到网络延迟高，请尝试切换
+// 到更好的网络环境」——用户点「知道了」只维持一次，属于纯骚扰且无法照做。
+// 这里在页面最早期挂一个观察器，把该弹窗直接隐藏；不影响任何投屏功能与统计显示。
+var LATENCY_MUTE_JS = []byte(`
+(function(){
+  if (window.__aeLatMute) return; window.__aeLatMute = 1;
+  var PAT = "\u7f51\u7edc\u5ef6\u8fdf\u9ad8";
+  var hide = function(){
+    var lst = document.querySelectorAll("div,section");
+    for (var i=0;i<lst.length;i++){
+      var el = lst[i];
+      if (el.__aeLatHidden) continue;
+      var t = el.textContent || "";
+      if (t.length > 260 || t.indexOf(PAT) < 0) continue;
+      var box = el;
+      for (var k=0;k<3 && box.parentElement;k++) box = box.parentElement;
+      box.style.display = "none";
+      box.__aeLatHidden = 1; el.__aeLatHidden = 1;
+    }
+  };
+  try {
+    new MutationObserver(hide).observe(document.documentElement, {childList:true, subtree:true});
+  } catch(e) {}
+  setInterval(hide, 2000);
+})();
+`)
+
 func rewriteBody(body []byte, external bool) []byte {
 	if bytesContains(body, []byte("<head")) && !bytesContains(body, []byte("gw_logout")) {
 		js := append([]byte{}, RUNTIME_SHIM...)
@@ -713,6 +745,8 @@ func rewriteBody(body []byte, external bool) []byte {
 		}
 		js = append(js, GW_LOGOUT_JS...)
 		js = append(js, NAV_FIX_JS...)
+		// 3.9.9：屏蔽上游误报的「网络延迟高」弹窗（本架构下必然走 TURN 中继，属正常）
+		js = append(js, LATENCY_MUTE_JS...)
 		if external {
 			js = append(js, EXTERNAL_HELPER_JS...)
 		}
