@@ -30,6 +30,12 @@ RUN_USER="${TRIM_RUN_USERNAME:-docker-androidemu}"
 CT="androidemu-android"
 ART="$APP_DIR/hwenc/artifacts/android11-hidl"
 DAEMON_BIN="$APP_DIR/hwenc/bin/daemon"
+### 3.9.9：硬件解码为**独立可选档**。原有 daemon 是 HWDEC=0（只编码）编译的；
+### daemon-hwdec 是同一份源码加 -DHAVE_HWDEC、静态链精简 libavcodec 编出来的，
+### 由 GitHub Actions 生成。两者并存，默认仍用旧 daemon —— 硬解没验证出图之前，
+### 绝不替换现有编码链路。开启方式：hwenc_ctl.sh decode on。
+DAEMON_HWDEC="$APP_DIR/hwenc/bin/daemon-hwdec"
+DECODE_CONF="$VAR_DIR/hwenc.decode"
 LOG="$VAR_DIR/hwenc.log"
 STATUS="$VAR_DIR/hwenc.status"
 BK="$VAR_DIR/hwenc/backup"
@@ -188,6 +194,40 @@ else
 fi
 ' || { log "media_codecs.xml 登记失败"; return 1; }
 
+    ### 3.9.9：可选硬件解码。注入的 C2 VAAPI 服务本身已经实现了
+    ### c2.hardware.decoder.{h264,hevc,vp9}（二进制内可查），缺的只是 XML 声明；
+    ### 默认不写，只有 `decode on` 时才登记。声明上限取 1920x1088（与编码侧一致，
+    ### 大于此尺寸不会被选中，自动回落软件解码，避免误选导致黑屏）。
+    if [ "$(cat "$DECODE_CONF" 2>/dev/null | tr -d '\r\n')" = "on" ]; then
+        dex '
+set -e
+if ! grep -q "c2.hardware.decoder.h264" /vendor/etc/media_codecs.xml; then
+  cat > /data/local/tmp/hwdec-frag.xml <<"FRAG"
+        <MediaCodec name="c2.hardware.decoder.h264" type="video/avc">
+            <Limit name="size" min="32x32" max="1920x1088" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="c2.hardware.decoder.hevc" type="video/hevc">
+            <Limit name="size" min="32x32" max="1920x1088" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="c2.hardware.decoder.vp9" type="video/x-vnd.on2.vp9">
+            <Limit name="size" min="32x32" max="1920x1088" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+FRAG
+  sed -i "/<Decoders>/r /data/local/tmp/hwdec-frag.xml" /vendor/etc/media_codecs.xml
+fi
+' || { log "硬件解码器登记失败（保持编码链路不变）"; }
+        log "已登记 3 个硬件解码器（h264/hevc/vp9）"
+    fi
+
     ### dma_heap 权限：实测在 libion 未被替换的前提下，0444 也能正常分配（c2.android
     ### 多帧编码通过）。这里保留放宽为 666，仅为兼容部分内核/驱动组合，
     ### 不影响宿主，属容器内权限。容器重启后会恢复 0444，由 repair 重新放开。
@@ -210,6 +250,17 @@ daemon_start() {
     chmod 755 "$SHARED"
     rm -f "$SHARED/socket"
 
+    ### 硬解开启时换用带 HAVE_HWDEC 的 daemon；缺失该文件则保持旧 daemon 并打日志，
+    ### 不会因为一个可选组件没构建好就把编码链路弄坏。
+    _run_daemon="$DAEMON_BIN"
+    if [ "$(cat "$DECODE_CONF" 2>/dev/null | tr -d '\r\n')" = "on" ]; then
+        if [ -x "$DAEMON_HWDEC" ]; then
+            _run_daemon="$DAEMON_HWDEC"
+            log "硬件解码：已启用，使用 daemon-hwdec"
+        else
+            log "硬件解码：标记已开但缺少 daemon-hwdec，本次仍用只编码 daemon"
+        fi
+    fi
     cd "$APP_DIR/hwenc/bin" || return 1
     ### 3.9.9：显式指定 libva 驱动。实测 2026-11-09 daemon 继承了宿主环境里的
     ### LIBVA_DRIVER_NAME=nvidia，日志报「vaInitialize failed / No NVIDIA VA-API decode」。
@@ -221,10 +272,19 @@ daemon_start() {
         _drv=iHD
     fi
     ### setsid -f 彻底脱离会话，否则 SSH/回调结束时被回收（实测）
+    ### 上游 v0.2.0 release 明写：Intel 上默认 legacy 编码后端会产生畸形 P 帧，
+    ### 必须走 REDROID_FORGE_ENCODE_BACKEND=ffmpeg；AMD 用 ffmpeg 后端反而会 GPU hang。
+    ### ffmpeg 后端与硬解共用一个 HAVE_HWDEC 开关，所以只在 Intel + decode on 时启用。
+    _extra_env=""
+    if [ "$_run_daemon" = "$DAEMON_HWDEC" ] && { [ -d /sys/module/i915 ] || [ -d /sys/module/xe ]; }; then
+        _extra_env="REDROID_FORGE_ENCODE_BACKEND=ffmpeg"
+        log "检测到 Intel 显卡：同时启用 ffmpeg 编码后端（避开 legacy 的 P 帧畸形码流）"
+    fi
     setsid -f runuser -u "$RUN_USER" -- env \
         REDROID_FORGE_VAAPI_SOCKET="$SHARED/socket" \
         ${_drv:+LIBVA_DRIVER_NAME=$_drv} \
-        "$DAEMON_BIN" >> "$VAR_DIR/hwenc/daemon.log" 2>&1 < /dev/null
+        $_extra_env \
+        "$_run_daemon" >> "$VAR_DIR/hwenc/daemon.log" 2>&1 < /dev/null
     sleep 5
 
     pgrep -x daemon >/dev/null || { log "daemon 启动失败"; return 1; }
@@ -330,7 +390,7 @@ rm -f /vendor/etc/init/android.hardware.media.c2@1.1-vaapi-service.rc
 rm -f /vendor/etc/vintf/manifest/manifest_media_c2_vaapi.xml
 rm -f /vendor/etc/seccomp_policy/android.hardware.media.c2-vaapi-seccomp_policy
 rm -rf /dev/vaapi-helper /data/vaapi-helper
-rm -rf /data/local/tmp/hwenc-pkg /data/local/tmp/hwenc-frag.xml /data/local/tmp/hwenc-svc.log
+rm -rf /data/local/tmp/hwenc-pkg /data/local/tmp/hwenc-frag.xml /data/local/tmp/hwdec-frag.xml /data/local/tmp/hwenc-svc.log
 ' >/dev/null
     rm -rf "$SHARED"
 
@@ -525,14 +585,57 @@ do_status() {
         echo "dma_heap     : $(dex 'ls -l /dev/dma_heap/system 2>/dev/null | awk "{print \$1}"')"
         echo "HIDL default : $(dex 'lshal 2>/dev/null | grep -c "media.c2@1.1::IComponentStore/default"') 个"
         echo "硬件编码器   : $(dex 'dumpsys media.player 2>/dev/null | grep -c "c2.hardware.encoder.h264"') 处"
+        echo "硬件解码器   : $(dex 'dumpsys media.player 2>/dev/null | grep -c "c2.hardware.decoder"') 处"
     fi
+    echo "硬件解码开关 : $(cat "$DECODE_CONF" 2>/dev/null || echo 'off（默认）')"
+    echo "hwdec daemon : $([ -x "$DAEMON_HWDEC" ] && echo 已安装 || echo '未安装（先在 CI 构建）')"
     echo "daemon 进程  : $(pgrep -x daemon >/dev/null && echo 运行中 || echo 未运行)"
     echo "daemon 用户  : $(pgrep -x daemon >/dev/null && ps -o user= -p "$(pgrep -x daemon | head -1)" | tr -d ' ' || echo -)"
     echo "日志         : $LOG"
 }
 
+### ---------------------------------------------------------------------------
+### 硬件解码开关（3.9.9，默认关闭）
+### 必须成对待办：①换 daemon ②登记/撤销 Decoders 声明 ③重启媒体栈。
+### 走 disable→enable 是为了让 media_codecs.xml 回到 orig 再按新标记重建，
+### 避免只删本脚本加的条目时误伤镜像原有内容。
+### ---------------------------------------------------------------------------
+do_decode() {
+    local act="${1:-status}"
+    case "$act" in
+        on)
+            if [ ! -x "$DAEMON_HWDEC" ]; then
+                echo "硬件解码不可用：缺少 $DAEMON_HWDEC（需先用 CI 构建该二进制）"
+                return 1
+            fi
+            if ! detect; then
+                echo "宿主 VA-API 检测未通过（$_WHY），硬解通常也不可用；开关未改动"
+                return 1
+            fi
+            echo on > "$DECODE_CONF" || return 1
+            log "硬件解码开关：on（h264 / hevc / vp9）"
+            ;;
+        off)
+            echo off > "$DECODE_CONF" || return 1
+            log "硬件解码开关：off（回到纯硬编 + 软解）"
+            ;;
+        status|*)
+            echo "硬件解码：$(cat "$DECODE_CONF" 2>/dev/null || echo off)   daemon-hwdec：$([ -x "$DAEMON_HWDEC" ] && echo 已安装 || echo 未安装)"
+            return 0
+            ;;
+    esac
+    if [ "$(cat "$STATUS" 2>/dev/null)" = "enabled" ]; then
+        do_disable
+        do_enable || { log "按新开关重新启用失败，已回退到软件编解码"; return 1; }
+        echo "已生效。用 $0 status 查看硬件解码器数量"
+    else
+        echo "已记录，当前硬件编码未启用；下次 enable 时生效"
+    fi
+}
+
 case "${1:-status}" in
     status)  do_status ;;
+    decode)  do_decode "${2:-status}" ;;
     enable)  do_enable ;;
     disable) do_disable ;;
     repair)  do_repair ;;

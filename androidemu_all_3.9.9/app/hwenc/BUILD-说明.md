@@ -13,8 +13,14 @@ Codec2 组件通过 AF_UNIX 套接字（`/dev/vaapi-helper/socket`）把画面 d
 上游已真机验证：
 - **硬件编码**：scrcpy 经正式框架路径录制硬件 H.264，在 AMD Renoir、AMD RX 480、
   Intel Iris Xe 三台真机全流水线通过；
-- **硬件解码（仅 NVIDIA）**：NVDEC 经 VA-API，GTX 1050 Ti 与软解逐位一致；
-- **Intel / AMD 的解码后端尚未实现**。
+- **硬件解码（v0.2.0 / 5.15）**：`hwdec.c` 走 libavcodec + VA-API，AMD/Intel 通用，
+  向 Android 侧提供 h264/hevc/vp9 解码，能力不足时由调用方回落软件解码；
+- **硬件解码（Tier 7）**：NVDEC 经 VA-API，GTX 1050 Ti 与软解逐位一致（NVIDIA 专用路径）。
+
+> **3.9.9 更正**：本文件早期写的是「Intel/AMD 的解码后端尚未实现」，那是 v0.1.0
+> 的结论，v0.2.0 已经补上。能力在源码里，但**必须用 `make HWDEC=1` 编译 daemon**
+> 才会带进去（`HWDEC ?= 0` 是默认值）；且 `media_codecs.xml` 要登记 `<Decoders>`。
+> 本包此前发布时两点都没做，所以实际只跑硬编 —— 详见 `scripts/hwenc_ctl.sh decode`。
 
 ## 二、目录内容
 
@@ -59,6 +65,42 @@ make HWDEC=1    # 额外编入 ffmpeg 后端（Intel 必须）
 **Intel 必须用 ffmpeg 后端**，否则码流畸形、ffprobe 每帧报 `Overread SPS by 3 bits`：
 编译 `make HWDEC=1` + 运行 `REDROID_FORGE_ENCODE_BACKEND=ffmpeg`。
 **AMD 一律用 legacy**（Polaris 用 ffmpeg 后端会 GPU hang）。
+
+### 3.9.9 实际交付状态（重要）
+
+本包里长期只放了 `make`（`HWDEC=0`）编出来的 `bin/daemon`，所以：
+- 只跑硬编，v0.2.0 的 5.15 通用硬解（`hwdec.c`）没编进去；
+- Intel 机器仍在用 legacy 后端，正是上面那段「码流畸形」的场景，也是
+  部分机器投屏卡顿的成因之一。
+
+现在改为**两个二进制并存**，默认行为完全不变：
+
+| 文件 | 编译方式 | 用途 |
+|---|---|---|
+| `bin/daemon` | `make`（HWDEC=0） | 默认，纯硬编，AMD 用 |
+| `bin/daemon-hwdec` | `-DHAVE_HWDEC`，链 libavcodec/libavutil | `hwenc_ctl.sh decode on` 时启用，带硬解；Intel 同时自动切 ffmpeg 编码后端 |
+
+`daemon-hwdec` 在 Debian 12（fnOS 同一用户态）上编译，命令：
+
+```sh
+apt-get download libavcodec-dev libavutil-dev libgbm-dev   # 不要 root
+for d in *.deb; do dpkg-deb -x "$d" sysroot; done
+gcc -O2 -Wall -D_FORTIFY_SOURCE=0 -DHAVE_HWDEC \
+    -DAV_PROFILE_H264_CONSTRAINED_BASELINE=FF_PROFILE_H264_CONSTRAINED_BASELINE \
+    -Isysroot/usr/include/x86_64-linux-gnu -Isysroot/usr/include \
+    $(pkg-config --cflags libdrm) \
+    -o daemon-hwdec daemon.c decode_h264.c hwdec.c ffmpeg_encode.c \
+    -lavcodec -lavutil -lva -lva-drm -lgbm -lEGL -ldl -lm -lpthread
+```
+
+`AV_PROFILE_*` 那个宏是 FFmpeg 7 → Debian 12 的 FFmpeg 5.1 兼容桥接。
+产物 72KB，动态依赖 libavcodec.so.59 / libavutil.so.57（fnOS 系统自带，实测 0 未解析）。
+静态链需要额外补大量 `-dev` 符号链接，收益不大，未采用。
+
+`decode on` 会在 `media_codecs.xml` 的 `<Decoders>` 登记
+`c2.hardware.decoder.{h264,hevc,vp9}`（组件二进制里本来就有），
+`decode off` 走 disable→enable 还原。**默认关闭**：硬解接错会黑屏/花屏，
+必须在有可用 VA-API 的机器上验证出图后才能建议用户开启。
 
 ## 五、实测数据（2026-11-09，AMD A8-7500 / Kaveri / VCE 2.0 / Android 12）
 
