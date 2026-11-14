@@ -138,6 +138,9 @@ services:
       # external-ip，浏览器才能拿到可直达的 TURN 中继候选；不能再用容器内自动探测
       #（bridge 下 hostname -I 是容器 IP，浏览器不可达）。
       - PUBLIC_IP=${ANDROIDEMU_HOST_IP:-127.0.0.1}
+      # 3.9.9：多网卡时把全部局域网地址逗号分隔写在这里，客户端逐个尝试、自动落到同网段。
+      # 留空 = 只用上面的 PUBLIC_IP，与旧版一致。
+      - PUBLIC_IPS=${ANDROIDEMU_HOST_IPS:-}
       - USE_TLS=false
       # 3.9.4：TURN 中继凭据改为可覆盖（原先 5 处写死上游默认值 cloudphone_secure_password，
       #   该默认值在上游公开文档里就能查到，而 3478 对外监听、/api/ice_servers 又直接回显，
