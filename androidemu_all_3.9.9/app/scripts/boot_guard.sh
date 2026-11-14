@@ -299,6 +299,34 @@ pkg_files_fresh(){
 }
 
 once(){
+    ### 3.9.9-r14：清掉 redroid 镜像里被拉成常驻 root 的 bugreport 服务。
+    ### AOSP 的 /system/etc/init/dumpstate.rc 里 dumpstate / dumpstatez / bugreportd
+    ### 都是 disabled + oneshot（按需由 ctl.start 触发），但 redroid 镜像开机把它们
+    ### 拉成 running，容器内 ps 平白多 3 条 uid0 常驻进程（实测 2026-11-14）。
+    ### 只做运行时 stop：不删文件、不改 rc、不影响任何业务功能；需要 bugreport 时
+    ### 仍可 ctl.start 手动触发。实测 stop 后 30 秒未被 init 重新拉起，
+    ### boot_completed / agent / launcher / 入口 HTTP 均正常。
+    ### 按容器 boot id 去重：容器重建后 init 会重新拉起，标记失效即自动再清一次。
+    _ds_boot="$(docker exec -u 0 "$C" sh -c 'getprop ro.boottime.init' 2>/dev/null | tr -d '\r\n')"
+    if [ -n "$_ds_boot" ]; then
+        _ds_mark="$VAR_DIR/.dumpstate_stopped"
+        _ds_done="$(cat "$_ds_mark" 2>/dev/null || echo '')"
+        if [ "$_ds_done" != "$_ds_boot" ]; then
+            _ds_state="$(docker exec -u 0 "$C" sh -c '
+stop dumpstate 2>/dev/null; stop dumpstatez 2>/dev/null; stop bugreportd 2>/dev/null
+sleep 1
+echo "$(getprop init.svc.dumpstate)/$(getprop init.svc.dumpstatez)/$(getprop init.svc.bugreportd)"
+' 2>/dev/null | tr -d '\r\n')"
+            case "${_ds_state:-}" in
+                stopped/stopped/stopped)
+                    echo "$_ds_boot" > "$_ds_mark" 2>/dev/null || true
+                    log "容器内 bugreport 常驻服务已停（dumpstate/dumpstatez/bugreportd），减少 3 条 uid0 进程"
+                    ;;
+                *)  log "bugreport 服务停止未完全生效（${_ds_state:-无返回}），下轮重试" ;;
+            esac
+        fi
+    fi
+
     ### 3.9.9：分辨率 16 对齐护栏（花屏兜底，与浏览器软/硬解无关）。
     ### 必须放在「升级/重装静默窗口」之前：那 300 秒里整轮容器巡检会跳过，
     ### 而分辨率如果被前端/用户改成非 16 对齐，这 5 分钟就会一直花屏。
