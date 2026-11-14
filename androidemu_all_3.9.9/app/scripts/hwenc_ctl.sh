@@ -1,6 +1,7 @@
 #!/bin/bash
-### 3.9.9-r2：补齐 /usr/sbin（runuser 所在目录），避免飞牛回调/看护 PATH 缺失时
-### "setsid -f runuser" 报 No such file or directory，硬编 daemon 起不来。
+### 补齐系统目录，避免飞牛回调/看护 PATH 缺失时找不到系统命令。
+### 3.9.9-r12 起硬编 daemon 用 setpriv（exec 语义）降权，不再依赖 /usr/sbin/runuser；
+### 本段 PATH 补齐保留给其余脚本命令使用。
 case ":${PATH:-}:" in
     *:/usr/sbin:*) ;;
     *) export PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}:/usr/sbin:/sbin" ;;
@@ -38,6 +39,8 @@ DAEMON_HWDEC="$APP_DIR/hwenc/bin/daemon-hwdec"
 DECODE_CONF="$VAR_DIR/hwenc.decode"
 LOG="$VAR_DIR/hwenc.log"
 STATUS="$VAR_DIR/hwenc.status"
+### 3.9.9-r12：检测失败时把「可直接执行的修复办法」落盘，供状态页/排障读取。
+HINT="$VAR_DIR/hwenc.hint"
 BK="$VAR_DIR/hwenc/backup"
 ### 3.9.9：共享目录必须按「容器 /data 的真实挂载点」推导，不能写死路径。
 ### 实测 2026-11-09：容器 /data 绑的是 /vol1/@appdata/androidemu/vol-data/androidemu-data，
@@ -64,12 +67,21 @@ log() {
 
 dex() { docker exec "$CT" sh -c "$1" 2>/dev/null; }
 
+### 3.9.9-r12：按实际运行的二进制名查 daemon（daemon / daemon-hwdec）。
+### 旧代码写死 pgrep -x daemon，开硬解后进程名是 daemon-hwdec，会漏判并误报
+### 「daemon 启动失败」→ 整个 enable 被回退，硬解链路起不来。
+daemon_pids() {
+    pgrep -x daemon 2>/dev/null
+    pgrep -x daemon-hwdec 2>/dev/null
+}
+
 ### ---------------------------------------------------------------------------
 ### 能力检测：输出原因，返回 0=可用 1=不可用
 ### ---------------------------------------------------------------------------
 detect() {
     _ARCH=$(uname -m 2>/dev/null)
     _WHY=""
+    _HINT=""
 
     if [ "$_ARCH" != "x86_64" ]; then
         _WHY="架构 $_ARCH 无预编译产物（本组件仅 x86_64）"
@@ -83,6 +95,15 @@ detect() {
 
     if ! vainfo >/dev/null 2>&1; then
         _WHY="vainfo 执行失败，VA-API 不可用"
+        ### 3.9.9-r12：最常见的原因是包用户不在 video/render 组，打不开
+        ### /dev/dri/card0(root:video 660) 与 renderD128(root:render 660)。
+        ### 飞牛只在「创建应用用户」时应用 config/privilege 的 join-groups，
+        ### 已安装的应用升级不会自动补组 —— 给出可直接执行的修复命令，
+        ### 否则用户只会看到一个 unsupported，不知道该干什么。
+        if [ -d /dev/dri ] && ! id -nG "$RUN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx 'render'; then
+            _WHY="vainfo 执行失败：运行用户 $RUN_USER 不在 render/video 组，打不开 /dev/dri/renderD*（GPU 设备权限未授予）"
+            _HINT="以 root 执行：gpasswd -a $RUN_USER video && gpasswd -a $RUN_USER render ；然后重启 NAS（或彻底重启本应用的全部常驻进程），让所有进程重新读取用户组，再执行 $0 enable。新装应用会自动获得这两个组；已安装的应用仅升级程序包不会自动补组。"
+        fi
         return 1
     fi
 
@@ -244,11 +265,30 @@ fi
 ### ---------------------------------------------------------------------------
 daemon_start() {
     pkill -x daemon >/dev/null 2>&1
+    pkill -x daemon-hwdec >/dev/null 2>&1
     sleep 1
-    mkdir -p "$SHARED"
-    chown "$RUN_USER" "$SHARED" >/dev/null 2>&1
-    chmod 755 "$SHARED"
-    rm -f "$SHARED/socket"
+    ### 3.9.9-r12：$SHARED 位于容器 /data 的宿主挂载点，该目录常由容器 uid0 创建，
+    ### 属主不是包用户（实测 lin3869:Administrators，权限 771），包用户在里面
+    ### mkdir 会 Permission denied —— 之前只在 root 手跑 enable 才成功，应用自身的
+    ### 包用户回调会卡在这里，硬编永远起不来。用一次性的 docker exec -u 0 在容器内
+    ### 创建并改成包用户属主（不产生任何常驻 root 进程）。
+    if ! mkdir -p "$SHARED" 2>/dev/null; then
+        local _muid _mgid
+        _muid=$(id -u "$RUN_USER" 2>/dev/null) || { log "无法解析运行用户 $RUN_USER"; return 1; }
+        _mgid=$(id -g "$RUN_USER" 2>/dev/null) || _mgid="$_muid"
+        dex "mkdir -p /data/vaapi-helper && chown $_muid:$_mgid /data/vaapi-helper && chmod 755 /data/vaapi-helper" >/dev/null 2>&1 \
+            || { log "共享目录创建失败：$SHARED"; return 1; }
+    fi
+    chown "$RUN_USER" "$SHARED" 2>/dev/null || true
+    chmod 755 "$SHARED" 2>/dev/null || true
+    rm -f "$SHARED/socket" 2>/dev/null || true
+    ### 日志文件若被早先的 root 操作留下 root 属主，包用户无法追加；
+    ### 退回同目录的可写文件名，避免 daemon 启动被日志重定向打断。
+    local _dlog="$VAR_DIR/hwenc/daemon.log"
+    if [ ! -w "$_dlog" ]; then
+        _dlog="$VAR_DIR/hwenc-daemon.log"
+        : > "$_dlog" 2>/dev/null || _dlog=/dev/null
+    fi
 
     ### 硬解开启时换用带 HAVE_HWDEC 的 daemon；缺失该文件则保持旧 daemon 并打日志，
     ### 不会因为一个可选组件没构建好就把编码链路弄坏。
@@ -280,16 +320,37 @@ daemon_start() {
         _extra_env="REDROID_FORGE_ENCODE_BACKEND=ffmpeg"
         log "检测到 Intel 显卡：同时启用 ffmpeg 编码后端（避开 legacy 的 P 帧畸形码流）"
     fi
-    setsid -f runuser -u "$RUN_USER" -- env \
+    ### 3.9.9-r12：绝不留下 root 常驻父进程。
+    ### · 应用回调本身就是包用户 → 直接 exec，无需降权（在非 root 下调 setpriv
+    ###   --init-groups 需要 setgroups() 权限，会直接失败，实测踩过）；
+    ### · 以 root 手工执行时 → 用 setpriv(exec 语义) 降权，不用 runuser
+    ###   （runuser 会 fork 并 wait，留下一个 root 父进程，宿主 ps 可见）。
+    local _uid _gid _sp="" _c
+    _uid=$(id -u "$RUN_USER" 2>/dev/null) || { log "无法解析运行用户 $RUN_USER"; return 1; }
+    _gid=$(id -g "$RUN_USER" 2>/dev/null) || _gid="$_uid"
+    local -a _launcher
+    if [ "$(id -u)" = "$_uid" ]; then
+        _launcher=(setsid -f env)
+        log "当前已是 $RUN_USER，daemon 直接以该身份启动（不降权、不新增 root）"
+    else
+        for _c in /usr/bin/setpriv /bin/setpriv /usr/sbin/setpriv; do
+            [ -x "$_c" ] && { _sp="$_c"; break; }
+        done
+        [ -n "$_sp" ] || { log "缺少 setpriv，无法以非 root 方式启动 daemon（拒绝回退到 root 父进程）"; return 1; }
+        ### --init-groups 按 /etc/group 初始化附加组（video/render），否则补了组
+        ### 但降权后的进程仍打不开 /dev/dri/renderD*。
+        _launcher=(setsid -f "$_sp" --reuid "$_uid" --regid "$_gid" --init-groups env)
+    fi
+    "${_launcher[@]}" \
         REDROID_FORGE_VAAPI_SOCKET="$SHARED/socket" \
         ${_drv:+LIBVA_DRIVER_NAME=$_drv} \
         $_extra_env \
-        "$_run_daemon" >> "$VAR_DIR/hwenc/daemon.log" 2>&1 < /dev/null
+        "$_run_daemon" >> "$_dlog" 2>&1 < /dev/null
     sleep 5
 
-    pgrep -x daemon >/dev/null || { log "daemon 启动失败"; return 1; }
+    [ -n "$(daemon_pids | head -1)" ] || { log "daemon 启动失败"; return 1; }
     [ -S "$SHARED/socket" ] || { log "daemon socket 未创建"; return 1; }
-    log "daemon 已启动（用户 $(ps -o user= -p "$(pgrep -x daemon | head -1)" | tr -d ' ')）"
+    log "daemon 已启动（用户 $(ps -o user= -p "$(daemon_pids | head -1)" | tr -d ' ')）"
     return 0
 }
 
@@ -297,15 +358,39 @@ daemon_start() {
 ### HIDL 服务启动
 ### ---------------------------------------------------------------------------
 service_start() {
+    ### 3.9.9-r12：C2 HAL 绝不能以 uid0 常驻（宿主 ps 会多一条 root）。
+    ### 上游 rc 声明 user mediacodec(1046) / group camera(1006) mediadrm(1031)
+    ### drmrpc(1026)，但 rc 是容器启动后才注入 /vendor/etc/init 的，Android init
+    ### 不会动态重读 —— 实测 ctl.start 报 "Failed to set property"，服务卡在
+    ### restarting。所以由宿主 docker exec 直接按同一套 uid/gid 启动。
+    ### 注意：本函数的 stdout 只用于返回 lshal 实例数，所有日志必须走 stderr。
     dex '
-for p in $(ps -A -o PID,NAME 2>/dev/null | awk "\$2 ~ /vaapi/ {print \$1}"); do kill -9 $p 2>/dev/null; done
+for p in $(ps -A -o PID,NAME 2>/dev/null | awk "\$2 ~ /vaapi-service/ {print \$1}"); do kill -9 $p 2>/dev/null; done
 rm -rf /dev/vaapi-helper
 ln -sfn /data/vaapi-helper /dev/vaapi-helper
-sleep 1
-export LD_LIBRARY_PATH=/vendor/lib64:/system/lib64
-setsid /vendor/bin/hw/android.hardware.media.c2@1.1-vaapi-service >/data/local/tmp/hwenc-svc.log 2>&1 </dev/null &
-sleep 5
-' 
+' >/dev/null 2>&1
+    ### 日志文件可能由早先的 root 启动留下 root 属主，mediacodec 写不进去会立刻退出。
+    dex 'rm -f /data/local/tmp/hwenc-svc.log; touch /data/local/tmp/hwenc-svc.log; chmod 666 /data/local/tmp/hwenc-svc.log' >/dev/null 2>&1
+    ### --group-add 是 docker run 的选项，docker exec 不支持（传了会直接报 unknown flag，
+    ### 之前把 stderr 吞掉导致服务根本没启动却查不到原因）。这里只指定 uid/gid，
+    ### 需要访问的设备节点由 gpu_release.sh 放权为 666，mediacodec 可直接打开。
+    local _dexerr
+    _dexerr=$(docker exec -d -u 1046:1046 \
+        "$CT" sh -c \
+        'LD_LIBRARY_PATH=/vendor/lib64:/system/lib64 exec /vendor/bin/hw/android.hardware.media.c2@1.1-vaapi-service >/data/local/tmp/hwenc-svc.log 2>&1' 2>&1) || true
+    [ -n "$_dexerr" ] && log "docker exec 启动 C2 返回：$_dexerr" >&2
+    sleep 6
+    local _uid
+    _uid=$(dex 'ps -A -o USER,NAME 2>/dev/null | awk "\$2 ~ /vaapi-service/ {print \$1; exit}"' | tr -d '\r\n')
+    if [ -z "$_uid" ]; then
+        log "C2 HAL 未启动，服务日志：$(dex 'tail -12 /data/local/tmp/hwenc-svc.log 2>/dev/null' | tr '\n' ' ')" >&2
+    fi
+    ### 硬约束：C2 HAL 绝不能以 root 常驻。宁可让 enable 失败回退，也不新增 root。
+    case "${_uid:-}" in
+        "")     log "C2 HAL 未启动，拒绝继续（不新增 root）" >&2; echo 0; return 1 ;;
+        root|0) log "C2 HAL 以 root 运行，拒绝继续（不新增 root）" >&2; echo 0; return 1 ;;
+        *)      log "C2 HAL 运行身份：$_uid（非 root）" >&2 ;;
+    esac
     dex 'lshal 2>/dev/null | grep -c "media.c2@1.1::IComponentStore/default"'
 }
 
@@ -375,6 +460,7 @@ setprop debug.stagefright.c2software 1
 for p in $(ps -A -o PID,NAME 2>/dev/null | awk "\$2 ~ /vaapi/ {print \$1}"); do kill -9 $p 2>/dev/null; done
 ' >/dev/null
     pkill -x daemon >/dev/null 2>&1
+    pkill -x daemon-hwdec >/dev/null 2>&1
 
     ### 3) 撤注入（只删我们加的东西）
     dex '
@@ -415,9 +501,18 @@ do_enable() {
     if ! detect; then
         log "前置检测未通过：$_WHY"
         echo "unsupported" > "$STATUS"
+        ### 3.9.9-r12：把可执行的修复办法落盘，状态页与排障时直接可见。
+        if [ -n "${_HINT:-}" ]; then
+            printf '%s\n' "$_HINT" > "$HINT"
+            log "修复提示：$_HINT"
+            echo "修复提示：$_HINT"
+        else
+            rm -f "$HINT"
+        fi
         echo "$_WHY"
         return 1
     fi
+    rm -f "$HINT"
     log "检测通过：$_ARCH / $_GPU / ${_ENC} 个编码入口"
     [ -n "${_WARN_RADEON:-}" ] && log "注意：$_WARN_RADEON；手机/平板分辨率会退回软件编码"
 
@@ -451,6 +546,7 @@ do_enable() {
         return 1
     fi
 
+    rm -f "$HINT"
     echo "enabled" > "$STATUS"
     log "启用成功：≤1920x1088 走硬件编码，更高分辨率退回软件编码"
     ### 立刻按当前实际分辨率校准一次（避免启用时正处在手机/平板分辨率而错选硬件编码器）
@@ -476,7 +572,7 @@ do_repair() {
 
     [ "$(dex 'ls /vendor/bin/hw/android.hardware.media.c2@1.1-vaapi-service 2>/dev/null | wc -l')" -lt 1 ] && need=1
     [ "$(dex 'grep -c "c2.hardware.encoder.h264" /vendor/etc/media_codecs.xml 2>/dev/null')" -lt 1 ] && need=1
-    pgrep -x daemon >/dev/null || need=1
+    [ -n "$(daemon_pids | head -1)" ] || need=1
     [ "$(dex 'lshal 2>/dev/null | grep -c "media.c2@1.1::IComponentStore/default"')" -lt 1 ] && need=1
     [ "$(dex 'getprop debug.stagefright.ccodec')" != "$want" ] && need=1
 
@@ -579,6 +675,7 @@ do_status() {
         [ -n "${_WARN_RADEON:-}" ] && echo "限制         : $_WARN_RADEON"
     else
         echo "能力检测     : 未通过 —— $_WHY"
+        [ -f "$HINT" ] && echo "修复提示     : $(cat "$HINT")"
     fi
     if docker inspect "$CT" >/dev/null 2>&1; then
         echo "容器 ccodec  : $(dex 'getprop debug.stagefright.ccodec')   (0=OMX软件 4=Codec2)"
@@ -589,8 +686,8 @@ do_status() {
     fi
     echo "硬件解码开关 : $(cat "$DECODE_CONF" 2>/dev/null || echo 'off（默认）')"
     echo "hwdec daemon : $([ -x "$DAEMON_HWDEC" ] && echo 已安装 || echo '未安装（先在 CI 构建）')"
-    echo "daemon 进程  : $(pgrep -x daemon >/dev/null && echo 运行中 || echo 未运行)"
-    echo "daemon 用户  : $(pgrep -x daemon >/dev/null && ps -o user= -p "$(pgrep -x daemon | head -1)" | tr -d ' ' || echo -)"
+    echo "daemon 进程  : $([ -n "$(daemon_pids | head -1)" ] && echo 运行中 || echo 未运行)"
+    echo "daemon 用户  : $([ -n "$(daemon_pids | head -1)" ] && ps -o user= -p "$(daemon_pids | head -1)" | tr -d ' ' || echo -)"
     echo "日志         : $LOG"
 }
 
@@ -610,6 +707,7 @@ do_decode() {
             fi
             if ! detect; then
                 echo "宿主 VA-API 检测未通过（$_WHY），硬解通常也不可用；开关未改动"
+                [ -n "${_HINT:-}" ] && echo "修复提示：$_HINT"
                 return 1
             fi
             echo on > "$DECODE_CONF" || return 1
