@@ -878,6 +878,34 @@ supervise_loop(){
     _down_max="${BG_DOWN_SECS:-300}"
     _dormant=0
     while :; do
+        ### 3.9.9：局域网地址漂移自愈（实测 2026-11-14，群友多网卡机器）。
+        ### 有线+无线双网卡时，换网/DHCP 变址后 compose 里的 PUBLIC_IP 仍是旧网段地址：
+        ### 客户端能连 3478（监听 0.0.0.0），但拿到的中继地址不可达 →
+        ### agent.log 表现为「连上 30 秒后 ICE failed」，turnserver 报 allocation timeout。
+        ### 判据从严：仅当 ① 模式为 lan ② 旧值是私有地址 ③ 该地址已不在本机任何网卡上
+        ### 才判定为残留并重放；每小时最多一次，避免反复重建容器打断投屏。
+        _ipf="$VAR_DIR/.ipdrift_fix"
+        _ipl=0
+        [ -f "$_ipf" ] && _ipl=$(cat "$_ipf" 2>/dev/null || echo 0)
+        case "${_ipl:-0}" in ''|*[!0-9]*) _ipl=0 ;; esac
+        if [ $(( $(date +%s) - _ipl )) -ge 3600 ]; then
+            _mode_now="$(sed -n 's/^MODE=//p' "$VAR_DIR/net.conf" 2>/dev/null | head -n1)"
+            _pub_ip="$(sed -n 's/^[[:space:]]*-[[:space:]]*PUBLIC_IP=//p' "$APP_DIR/docker/docker-compose.yaml" 2>/dev/null | head -n1 | tr -d ' \r')"
+            _cur_ip="$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+            [ -z "$_cur_ip" ] && _cur_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+            if [ "$_mode_now" = "lan" ] && [ -n "$_pub_ip" ] && [ -n "$_cur_ip" ] && [ "$_pub_ip" != "$_cur_ip" ]; then
+                case "$_pub_ip" in
+                    10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*)
+                        if ! ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qx "$_pub_ip"; then
+                            log "局域网地址漂移：compose 的 PUBLIC_IP=$_pub_ip 已不在本机网卡上，当前为 $_cur_ip → 按当前地址重放 lan 模式"
+                            echo "$(date +%s)" > "$_ipf" 2>/dev/null || true
+                            TRIM_PKGVAR="$VAR_DIR" TRIM_APPDEST="$APP_DIR" bash "$APP_DIR/scripts/net_mode.sh" lan >>"$LOG" 2>&1 || true
+                        fi
+                        ;;
+                esac
+            fi
+        fi
+
         ### 3.9.8：每轮清掉 compose 重建残留的临时容器（<12位hex>_androidemu-*）。
         ### 这类容器停在 Created，不占端口，但会让用户看到「多个同名前缀容器」；
         ### 一旦被拉起就会抢 8443 与 agent 连接（官方与群友都截过图反馈）。
