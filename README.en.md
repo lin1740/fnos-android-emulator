@@ -736,7 +736,7 @@ Most utility, productivity, media and system apps (x86-native or regular ARM tra
 
 This app passes the host GPU's **graphics** capabilities into the Android container (GPU host mode: `/dev/dri` device passthrough + shared host mesa/driver stack), choosing the route per platform and falling back when unsupported — no user intervention needed.
 
-> **Video HW encode/decode is not available today**: the subsection below records host-side capability findings and a possible future route; it does not mean this app enables hardware video codecs. Current releases do all video playback and streaming encode in software. `app/hwenc/` contains upstream reference source only, not compiled and not started.
+> **Hardware video encoding is available; hardware decoding is still not.** Since 3.9.9 the package ships hardware video encoding, enabled by default and switchable off in the install wizard: on supported driver families the host GPU encodes the stream, and it falls back to software automatically when the driver is unsupported or the frame exceeds the encoder's size limit, so an unusable encoder never breaks the picture. **Hardware decoding** remains unavailable: the redroid image has no decode HAL, so playback stays on software codecs.
 
 ### 1. Video HW decode/encode (three-layer architecture)
 
@@ -744,9 +744,9 @@ This app passes the host GPU's **graphics** capabilities into the Android contai
 In-container player/app -> C2 plugin (forwarding) -> Host daemon (VAAPI/NVDEC) -> GPU hardware
 ```
 
-- **Host daemon** (designed, not enabled): talks to hardware via standard VAAPI (Intel iHD/i965, AMD radeonsi/r600) and a dedicated NVIDIA route (NVDEC/NVENC + nvidia-vaapi-driver); source ships in the package but is not built and does not run;
-- **In-container C2 plugin** (not built): designed as a pure forwarding layer, GPU-brand agnostic; it needs a Codec2 component built on the AOSP side, not just a device node;
-- **Auto-detection** (not implemented): would probe encode (EncSlice/EncPicture) and decode (H264 VLD) with vainfo and fall back to software codecs when unsupported.
+- **Host encode daemon** (shipped since 3.9.9): bundled and started on demand; it reaches the host GPU over standard VAAPI (Intel iHD/i965, AMD radeonsi/r600) and turns in-container encode requests into GPU work. Can be disabled in the install wizard;
+- **Automatic capability probing** (implemented): `hwenc_ctl.sh` reads encode capability from vainfo and stays on software encoding when the driver family is unsupported or the frame exceeds the encoder limit, so a failed hardware encode never causes a black or garbled picture;
+- **In-container decode component** (not provided): decoding needs a Codec2 decoder inside the image, which the official redroid image does not include; this layer is not implemented and playback remains software-decoded.
 
 **Host-side capability assessment** (from driver behaviour and upstream real-hardware runs — **not a feature this app currently ships**):
 
@@ -762,7 +762,7 @@ In-container player/app -> C2 plugin (forwarding) -> Host daemon (VAAPI/NVDEC) -
 | NVIDIA (NVDEC/NVENC, GTX 10-series+) | ✅ | ✅ | 1050 Ti verified upstream; full userland driver stack mounted since 3.8.9 |
 | ARM Mali (Panfrost) | V4L2 route (in progress) | upstream pending | graphics rendering tested ✅ |
 
-> The above describes what the host GPU itself can do. The in-container plugin has not been built, so all video currently runs in software — playback still works, only CPU usage is higher. Whether this lands depends on the upstream Codec2 component and the GPU's encode capability; no schedule is set.
+> The above describes what the host GPU itself can do. **Video encoding** has been handled by the host daemon since 3.9.9 (enabled by default); **video decoding** is still software — the container has no decode HAL, which costs CPU but does not affect playback.
 
 ### 2. Audio path (no hardware acceleration needed)
 
