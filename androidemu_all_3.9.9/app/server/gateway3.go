@@ -104,6 +104,15 @@ func rewriteLocation(lines []string, rc int) []string {
 func handleRequest(conn net.Conn) {
 	uErr := interface{}(nil)
 	defer conn.Close()
+	// 3.9.9：单个请求内部一旦 panic（畸形报文、对端半关闭、WS 收尾竞态），
+	// goroutine 里的 panic 会直接终止整个网关进程 —— 表现就是所有连接同时断、
+	// 随后飞牛网关一直 Bad Gateway，而投屏画面（已建立的 WebRTC）照旧在跑。
+	// 这里把异常隔离在单个连接内，宁可丢一个连接也不让整进程退出。
+	defer func() {
+		if r := recover(); r != nil {
+			logf("请求处理异常（已隔离，网关继续服务）：%v", r)
+		}
+	}()
 	br := bufio.NewReaderSize(conn, 64*1024)
 	reqLines, err := readHeadLines(br, 200)
 	uErr = err
@@ -495,6 +504,22 @@ var srvMu sync.Mutex
 var srvListener net.Listener
 var srvAlive bool
 
+// srvSockIno 记录本进程监听 fd 对应的 app.sock inode。
+// 只靠 probeOnce() 判断健康是不够的：若另一个守护把 app.sock 删掉重绑，
+// 本进程的 probeOnce() 会连到「别人的 socket」并拿到 200，于是误判自己健康、
+// 永不重建入口，飞牛网关就一直在跟一个无名 inode 说话 —— 表现即 Bad Gateway。
+var srvSockIno uint64
+
+func statIno(st os.FileInfo) uint64 {
+	if st == nil {
+		return 0
+	}
+	if s, ok := st.Sys().(*syscall.Stat_t); ok {
+		return s.Ino
+	}
+	return 0
+}
+
 func serverAlive() bool {
 	srvMu.Lock()
 	defer srvMu.Unlock()
@@ -512,6 +537,11 @@ func startServerThread() bool {
 	}
 	srvListener = l
 	srvAlive = true
+	// 记下本次绑定后 app.sock 的 inode，用于后续判断「这个入口还是不是我的」。
+	srvSockIno = 0
+	if st, err := os.Stat(SOCK_PATH); err == nil {
+		srvSockIno = statIno(st)
+	}
 	os.WriteFile(CHILD_PID, []byte(strconv.Itoa(os.Getpid())), 0644)
 	os.WriteFile(VER_FILE, []byte(VERSION), 0644)
 	logf("代理已监听 %s -> %s:%d tls=%s prefix=%s 版本=%s（守护进程内 goroutine）",
@@ -621,10 +651,23 @@ func containsInt(list []int, v int) bool {
 
 func supervise() {
 	dropPrivileges()
-	lock, err := os.OpenFile(LOCK_FILE, os.O_CREATE|os.O_WRONLY, 0644)
-	if err == nil {
+	// 单实例锁。3.9.9 修复（实测 2026-11-14）：gateway.lock 由包用户创建后权限 0644，
+	// 以另一个用户（安装回调的系统身份、或登录用户）再起守护时 os.OpenFile 直接 EACCES，
+	// 而旧代码是「打不开锁就静默继续」——于是同机并存两个守护，双方不断
+	// os.Remove(SOCK_PATH) + 重绑，抢同一个入口，表现就是页面间歇 502 Bad Gateway，
+	// 而投屏画面完全正常（媒体走 WebRTC，不经过这个 socket），极易误判成飞牛的问题。
+	// 现在：锁打不开时用「同路径网关进程扫描」兜底判重，绝不静默放行。
+	lock, lerr := os.OpenFile(LOCK_FILE, os.O_CREATE|os.O_RDWR, 0666)
+	if lerr == nil {
 		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 			logf("已有网关守护在运行（锁被占用），本进程退出以避免互掐")
+			os.Exit(0)
+		}
+	} else {
+		logf("单实例锁不可用（%v）→ 改用同路径进程扫描判重", lerr)
+		time.Sleep(300 * time.Millisecond)
+		if others := ourPids(); len(others) > 0 {
+			logf("已有同路径网关守护 %v 在运行，本进程退出（避免两个守护抢 app.sock）", others)
 			os.Exit(0)
 		}
 	}
@@ -657,6 +700,29 @@ func supervise() {
 			os.Exit(0)
 		}
 		sweep(os.Getpid())
+		// 入口归属校验（3.9.9）：app.sock 若被别的守护删掉重绑、或被外部删除，本进程的
+		// probeOnce() 会因为连到「别人的 socket」而返回 200，从而误判健康、永不重建入口，
+		// 飞牛侧就持续 Bad Gateway。比对 inode 才能识别这种「入口已不属于我」的状态。
+		srvMu.Lock()
+		_sockIno := srvSockIno
+		srvMu.Unlock()
+		if _sockIno != 0 {
+			_st2, _e2 := os.Stat(SOCK_PATH)
+			if _e2 != nil || statIno(_st2) != _sockIno {
+				if others := ourPids(); len(others) > 0 {
+					logf("app.sock 已被另一个网关守护接管（同路径守护 %v）→ 本进程退出，避免互抢入口", others)
+					os.Exit(0)
+				}
+				logf("app.sock 已被删除或替换（入口丢失）→ 重新绑定")
+				srvMu.Lock()
+				if srvListener != nil {
+					srvListener.Close()
+				}
+				srvAlive = false
+				srvMu.Unlock()
+				startServerThread()
+			}
+		}
 		// 健康信号必须是「实际可连接」：只判断 socket 文件存在会被「上一实例被杀后留下的
 		// 死 socket 文件」骗过 —— 表现就是飞牛网关 Bad Gateway（实测事故）。
 		healthy := serverAlive() && fileExists(SOCK_PATH) && verOK() && probeOnce()

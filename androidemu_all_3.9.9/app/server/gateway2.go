@@ -296,11 +296,23 @@ func handleWS(conn net.Conn, method, path string, reqLines []string) {
 	t0 := time.Now()
 	p := &wsPair{}
 	done := make(chan struct{})
+	var endOnce sync.Once
+	finish := func() {
+		endOnce.Do(func() {
+			close(done)
+			// 3.9.9：以前两个方向都不关连接，WS 结束后客户端侧一直停在 CLOSE_WAIT，
+			// 长时间使用会累积到耗尽网关的文件描述符，Accept 随之反复失败。
+			conn.Close()
+			u.Close()
+		})
+	}
 	go wsKeepalive(conn, u, done, p)
 	go func() {
 		wsTunnel(conn, u, done, p)
+		finish()
 	}()
 	wsTunnel(u, conn, done, p)
+	finish()
 	logf("WS 结束: %s（持续 %.1f 秒）", path, time.Since(t0).Seconds())
 }
 

@@ -838,7 +838,13 @@ ensure_helpers(){
     if ! _app_alive "server/$(basename "$_gw_bin") supervise"; then
         _gw_bad=1
         log "网关守护缺失 → 重新拉起（$(basename "$_gw_bin")）"
-    elif [ -S "$_gw_sock" ]; then
+    elif [ ! -S "$_gw_sock" ]; then
+        ### 3.9.9：socket 文件本身不见了，也必须算「坏」。旧写法把连通性检测挂在
+        ### 「文件存在」分支里，文件不存在时 _gw_bad 始终保持 0，于是永远不修，
+        ### 飞牛统一网关只能一直回 Bad Gateway（实测某台机器挂了两小时无人拉起）。
+        _gw_bad=1
+        log "app.sock 不存在（入口丢失，网关进程在但入口没了）→ 重建网关入口"
+    else
         python3 - "$_gw_sock" <<'PY' 2>/dev/null || _gw_bad=1
 import socket, sys
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -861,6 +867,16 @@ PY
     _now=$(date +%s)
     [ $(( _now - _ensure_ts )) -lt 300 ] && return 0
     _ensure_ts=$_now
+    ### 网关单实例校验（3.9.9）：同一台机器出现两个网关守护时，双方会不断
+    ### os.Remove(app.sock) + 重绑抢同一个入口，表现是页面间歇 502 Bad Gateway、
+    ### 投屏画面却一直正常（媒体走 WebRTC 不经过该 socket），极易误判成飞牛的问题。
+    ### 内部实测（2026-11-14）本机就并存了 3869 与 961 两个守护。这里收敛为单实例。
+    _gwn=$(ps -eo args 2>/dev/null | grep -F "$APP_DIR/server/gateway" \
+        | grep -E 'gateway(_amd64|_arm64) (supervise|serve)' | grep -v grep | wc -l)
+    if [ "${_gwn:-0}" -gt 1 ] && [ -x "$_gw_bin" ]; then
+        log "检测到 ${_gwn} 个网关守护并存（互抢 app.sock）→ 收敛为单实例"
+        ( cd / && TRIM_APPDEST="$APP_DIR" TRIM_PKGVAR="$VAR_DIR" "$_gw_bin" start >/dev/null 2>&1 & ) || true
+    fi
     ### 音频守护
     if [ -x "$APP_DIR/server/audio_fix.py" ] && ! _app_alive "server/audio_fix.py watchdog"; then
         log "音频守护缺失 → 重新拉起"
