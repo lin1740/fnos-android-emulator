@@ -557,6 +557,12 @@ for p in $(ps -A -o PID,NAME 2>/dev/null | awk "\$2 ~ /vaapi/ {print \$1}"); do 
     dex '
 BK=/data/local/tmp/hwenc-backup
 [ -f $BK/media_codecs.xml.orig ] && cp -f $BK/media_codecs.xml.orig /vendor/etc/media_codecs.xml
+### 3.9.9-r15：备份可能被旧版污染，不能只靠 cp 还原。强制删掉所有注入块，
+### 保证禁用后一定只剩软件编码器，否则 MediaCodec 会一直等没启动的 C2 HAL → 黑屏。
+sed -i "/c2.hardware.encoder.h264/,/<\/MediaCodec>/d" /vendor/etc/media_codecs.xml 2>/dev/null
+sed -i "/c2.hardware.decoder/,/<\/MediaCodec>/d" /vendor/etc/media_codecs.xml 2>/dev/null
+### 停掉 init 里可能卡在 restarting 的 vaapi 服务，避免反复 ctl.interface_start 刷日志
+setprop ctl.stop android-hardware-media-c2-vaapi-hal 2>/dev/null
 rm -f /vendor/bin/hw/android.hardware.media.c2@1.1-vaapi-service
 rm -f /vendor/lib64/libavservices_minijail.so /vendor/lib64/libcodec2.so \
       /vendor/lib64/libcodec2_hidl@1.0.so /vendor/lib64/libcodec2_hidl@1.1.so \
@@ -614,9 +620,13 @@ do_enable() {
     log "检测通过：$_ARCH / $_GPU / ${_ENC} 个编码入口"
     [ -n "${_WARN_RADEON:-}" ] && log "注意：$_WARN_RADEON；手机/平板分辨率会退回软件编码"
 
-    ### 记录原始状态，便于 disable 精准还原
+    ### 3.9.9-r15：只在 orig 不存在时备份。旧写法每次 enable 都无条件 cp -f 覆盖，
+    ### 一旦上一次 disable 没还原干净 / 中途失败，当前 XML 已带注入条目，备份就被污染；
+    ### 之后 disable 永远恢复不回原始 XML，残留 c2.hardware.encoder.h264 会让
+    ### MediaCodec 去找没启动的 C2 HAL（IComponentStore/default），编不出帧 → 投屏黑屏。
+    ### 2026-11-14 实测踩过；现场恢复办法是重启 Android 容器。
     mkdir -p "$BK"
-    dex 'cp -f /vendor/etc/media_codecs.xml /data/local/tmp/hwenc-backup/media_codecs.xml.orig 2>/dev/null' >/dev/null
+    dex '[ -f /data/local/tmp/hwenc-backup/media_codecs.xml.orig ] || cp -f /vendor/etc/media_codecs.xml /data/local/tmp/hwenc-backup/media_codecs.xml.orig 2>/dev/null' >/dev/null
 
     inject || { log "注入失败，回退"; do_disable; return 1; }
 
