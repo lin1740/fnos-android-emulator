@@ -60,6 +60,23 @@ MODE="${1:-}"
 HOST_ARG="${2:-}"
 PORT_ARG="${3:-}"
 
+### 3.9.9：多网卡。把所有真实局域网地址（排除 docker 网桥/veth）收集起来，
+### 逐个通告给客户端 TURN/STUN —— 客户端会尝试全部，自动落到同网段那个。
+### wan/proxy 模式不做扩展（由用户在向导里指定地址）。
+PUB_IPS=""
+_collect_ips() {
+    PUB_IPS=""
+    for _a in $(ip -o -4 addr show 2>/dev/null | awk '$2 !~ /^(lo|docker|br-|veth|cni|flannel)/ {print $4}' | cut -d/ -f1); do
+        case "$_a" in
+            127.*|169.254.*) continue ;;
+            10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) ;;
+            *) continue ;;
+        esac
+        case ",$PUB_IPS," in *",$_a,"*) continue ;; esac
+        PUB_IPS="${PUB_IPS:+$PUB_IPS,}$_a"
+    done
+}
+
 ### 3.9.1：同 detect_net.sh —— 取真实局域网 IP，避免写成 docker 网桥
 if [ -f "$(dirname "$0")/net_util.sh" ]; then . "$(dirname "$0")/net_util.sh"; fi
 if command -v ae_lan_ip >/dev/null 2>&1; then
@@ -100,6 +117,8 @@ fi
 case "$MODE" in
     lan|lanhttp)
         PUB="$LAN_IP"; TLS="true"; EXT="${P_EXT:-$P_WEB}"; HOST_SAVE=""; PORT_SAVE="${P_EXT:-$P_WEB}"
+        _collect_ips
+        [ -n "$PUB_IPS" ] || PUB_IPS="$LAN_IP"
         ### 3.9.1：局域网默认也用 HTTPS（用户要求"任何环境优先 HTTPS"）。
         ### 自签证书浏览器首次需确认；如确需明文：net_mode.sh https off。
         [ "$TLS_OVERRIDE" = "off" ] && TLS="false"
@@ -179,17 +198,18 @@ _edit_compose_env() {
     [ "$(uname -m 2>/dev/null)" = "aarch64" ] && GWBIN="$APP_DIR/server/gateway_arm64"
     [ -x "$GWBIN" ] || return 1
     local k
-    for k in PUBLIC_IP USE_TLS EXTERNAL_SIGNALING_PORT SIGNALING_PORT EXTERNAL_TURN_PORT; do
+    for k in PUBLIC_IP PUBLIC_IPS USE_TLS EXTERNAL_SIGNALING_PORT SIGNALING_PORT EXTERNAL_TURN_PORT; do
         "$GWBIN" editcompose "$COMPOSE" set-env webrtc "$k" - >/dev/null 2>&1 || return 1
     done
     "$GWBIN" editcompose "$COMPOSE" set-env webrtc "PUBLIC_IP=$PUBLIC_IP_FOR_CONTAINER" >/dev/null 2>&1 || return 1
+    "$GWBIN" editcompose "$COMPOSE" set-env webrtc "PUBLIC_IPS=${PUB_IPS:-$PUBLIC_IP_FOR_CONTAINER}" >/dev/null 2>&1 || return 1
     "$GWBIN" editcompose "$COMPOSE" set-env webrtc "USE_TLS=$TLS" >/dev/null 2>&1 || return 1
     "$GWBIN" editcompose "$COMPOSE" set-env webrtc "EXTERNAL_SIGNALING_PORT=$EXT" >/dev/null 2>&1 || return 1
     "$GWBIN" editcompose "$COMPOSE" set-env webrtc "SIGNALING_PORT=8443" >/dev/null 2>&1 || return 1
     "$GWBIN" editcompose "$COMPOSE" set-env webrtc "EXTERNAL_TURN_PORT=$P_TURN" >/dev/null 2>&1 || return 1
     # 写后必须校验：editcompose 可能「静默成功」或留下重复键（compose 后者生效，
     # 会盖掉新值）。任一键不存在 / 不唯一 / 值不对，都交给 awk 回退重写。
-    for k in PUBLIC_IP USE_TLS EXTERNAL_SIGNALING_PORT SIGNALING_PORT EXTERNAL_TURN_PORT; do
+    for k in PUBLIC_IP PUBLIC_IPS USE_TLS EXTERNAL_SIGNALING_PORT SIGNALING_PORT EXTERNAL_TURN_PORT; do
         [ "$(grep -c -- "- ${k}=" "$COMPOSE")" = "1" ] || return 1
     done
     grep -q -- "- USE_TLS=$TLS" "$COMPOSE" || return 1
@@ -199,14 +219,15 @@ _edit_compose_env() {
 }
 if ! _edit_compose_env; then
     TMP="$(mktemp)" || exit 0
-    awk -v pub="$PUBLIC_IP_FOR_CONTAINER" -v tls="$TLS" -v ext="$EXT" -v sig="8443" -v turn="$P_TURN" '
+    awk -v pub="$PUBLIC_IP_FOR_CONTAINER" -v ips="${PUB_IPS:-$PUBLIC_IP_FOR_CONTAINER}" -v tls="$TLS" -v ext="$EXT" -v sig="8443" -v turn="$P_TURN" '
         /^  redroid:/ { inw=0 }
         /^  webrtc:/ { inw=1 }
         !inw { print; next }
-        /^[[:space:]]*-[[:space:]]*(PUBLIC_IP|USE_TLS|EXTERNAL_SIGNALING_PORT|SIGNALING_PORT|EXTERNAL_TURN_PORT)=/ { next }
+        /^[[:space:]]*-[[:space:]]*(PUBLIC_IP|PUBLIC_IPS|USE_TLS|EXTERNAL_SIGNALING_PORT|SIGNALING_PORT|EXTERNAL_TURN_PORT)=/ { next }
         { print }
         /^[[:space:]]*environment:[[:space:]]*$/ && !done {
             print "      - PUBLIC_IP=" pub
+            print "      - PUBLIC_IPS=" ips
             print "      - USE_TLS=" tls
             print "      - EXTERNAL_SIGNALING_PORT=" ext
             print "      - SIGNALING_PORT=" sig
@@ -221,7 +242,7 @@ mkdir -p /docker 2>/dev/null || true
 cp -f "$COMPOSE" /docker/docker-compose.yaml 2>/dev/null || true
 chmod 644 /docker/docker-compose.yaml 2>/dev/null || true
 
-echo "net_mode[$MODE]: PUBLIC_IP(容器)=$PUBLIC_IP_FOR_CONTAINER USE_TLS=$TLS EXTERNAL_SIGNALING_PORT=$EXT SIGNALING_PORT=8443(容器内固定) TURN=$P_TURN ADB=$P_ADB"
+echo "net_mode[$MODE]: PUBLIC_IPS=${PUB_IPS:-$PUBLIC_IP_FOR_CONTAINER} PUBLIC_IP(容器)=$PUBLIC_IP_FOR_CONTAINER USE_TLS=$TLS EXTERNAL_SIGNALING_PORT=$EXT SIGNALING_PORT=8443(容器内固定) TURN=$P_TURN ADB=$P_ADB"
 
 if [ "$NO_RESTART" = "1" ]; then
     echo "net_mode: --no-restart，仅写配置（安装/升级流程稍后统一启动容器）"
