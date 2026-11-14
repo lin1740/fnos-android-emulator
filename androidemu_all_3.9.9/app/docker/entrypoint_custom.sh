@@ -106,7 +106,25 @@ if [ -n "${CLOUDPHONE_DEVICE_SECRET:-}" ]; then
     export CLOUDPHONE_DEVICE_SECRET
 fi
 
-export ICE_SERVERS="turn:${TURN_USER}:${TURN_PASSWORD}@${PUBLIC_IP}:${EXTERNAL_TURN_PORT}?transport=udp,turn:${TURN_USER}:${TURN_PASSWORD}@${PUBLIC_IP}:${EXTERNAL_TURN_PORT}?transport=tcp,stun:${PUBLIC_IP}:${EXTERNAL_TURN_PORT},turn:${TURN_USER}:${TURN_PASSWORD}@webrtc:${EXTERNAL_TURN_PORT}?transport=udp,turn:${TURN_USER}:${TURN_PASSWORD}@webrtc:${EXTERNAL_TURN_PORT}?transport=tcp,stun:webrtc:${EXTERNAL_TURN_PORT}"
+### 3.9.9：多网卡适配。PUBLIC_IPS 为逗号分隔的宿主局域网地址（net_mode.sh 写入），
+### 每个都生成一组 TURN/STUN。浏览器会逐个尝试，落在同网段的那个必然可达 ——
+### 相当于「自动选与客户端同网段」，但不需要服务端猜客户端在哪。
+### PUBLIC_IPS 为空/未设时，行为与旧版完全一致（只用 PUBLIC_IP）。
+_AE_IPS="${PUBLIC_IPS:-$PUBLIC_IP}"
+_AE_ICE=""
+_AE_OLDIFS="$IFS"; IFS=','
+for _ae_ip in $_AE_IPS; do
+    _ae_ip=$(printf '%s' "$_ae_ip" | tr -d ' \r\n')
+    [ -z "$_ae_ip" ] && continue
+    [ -n "$_AE_ICE" ] && _AE_ICE="${_AE_ICE},"
+    _AE_ICE="${_AE_ICE}turn:${TURN_USER}:${TURN_PASSWORD}@${_ae_ip}:${EXTERNAL_TURN_PORT}?transport=udp"
+    _AE_ICE="${_AE_ICE},turn:${TURN_USER}:${TURN_PASSWORD}@${_ae_ip}:${EXTERNAL_TURN_PORT}?transport=tcp"
+    _AE_ICE="${_AE_ICE},stun:${_ae_ip}:${EXTERNAL_TURN_PORT}"
+done
+IFS="$_AE_OLDIFS"
+[ -z "$_AE_ICE" ] && _AE_ICE="turn:${TURN_USER}:${TURN_PASSWORD}@${PUBLIC_IP}:${EXTERNAL_TURN_PORT}?transport=udp,stun:${PUBLIC_IP}:${EXTERNAL_TURN_PORT}"
+export ICE_SERVERS="${_AE_ICE},turn:${TURN_USER}:${TURN_PASSWORD}@webrtc:${EXTERNAL_TURN_PORT}?transport=udp,turn:${TURN_USER}:${TURN_PASSWORD}@webrtc:${EXTERNAL_TURN_PORT}?transport=tcp,stun:webrtc:${EXTERNAL_TURN_PORT}"
+echo "ICE 通告地址：${_AE_IPS}（共 $(printf '%s' "$_AE_IPS" | awk -F, '{print NF}') 个）"
 
 if [ ! -e "${ASSETS}/agent" ]; then
     echo "assets/agent directory not found. Restoring built-in agent binaries..."
