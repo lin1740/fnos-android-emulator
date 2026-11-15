@@ -236,6 +236,21 @@ res_summary() {
 ### ---------------------------------------------------------------------------
 inject() {
     log "注入组件到容器 /vendor"
+    ### 3.9.9-r18：备份/注入前先把 XML 里的注入块清干净，保证 orig 一定是"原始版"。
+    ### 2026-11-15 实测：do_disable 报「已撤回」但 XML 仍留 1 条硬编 + 3 条硬解 +
+    ### Decoders 段，daemon 也还在跑 → MediaCodec 选中没人提供的硬编 →
+    ### 投屏 IllegalStateException，只能重建容器才恢复。
+    ### 根因：dex 单引号块里的 sed 正则不可靠。这里改用 heredoc + awk（无转义问题），幂等。
+    docker exec -i -u 0 "$CT" sh -s <<'AE_AWK_CLEAN' >/dev/null 2>&1
+X=/vendor/etc/media_codecs.xml
+[ -f "$X" ] || exit 0
+awk '
+  /<MediaCodec name="c2\.hardware\./ { if ($0 ~ /\/>[ \t]*$/) next; skip=1; next }
+  skip && /<\/MediaCodec>/ { skip=0; next }
+  skip { next }
+  { print }
+' "$X" > "$X.ae_tmp" && mv -f "$X.ae_tmp" "$X"
+AE_AWK_CLEAN
     local _max
     _max=$(hwenc_max_size)
     log "编解码尺寸上限：$_max（驱动 $(va_driver_name)；可用 $VAR_DIR/hwenc.maxsize 覆盖）"
@@ -577,14 +592,41 @@ rm -rf /data/local/tmp/hwenc-pkg /data/local/tmp/hwenc-frag.xml /data/local/tmp/
 ' >/dev/null
     rm -rf "$SHARED"
 
+    ### 3.9.9-r18：备份/注入前先把 XML 里的注入块清干净，保证 orig 一定是"原始版"。
+    ### 2026-11-15 实测：do_disable 报「已撤回」但 XML 仍留 1 条硬编 + 3 条硬解 +
+    ### Decoders 段，daemon 也还在跑 → MediaCodec 选中没人提供的硬编 →
+    ### 投屏 IllegalStateException，只能重建容器才恢复。
+    ### 根因：dex 单引号块里的 sed 正则不可靠。这里改用 heredoc + awk（无转义问题），幂等。
+    docker exec -i -u 0 "$CT" sh -s <<'AE_AWK_CLEAN' >/dev/null 2>&1
+X=/vendor/etc/media_codecs.xml
+[ -f "$X" ] || exit 0
+awk '
+  /<MediaCodec name="c2\.hardware\./ { if ($0 ~ /\/>[ \t]*$/) next; skip=1; next }
+  skip && /<\/MediaCodec>/ { skip=0; next }
+  skip { next }
+  { print }
+' "$X" > "$X.ae_tmp" && mv -f "$X.ae_tmp" "$X"
+AE_AWK_CLEAN
+
     ### 4) 重启媒体栈回默认
     dex 'setprop ctl.restart media' >/dev/null
     sleep 10
     dex 'for p in $(ps -A -o PID,NAME | awk "\$2 ~ /swcodec/ {print \$1}"); do kill -9 $p 2>/dev/null; done' >/dev/null
     sleep 6
 
+    ### 3.9.9-r18：必须核对真的清干净，不能只看命令返回值就报成功。
+    local _left _dpid
+    _left=$(dex 'grep -c "c2.hardware" /vendor/etc/media_codecs.xml 2>/dev/null' | tr -d '\r\n')
+    case "${_left:-0}" in ''|*[!0-9]*) _left=0 ;; esac
+    _dpid=$(daemon_pids | head -1)
+    if [ "$_left" -gt 0 ] || [ -n "${_dpid:-}" ]; then
+        log "禁用未完成：XML 仍残留 ${_left} 条注入条目$([ -n "${_dpid:-}" ] && echo "，daemon 仍在运行(pid=$_dpid)")"
+        log "彻底恢复需重建 Android 容器：cd $APP_DIR/docker && docker rm -f $CT && docker compose -f docker-compose.yaml up -d redroid"
+        echo "disabled-incomplete" > "$STATUS"
+        return 1
+    fi
     echo "disabled" > "$STATUS"
-    log "已禁用：ccodec=1（软件编码），硬件组件已撤回、daemon 已停"
+    log "已禁用：ccodec=1（软件编码），XML 无残留、daemon 已停"
     return 0
 }
 
