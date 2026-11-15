@@ -1,6 +1,6 @@
 # 视频硬编解码实验组件（redroid-hwenc）构建与状态说明
 
-> **硬编默认开启、硬解默认关闭（手动 opt-in）。** 本目录是上游开源项目 redroid-hwenc
+> **硬编硬解默认开启，能力不足自动回退。** 本目录是上游开源项目 redroid-hwenc
 > （github.com/fogelmanjg/redroid-hwenc，Apache-2.0）v0.2.0 的产物与源码。
 > 运行时按 `vainfo` 的实际能力决定是否部署硬解组件；检测不通过时只保留编码链路或回退软编/软解，不影响应用任何正常功能。
 
@@ -73,12 +73,12 @@ make HWDEC=1    # 额外编入 ffmpeg 后端（Intel 必须）
 - Intel 机器仍在用 legacy 后端，正是上面那段「码流畸形」的场景，也是
   部分机器投屏卡顿的成因之一。
 
-现在改为**两个二进制并存**，硬编默认开、硬解默认关（`decode on` 手动开启）：
+现在改为**两个二进制并存**，硬解默认开启、能力不足自动回退：
 
 | 文件 | 编译方式 | 用途 |
 |---|---|---|
 | `bin/daemon` | `make`（HWDEC=0） | 只编码；硬解能力不足时自动回退用它 |
-| `bin/daemon-hwdec` | `-DHAVE_HWDEC`，链 libavcodec/libavutil | **默认不启用**；`decode on` 后按 `vainfo` 解码能力判定，带硬解；Intel 同时自动切 ffmpeg 编码后端 |
+| `bin/daemon-hwdec` | `-DHAVE_HWDEC`，链 libavcodec/libavutil | **默认启用**（按 `vainfo` 解码能力判定），带硬解；Intel 同时自动切 ffmpeg 编码后端 |
 
 `daemon-hwdec` 在 Debian 12（fnOS 同一用户态）上编译，命令：
 

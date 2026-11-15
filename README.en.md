@@ -736,7 +736,7 @@ Most utility, productivity, media and system apps (x86-native or regular ARM tra
 
 This app passes the host GPU's **graphics** capabilities into the Android container (GPU host mode: `/dev/dri` device passthrough + shared host mesa/driver stack), choosing the route per platform and falling back when unsupported — no user intervention needed.
 
-> **Hardware video encoding is on by default; hardware decoding is off by default and must be opted in.** Since 3.9.9 the package ships host-GPU hardware encoding plus upstream v0.2.0's H.264/HEVC/VP9 VA-API decoders. Encoding is enabled from what `vainfo` actually reports and falls back to software when the driver is unsupported, the package user lacks `/dev/dri/renderD*` access, or no encode entrypoint exists. **Decoding stays off** until you run `bash /vol1/@appcenter/androidemu/scripts/hwenc_ctl.sh decode on`; when enabled, the C2 service must stay alive and register successfully, otherwise the enable is rolled back to software decoding. The size limit is tiered by driver (3840x2160 on modern Intel/AMD, a conservative 1920x1088 on legacy radeon), overridable via `hwenc.maxsize`. Check `hwenc.status` / `hwenc.decode` for the live state.
+> **Hardware video encoding and decoding are both available and enabled by default.** Since 3.9.9 the package ships host-GPU hardware encoding plus upstream v0.2.0's H.264/HEVC/VP9 VA-API decoders. Both are decided at runtime from what `vainfo` actually reports: an unsupported driver, a package user without `/dev/dri/renderD*` access, or a missing VA-API entrypoint falls back to software automatically and never breaks the picture. The size limit is tiered by driver (3840x2160 on modern Intel/AMD, a conservative 1920x1088 on legacy radeon), overridable via `hwenc.maxsize`. Encoding can be turned off in the install wizard; decoding via `hwenc_ctl.sh decode off`. Check `hwenc.status` / `hwenc.decode` for the live state.
 
 ### 1. Video HW decode/encode (three-layer architecture)
 
@@ -762,7 +762,7 @@ In-container player/app -> C2 plugin (forwarding) -> Host daemon (VAAPI/NVDEC) -
 | NVIDIA (NVDEC / NVENC, GTX 10+) | Yes (NVDEC, when VA-API reports VLD) | Only if `vainfo` reports EncSlice | Upstream verified Tier 7 NVDEC decode; `nvidia-vaapi-driver` normally has no EncSlice, so encode falls back to software while decode still works |
 | ARM Mali (Panfrost) | V4L2 route (in progress) | upstream pending | graphics rendering tested ✅ |
 
-> The above describes what the host GPU itself can do; actual enablement is decided by `vainfo`, not by vendor. The 1920x1088 limit came from one Kaveri APU measurement and applies only to that conservative tier. **Hardware decoding is off by default** and must be enabled with `hwenc_ctl.sh decode on`: on 2026-11-15 two Intel machines showed that stale decoder declarations can block the `system_server` binder thread for 60s and trigger a watchdog restart once the C2 service fails, so it is no longer enabled automatically.
+> The above describes what the host GPU itself can do; actual enablement is decided by `vainfo`, not by vendor. The 1920x1088 limit came from one Kaveri APU measurement and applies only to that conservative tier. NVIDIA's `nvidia-vaapi-driver` usually reports `VAEntrypointVLD` (NVDEC decode) but no `EncSlice`: encoding then falls back to software while hardware decode remains available.
 
 ### 2. Audio path (no hardware acceleration needed)
 
@@ -1770,7 +1770,7 @@ TLS per network mode plus the dedicated toggle (`scripts/net_mode.sh`):
 > **About Standalone Docker Container Version**: This project is currently published as an fnOS App Center FPK package. Standalone Docker Compose deployment is not yet available. The standalone Docker container version is planned for release after the app is stable on the App Center. Stay tuned.
 
 1. **Audio**: v3.8.9 has fully fixed the OPUS audio encoder (via Codec2), enabled by default; 3.9.2 fixed an audio-repair watchdog lock-contention issue (audio now self-heals after container restarts). Note: output volume matches host system volume (if container is at 100% but host is at 50%, output is 50%)
-7. **Video hardware codec**: hardware encoding ships enabled by default (falls back to software when the driver, frame size, or host `/dev/dri/renderD*` access is unavailable). Hardware decoding is **off by default** and requires `hwenc_ctl.sh decode on`; enabling verifies that the C2 service stays alive and registers, otherwise it rolls back. Size limits are tiered by driver rather than hard-coded per vendor.
+7. **Video hardware codec**: hardware encoding and decoding both shipped with 3.9.9 and are enabled by default, gated on what `vainfo` actually reports. Each falls back to software independently when the driver, frame size, or host `/dev/dri/renderD*` access is unavailable. Size limits are tiered by driver rather than hard-coded per vendor. Decoding can be disabled with `hwenc_ctl.sh decode off`.
 2. **External network access**: fnOS reverse proxy only passes TCP, WebRTC media stream (UDP) can't pass, auto-downgrades to WebSocket casting
 3. **fnOS APP**: Some versions WebView has limited WebSocket proxy support, recommend mobile browser
 4. **ARM app compatibility**: ARM64 apps with anti-emulator detection or complex JIT may crash (translation layer capability boundary)

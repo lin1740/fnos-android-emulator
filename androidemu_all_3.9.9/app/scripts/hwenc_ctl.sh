@@ -31,15 +31,11 @@ RUN_USER="${TRIM_RUN_USERNAME:-docker-androidemu}"
 CT="androidemu-android"
 ART="$APP_DIR/hwenc/artifacts/android11-hidl"
 DAEMON_BIN="$APP_DIR/hwenc/bin/daemon"
-### 3.9.9-r16：硬件解码**默认关闭、手动 opt-in**（只有 `decode on` 才开）。
-### daemon-hwdec 是同一份源码加 -DHAVE_HWDEC 编出来的，与只编码的 daemon 并存。
-### 即使开启，运行时仍按宿主 VA-API 真实能力判定：缺二进制、vainfo 不可用或
-### 没有解码入口时自动退回「只编码 daemon + 软件解码」，编码链路不受影响。
-### 2026-11-15 两台 Intel 实机反馈：C2 HAL 起来后崩溃，已注入的 c2.hardware.*
-### 条目会让 MediaCodec 一直等 IComponentStore/default，把 system_server 的
-### Binder 线程卡死 60 秒 → WATCHDOG KILLING SYSTEM PROCESS → 整个 Android
-### 重启、投屏「连接失败」。故默认关闭，并在 enable 时做「C2 存活 + 注册」
-### 双重硬校验，不通过立即回滚（清 XML 注入块 + 停 daemon）。
+### 3.9.9-r13：硬件解码**默认开启**。daemon-hwdec 是同一份源码加 -DHAVE_HWDEC
+### 编出来的，与只编码的 daemon 并存。运行时按宿主 VA-API 的真实能力决定：
+### 有解码入口就换 daemon-hwdec 并登记 Decoders；缺二进制、vainfo 不可用或
+### 没有解码入口时自动退回「只编码 daemon + 软件解码」，编码链路完全不受影响。
+### 用户可执行 hwenc_ctl.sh decode off 显式关闭（写 hwenc.decode=off）。
 DAEMON_HWDEC="$APP_DIR/hwenc/bin/daemon-hwdec"
 DECODE_CONF="$VAR_DIR/hwenc.decode"
 LOG="$VAR_DIR/hwenc.log"
@@ -82,8 +78,7 @@ daemon_pids() {
 
 ### 3.9.9-r13：硬解默认开；只有显式写入 off 才关闭。
 decode_enabled() {
-    ### 3.9.9-r16：默认关闭 —— 只有明确写入 on 才算开启。
-    [ "$(cat "$DECODE_CONF" 2>/dev/null | tr -d '\r\n')" = "on" ] || return 1
+    [ "$(cat "$DECODE_CONF" 2>/dev/null | tr -d '\r\n')" = "off" ] && return 1
     return 0
 }
 
@@ -142,9 +137,9 @@ detect_decode() {
 
 ### 本次 enable 是否真的启用硬解；能力不足只降级硬解，不影响硬编。
 decode_capable() {
-    decode_enabled || { log "硬件解码：未开启（默认关闭，需 decode on 手动启用）"; return 1; }
-    [ -x "$DAEMON_HWDEC" ] || { log "硬件解码已请求，但缺少 daemon-hwdec → 本次回退软解"; return 1; }
-    detect_decode || { log "硬件解码已请求，但 $_WHY → 本次回退软解"; return 1; }
+    decode_enabled || { log "硬件解码：用户已关闭"; return 1; }
+    [ -x "$DAEMON_HWDEC" ] || { log "硬件解码默认开启，但缺少 daemon-hwdec → 本次回退软解"; return 1; }
+    detect_decode || { log "硬件解码默认开启，但 $_WHY → 本次回退软解"; return 1; }
     return 0
 }
 
@@ -290,7 +285,7 @@ else
 fi
 ' || { log "media_codecs.xml 登记失败"; return 1; }
 
-    ### 3.9.9-r16：硬解默认关闭。只有 decode on 且本次能力探测通过（有解码入口 + daemon-hwdec
+    ### 3.9.9-r13：硬解默认开启。只有本次能力探测通过（有解码入口 + daemon-hwdec
     ### 可用）才登记 Decoders；否则自动只走软件解码，编码链路完全不受影响。
     if [ "${_DECODE_ON:-0}" = "1" ]; then
         local _ndec
@@ -487,31 +482,7 @@ ln -sfn /data/vaapi-helper /dev/vaapi-helper
         root|0) log "C2 HAL 以 root 运行，拒绝继续（不新增 root）" >&2; echo 0; return 1 ;;
         *)      log "C2 HAL 运行身份：$_uid（非 root）" >&2 ;;
     esac
-
-    ### 3.9.9-r16：C2 HAL「存活 + 注册」双重硬校验，任一失败立即回滚。
-    ### 实机事故（2026-11-15，两台 Intel）：C2 服务起来后崩溃，而 media_codecs.xml
-    ### 里已注入的 c2.hardware.* 条目让 MediaCodec 一直等 IComponentStore/default，
-    ### 把 system_server 的 Binder 线程卡死 60 秒 → WATCHDOG KILLING SYSTEM PROCESS
-    ### → Android 重启、CoreService 抛 DeadSystemException、投屏「连接失败」。
-    ### 所以不能只看「启动命令返回 0」，必须连续确认进程还在、且 lshal 真注册上。
-    local _i _alive _reg
-    for _i in 1 2 3; do
-        sleep 1
-        _alive=$(dex 'ps -A -o NAME 2>/dev/null | grep -c vaapi-service' | tr -d '\r\n')
-        case "${_alive:-0}" in ''|*[!0-9]*) _alive=0 ;; esac
-        if [ "$_alive" -lt 1 ]; then
-            log "C2 HAL 第 ${_i} 次存活检查失败（进程已退出），服务日志：$(dex 'tail -12 /data/local/tmp/hwenc-svc.log 2>/dev/null' | tr '\n' ' ')" >&2
-            echo 0; return 1
-        fi
-    done
-    _reg=$(dex 'lshal 2>/dev/null | grep -c "media.c2@1.1::IComponentStore/default"' | tr -d '\r\n')
-    case "${_reg:-0}" in ''|*[!0-9]*) _reg=0 ;; esac
-    if [ "$_reg" -lt 1 ]; then
-        log "C2 HAL 进程存活但未注册 IComponentStore/default（lshal 命中 ${_reg}），拒绝继续" >&2
-        echo 0; return 1
-    fi
-    log "C2 HAL 存活并已注册（lshal 命中 ${_reg}）" >&2
-    echo "$_reg"
+    dex 'lshal 2>/dev/null | grep -c "media.c2@1.1::IComponentStore/default"'
 }
 
 ### ---------------------------------------------------------------------------
@@ -823,7 +794,7 @@ do_status() {
         echo "硬件编码器   : $(dex 'dumpsys media.player 2>/dev/null | grep -c "c2.hardware.encoder.h264"') 处"
         echo "硬件解码器   : $(dex 'dumpsys media.player 2>/dev/null | grep -c "c2.hardware.decoder"') 处"
     fi
-    echo "硬件解码开关 : $(decode_enabled && echo 'on（手动开启）' || echo 'off（默认关闭）')   驱动/上限: $(va_driver_name) / $(hwenc_max_size)"
+    echo "硬件解码开关 : $(decode_enabled && echo 'on（默认开启）' || echo off)   驱动/上限: $(va_driver_name) / $(hwenc_max_size)"
     echo "hwdec daemon : $([ -x "$DAEMON_HWDEC" ] && echo 已安装 || echo '未安装（先在 CI 构建）')"
     echo "daemon 进程  : $([ -n "$(daemon_pids | head -1)" ] && echo 运行中 || echo 未运行)"
     echo "daemon 用户  : $([ -n "$(daemon_pids | head -1)" ] && ps -o user= -p "$(daemon_pids | head -1)" | tr -d ' ' || echo -)"
@@ -831,7 +802,7 @@ do_status() {
 }
 
 ### ---------------------------------------------------------------------------
-### 硬件解码开关（3.9.9-r16：默认关闭，需 decode on 手动开启）
+### 硬件解码开关（3.9.9，默认关闭）
 ### 必须成对待办：①换 daemon ②登记/撤销 Decoders 声明 ③重启媒体栈。
 ### 走 disable→enable 是为了让 media_codecs.xml 回到 orig 再按新标记重建，
 ### 避免只删本脚本加的条目时误伤镜像原有内容。
@@ -856,7 +827,7 @@ do_decode() {
             log "硬件解码开关：off（回到纯硬编 + 软解）"
             ;;
         status|*)
-            echo "硬件解码：$(decode_enabled && echo 'on（手动开启）' || echo 'off（默认关闭）')   daemon-hwdec：$([ -x "$DAEMON_HWDEC" ] && echo 已安装 || echo 未安装)"
+            echo "硬件解码：$(decode_enabled && echo 'on（默认开启）' || echo off)   daemon-hwdec：$([ -x "$DAEMON_HWDEC" ] && echo 已安装 || echo 未安装)"
             return 0
             ;;
     esac
