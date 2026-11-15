@@ -181,10 +181,37 @@ check_once() {
     if [ "$_boot" = "1" ]; then
         do_fix
     else
-        ### 开机早期：只纠正属主，不重启（避免打断正在进行的开机）
-        [ "$_k" = "1" ] && repair_keystore_owner
+        ### 3.9.9-r17：开机早期**不得**改 keystore 数据库的属主/权限。
+        ### 实测（2026-11-15 群友机器，zj37tzbpl）：
+        ###   09:59:30 本脚本在 boot_completed 之前对
+        ###   /data/misc/keystore/persistent.sqlite 执行 chown/chmod；
+        ###   20 秒后 /system/bin/installd 打开该库失败：
+        ###     Abort message: 'Failed to open database. failed to attach database persistent.'
+        ###     Caused by: Error code 14: Unable to open the database file
+        ###   → installd SIGABRT → system_server 等它卡 60 秒 →
+        ###     WATCHDOG KILLING SYSTEM PROCESS → 整个 Android 重启 →
+        ###     CoreService 抛 DeadSystemException → 投屏「连接失败」。
+        ### 开机早期 keystore2 正在初始化数据库，此刻改属主/权限是竞态。
+        ### 新策略：先计时不动手；只有「持续 300 秒仍异常且开机未完成」（可能是
+        ### keystore panic 卡住启动）才兜底纠正一次。正常情况留给 boot 完成后的 do_fix。
+        _kstamp="$VAR_DIR/.keystore_broken_since"
+        if [ "$_k" = "1" ]; then
+            _since=$(cat "$_kstamp" 2>/dev/null || echo 0)
+            case "$_since" in ''|*[!0-9]*) _since=0 ;; esac
+            _now=$(date +%s)
+            if [ "$_since" = "0" ]; then
+                echo "$_now" > "$_kstamp" 2>/dev/null || true
+                log "开机早期 keystore 库异常，开始计时（暂不修改，避免与 keystore2 初始化竞态）"
+            elif [ $(( _now - _since )) -ge 300 ]; then
+                log "keystore 库异常已持续 $(( _now - _since ))s 且开机未完成，按兜底策略纠正属主"
+                repair_keystore_owner
+                echo "$_now" > "$_kstamp" 2>/dev/null || true
+            fi
+        else
+            rm -f "$_kstamp" 2>/dev/null || true
+        fi
         [ "$_s" = "1" ] && repair_sys_owner
-        log "开机早期检测到异常（keystore=$_k sys=$_s），已纠正属主（不重启，等待开机完成）"
+        log "开机早期检测到异常（keystore=$_k sys=$_s），已纠正 /data/system 属主（keystore 留待开机后）"
     fi
 }
 
