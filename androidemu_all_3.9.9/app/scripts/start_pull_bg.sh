@@ -33,6 +33,20 @@ nohup bash -c '
         ( ensure_gms_image ) &
         GMS_PULL_PID=$!
     fi
+    ### 3.9.9-r29：ARM 转译库（150-250MB）与主镜像**并行**下载。
+    ### 绝不再放进安装回调（那是「安装中卡很久」的根因），也不阻塞容器启动：
+    ### 镜像就绪后再给它最多 60 秒，到位就带上 ARM 挂载，不到位先不带。
+    ### 3.9.9-r30：直接下到「应用数据目录」（armlibs），不要在 app 目录留第二份 ——
+    ### app 目录升级时会被整体替换，放在那里等于每次重下 250MB。
+    HOUDINI_DIR="'"$VAR_DIR"'"/armlibs
+    if [ -z "$(ls "$HOUDINI_DIR"/lib/arm/*.so 2>/dev/null | head -1)" ] \
+       && [ -z "$(ls "$HOUDINI_DIR"/lib/arm/arm/*.so 2>/dev/null | head -1)" ]; then
+        ( timeout 900 bash "'"$APP_DIR"'"/scripts/download_houdini.sh "$HOUDINI_DIR" \
+              > "'"$VAR_DIR"'"/houdini_dl.log 2>&1; : > "'"$VAR_DIR"'"/.houdini_dl_done ) &
+        HOUDINI_DL_PID=$!
+        logline "ARM 转译库缺失：已后台并行下载（不影响安装完成，最多 15 分钟）"
+    fi
+
     ### 3.9.6：起容器前先清孤儿（<hash>_androidemu-*），否则会抢端口/抢 agent 连接
     docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^[0-9a-f]{12}_androidemu-' | while read -r _orph; do
         docker rm -f "$_orph" >/dev/null 2>&1 && logline "清理孤儿容器：$_orph"
@@ -44,6 +58,20 @@ nohup bash -c '
             wait "$GMS_PULL_PID" 2>/dev/null || true
         fi
         echo "[$(date +%F\ %T)] 镜像就绪，正在启动容器…"
+        ### 3.9.9-r29：给后台 ARM 库下载最多 60 秒机会；到位就带上 ARM 挂载，
+        ### 没到位也照常启动（微信类 Tinker 应用下次重启后自动可用）。
+        if [ -n "${HOUDINI_DL_PID:-}" ]; then
+            for _hi in $(seq 1 60); do
+                [ -f "'"$VAR_DIR"'"/.houdini_dl_done ] && break
+                sleep 1
+            done
+            rm -f "'"$VAR_DIR"'"/.houdini_dl_done 2>/dev/null || true
+        fi
+        ### 按「现在到底有没有 ARM 库」重写 compose：有就挂载，没有就不挂，行为不变
+        if [ -f "'"$APP_DIR"'"/scripts/tune_compose.sh ]; then
+            AE_SKIP_ARM_FETCH=1 bash "'"$APP_DIR"'"/scripts/tune_compose.sh \
+                "'"$APP_DIR"'"/docker/docker-compose.yaml >> "'"$VAR_DIR"'"/tune.log 2>&1 || true
+        fi
         ### 缓存标签：给两个镜像打备份 tag（androidemu-cache/*）。
         ### 飞牛升级时按 compose 官方名清理镜像，备份 tag 能存活；
         ### upgrade_init 用它秒级恢复官方 tag，升级不再重下 2GB。
