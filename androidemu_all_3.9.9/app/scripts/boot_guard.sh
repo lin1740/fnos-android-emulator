@@ -57,6 +57,45 @@ PIDFILE="$VAR_DIR/boot_guard.pid"
 STAMP="$VAR_DIR/boot_guard.stamp"
 MARK="$VAR_DIR/gpu_fallback.done"
 
+### 3.9.9-r28：按官方口径「前台进程不要 root，后端可酌情 root」重建职责边界。
+###   · 本守护由 systemd 以 root 托管 → 开机自启、能杀卡死进程、能起容器（后端）
+###   · 但它拉起的一切用户可见服务（前端网关）与修复脚本仍降权到包用户
+PKG_USER="${TRIM_RUN_USERNAME:-docker-androidemu}"
+RUNUSER_BIN=""
+for _ru in /usr/sbin/runuser /sbin/runuser /usr/bin/runuser /bin/runuser; do
+    [ -x "$_ru" ] && { RUNUSER_BIN="$_ru"; break; }
+done
+### 记忆铁律：runuser 在 /usr/sbin，看护的 PATH 常不含它，必须用绝对路径。
+### 找不到 runuser 时退回「原身份执行」，绝不因为降权失败而让守护拒绝工作。
+as_pkg(){
+    if [ "$(id -u)" = "0" ] && [ -n "$PKG_USER" ] && [ "$PKG_USER" != "root" ] && [ -n "$RUNUSER_BIN" ]; then
+        "$RUNUSER_BIN" -u "$PKG_USER" -- "$@"
+    else
+        "$@"
+    fi
+}
+### 「用户主动停用」标记，内容写本机 boot_id：
+###   同一次开机内存在 → 说明是用户在应用中心点了停用（或飞牛停的），
+###   本守护不得把容器拉回来；重启后 boot_id 变化 → 标记自动失效，恢复自愈。
+USER_STOP="$VAR_DIR/.user_stopped"
+boot_id(){ cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d '\r\n'; }
+mark_user_stop(){
+    mkdir -p "$VAR_DIR" 2>/dev/null || true
+    boot_id > "$USER_STOP" 2>/dev/null || true
+}
+clear_user_stop(){ rm -f "$USER_STOP" 2>/dev/null || true; }
+user_stopped(){
+    [ -f "$USER_STOP" ] || return 1
+    _us_saved=$(cat "$USER_STOP" 2>/dev/null | tr -d '\r\n')
+    _us_now=$(boot_id)
+    if [ -n "$_us_saved" ] && [ -n "$_us_now" ] && [ "$_us_saved" != "$_us_now" ]; then
+        clear_user_stop
+        log "重启后检测到停用标记已过期（boot_id 变化）→ 清除，恢复自愈"
+        return 1
+    fi
+    return 0
+}
+
 mkdir -p "$VAR_DIR" 2>/dev/null || true
 log(){ echo "[$(date '+%F %T')] boot_guard: $*" >>"$LOG" 2>/dev/null || true; }
 
@@ -528,7 +567,17 @@ echo "$(getprop init.svc.dumpstate)/$(getprop init.svc.dumpstatez)/$(getprop ini
                     _wr_ts=$(date -d "$_wr_fin" +%s 2>/dev/null || echo 0)
                     [ "$_wr_ts" -gt 0 ] 2>/dev/null && _wr_age=$(( $(date +%s) - _wr_ts ))
                 fi
-                if [ "$_wr_age" -lt 180 ]; then
+                ### 3.9.9-r27：先看退出码。143 = SIGTERM = 被 docker stop / compose stop
+                ### 停掉的，只可能是「用户点停用」或飞牛停用，绝不可能是自己崩溃
+                ### （进程崩溃的退出码是 1/2/137/139 之类，不会有 143）。
+                ### 2026-11-15 21:11 实测：用户 21:11:35 点停用，webrtc 退出 143，
+                ### 靠原来的「180 秒时间闸」不够 —— 21:15:04（208 秒后）本规则把
+                ### webrtc 又拉起来了，用户看到「停用了但画面服务自己回来了」。
+                ### 因此这里改成：只要退出码是 143，无论过多久都不拉起。
+                _wr_exit=$(docker inspect -f '{{.State.ExitCode}}' androidemu-webrtc 2>/dev/null | tr -d '\r\n')
+                if [ "$_wr_exit" = "143" ]; then
+                    log "webrtc 是收到停止信号退出的（exit 143，用户停用中）→ 不自动拉起"
+                elif [ "$_wr_age" -lt 180 ]; then
                     log "webrtc 刚退出 ${_wr_age}s（疑似用户停用中）→ 本轮不自动拉起"
                 else
                     log "webrtc 容器已停止而安卓容器在运行 → 自动启动（本次开机限一次）"
@@ -903,14 +952,32 @@ try:
 except Exception:
     sys.exit(1)
 PY
-        [ "$_gw_bad" = "1" ] && log "app.sock 死 socket → 清理并重启网关"
+        if [ "$_gw_bad" = "1" ]; then
+            log "app.sock 死 socket → 清理并重启网关"
+        else
+            ### 3.9.9-r24：能 connect 不等于能干活。实测存在「socket 通、网关内部卡死」
+            ### 的情况：飞牛反代照样回 502 Bad Gateway，但进程在、socket 也在，
+            ### 旧检查永远不会修。这里补一次真实 HTTP 请求 —— 只要拿不到任何状态码
+            ### （curl 的 000）就判坏。返回 401/404 之类都算活着，不做业务判断。
+            _gw_code=$(curl -s -o /dev/null -m 4 -w '%{http_code}' \
+                --unix-socket "$_gw_sock" http://localhost/api/status 2>/dev/null)
+            case "${_gw_code:-000}" in
+                000|"")
+                    _gw_bad=1
+                    log "app.sock 能连但不回 HTTP（网关内部卡死）→ 重启网关"
+                    ;;
+            esac
+        fi
     fi
     if [ "$_gw_bad" = "1" ] && [ -x "$_gw_bin" ]; then
         _gw_now=$(date +%s)
         if [ $(( _gw_now - _gw_restart_ts )) -ge 30 ]; then
             _gw_restart_ts=$_gw_now
             rm -f "$_gw_sock" 2>/dev/null || true
-            ( cd / && TRIM_APPDEST="$APP_DIR" TRIM_PKGVAR="$VAR_DIR" "$_gw_bin" start >/dev/null 2>&1 & ) || true
+            ### 3.9.9-r28：本守护可能是 root（systemd 托管），而网关是用户可见的前端，
+            ### 必须降权到包用户启动 —— 官方口径「前台进程不要 root」。
+            ( cd / && export TRIM_APPDEST="$APP_DIR" TRIM_PKGVAR="$VAR_DIR" TRIM_RUN_USERNAME="$PKG_USER"
+              as_pkg "$_gw_bin" start ) >/dev/null 2>&1 &
         fi
     fi
     _now=$(date +%s)
@@ -938,9 +1005,51 @@ PY
     fi
 }
 
+### ---------------------------------------------------------------------------
+### 3.9.9-r24：健康快照 —— 让故障自己留证，用户不需要敲任何命令
+### 群友报障时最缺的就是「出问题那一刻的状态」：日志会被下一次重启清掉，
+### 只能靠用户回忆「它自己退出了」。这里每轮巡检把关键状态写成一个纯文本快照，
+### 网关状态页会读它并展示，用户截一张图就等于把完整现场发过来了。
+### 只做只读采集，不改任何状态；任何一步失败都不影响巡检本身。
+### ---------------------------------------------------------------------------
+write_health() {
+    local _hf="$VAR_DIR/health.txt"
+    {
+        echo "androidemu 健康快照  $(date '+%F %T')"
+        echo "------------------------------------------------------------"
+        echo "容器 安卓    : $(docker inspect -f '{{.State.Status}}' "$C" 2>/dev/null || echo none)"
+        echo "容器 画面    : $(docker inspect -f '{{.State.Status}}' "$C_WEB" 2>/dev/null || echo none)"
+        echo "安卓 boot   : $(docker exec -u 0 "$C" sh -c 'getprop sys.boot_completed' 2>/dev/null | tr -d '\r\n')"
+        echo "网关进程    : $(ps -eo pid,args 2>/dev/null | grep -F "$APP_DIR/server/gateway" | grep -E 'gateway(_amd64|_arm64) (supervise|serve)' | grep -v grep | awk '{print $1}' | head -1)"
+        echo "网关入口    : $([ -S "$APP_DIR/app.sock" ] && echo 'app.sock 存在' || echo 'app.sock 缺失')"
+        echo "画面端口    : $(ss -lnt 2>/dev/null | grep -cE ':(8443|8444|8445)\b') 个监听"
+        echo "agent 进程  : $(docker exec -u 0 "$C" sh -c 'pidof cloudphone-agent' 2>/dev/null | tr -d '\r\n')"
+        echo "投屏核心    : $(docker exec -u 0 "$C" sh -c 'stat -c "mode=%a uid=%u" /data/local/tmp/app_process 2>/dev/null' 2>/dev/null | tr -d '\r\n')"
+        echo "媒体注入    : $(docker exec -u 0 "$C" sh -c 'grep -c "c2.hardware" /vendor/etc/media_codecs.xml 2>/dev/null' 2>/dev/null | tr -d '\r\n') 条 c2.hardware（0=走软件编码，正常）"
+        echo "硬件编码    : $(cat "$VAR_DIR/hwenc.status" 2>/dev/null)$([ -f "$VAR_DIR/hwenc.deferred" ] && echo '（暂缓：当前分辨率超上限）')"
+        echo "------------------------------------------------------------"
+        echo "最近巡检日志（末尾 20 行）："
+        tail -20 "$LOG" 2>/dev/null | sed 's/^/  /'
+    } > "$_hf" 2>/dev/null || true
+}
+
+
+### 用户停用时把前端网关也停掉（否则飞牛反代仍能打开面板，等于没停）。
+### 用 pid 精确匹配，不用 pkill -f —— 命令行里带同样字符串的 shell 会被误杀。
+kill_gateway(){
+    for _p in $(ps -eo pid,args 2>/dev/null | grep -F "$APP_DIR/server/gateway_" \
+            | grep -E 'gateway_(amd64|arm64) (supervise|serve)' | grep -v grep | awk '{print $1}'); do
+        kill "$_p" 2>/dev/null || true
+    done
+    for _p in $(ps -eo pid,args 2>/dev/null | grep -F "$APP_DIR/server/gateway_" \
+            | grep -E 'gateway_(amd64|arm64) (supervise|serve)' | grep -v grep | awk '{print $1}'); do
+        kill -9 "$_p" 2>/dev/null || true
+    done
+    rm -f "$APP_DIR/app.sock" 2>/dev/null || true
+}
+
 supervise_loop(){
-    log "开机守护启动（pid=$$，每 ${INTERVAL}s 巡检，卡住阈值 ${STUCK_SECS}s）"
-    _down_max="${BG_DOWN_SECS:-300}"
+    log "开机守护启动（pid=$$，每 ${INTERVAL}s 巡检，卡住阈值 ${STUCK_SECS}s）"    _down_max="${BG_DOWN_SECS:-300}"
     _dormant=0
     while :; do
         ### 3.9.9：局域网地址漂移自愈（实测 2026-11-14，群友多网卡机器）。
@@ -980,6 +1089,8 @@ supervise_loop(){
         done
         _up=0
         if _container_up; then
+            ### 3.9.9-r28：容器在跑 = 用户已启用，停用标记必须清掉
+            [ -f "$USER_STOP" ] && { clear_user_stop; log "容器已运行 → 清除停用标记"; }
             _up=1
             rm -f "$DIS_SINCE" 2>/dev/null || true
             if [ "$_dormant" = "1" ]; then
@@ -989,6 +1100,25 @@ supervise_loop(){
             fi
             ensure_helpers
         else
+            ### 3.9.9-r28：先判「是不是用户主动停用」。
+            ### 容器存在且已退出，退出码 0/143/137（137 = docker stop 超时后的强杀）→
+            ### 只可能是被停掉的，崩溃不会是这个模式。命中就写标记并彻底休眠：
+            ### 不拉容器、不起网关、不补建画面容器 —— 让「停用」真的停住。
+            ### 同一次开机内一直保持；重启后 boot_id 变化，标记自动失效并恢复自愈。
+            _as=$(docker inspect -f '{{.State.Status}}|{{.State.ExitCode}}' "$C" 2>/dev/null | tr -d '\r\n')
+            case "$_as" in
+                exited\|0|exited\|143|exited\|137|dead\|*|created\|*)
+                    if ! user_stopped; then
+                        mark_user_stop
+                        log "容器已停止（${_as:-未知}）→ 判定为用户停用，写入停用标记，本次开机不再拉起"
+                    fi
+                    ;;
+            esac
+            if user_stopped; then
+                kill_gateway
+                sleep "$INTERVAL"
+                continue
+            fi
             if ! _has_container; then
                 ### 容器根本不存在（首次安装镜像未就绪 / 早期 up 失败）→ 不能算用户停用，
                 ### 主动把容器建出来，否则应用中心的「启用」永远是 12005。
@@ -1010,6 +1140,7 @@ supervise_loop(){
         # harden_system、adbd 之类的检查必然失败，只会往日志里刷「OCI runtime exec failed」
         # 这类噪音，对排查没有帮助。等容器回来（created/restarting/running）再恢复巡检。
         if [ "$_dormant" != "1" ] && [ "$_up" = "1" ]; then once || true; fi
+        write_health || true
         rotate_logs || true
         sleep "$INTERVAL"
     done
