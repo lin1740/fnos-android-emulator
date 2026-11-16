@@ -76,6 +76,21 @@ daemon_pids() {
     pgrep -x daemon-hwdec 2>/dev/null
 }
 
+### 3.9.9-r20：媒体栈探针 —— 容器内录 1 秒，能产出 >2KB 的 mp4 才算「真的在编码」。
+### 用来区分「XML 已经清干净了，但 mediaserver 本身卡死」这种情况：
+### 2026-11-15 13:46 实测，回退后 XML 无残留、daemon 已停、面板也照常连上，
+### 但 MediaCodec 只 configure 不出帧 —— 投屏全黑，screenrecord 录出 0 字节，
+### 只有 docker restart 容器才恢复。只看 XML/进程/属性是查不出这个状态的。
+media_stack_alive() {
+    local _sz
+    dex 'rm -f /data/local/tmp/.hwenc_probe.mp4' >/dev/null 2>&1
+    dex 'timeout 12 screenrecord --time-limit 1 /data/local/tmp/.hwenc_probe.mp4' >/dev/null 2>&1
+    _sz=$(dex 'stat -c %s /data/local/tmp/.hwenc_probe.mp4 2>/dev/null' | tr -d '\r\n')
+    case "${_sz:-0}" in ''|*[!0-9]*) _sz=0 ;; esac
+    dex 'rm -f /data/local/tmp/.hwenc_probe.mp4' >/dev/null 2>&1
+    [ "$_sz" -ge 2000 ]
+}
+
 ### 3.9.9-r13：硬解默认开；只有显式写入 off 才关闭。
 decode_enabled() {
     [ "$(cat "$DECODE_CONF" 2>/dev/null | tr -d '\r\n')" = "off" ] && return 1
@@ -623,9 +638,26 @@ AE_AWK_CLEAN
         log "禁用未完成：XML 仍残留 ${_left} 条注入条目$([ -n "${_dpid:-}" ] && echo "，daemon 仍在运行(pid=$_dpid)")"
         log "彻底恢复需重建 Android 容器：cd $APP_DIR/docker && docker rm -f $CT && docker compose -f docker-compose.yaml up -d redroid"
         echo "disabled-incomplete" > "$STATUS"
+        date +%s > "$VAR_DIR/hwenc.last_run" 2>/dev/null || true
         return 1
     fi
+
+    ### 3.9.9-r20：回退完成后确认媒体栈真的能出帧（原因见 media_stack_alive 注释）。
+    ### 反复重启媒体栈之后，mediaserver 可能停在「能 configure、零帧输出」的状态，
+    ### 这时 XML/进程/属性看起来全是干净的，但投屏就是黑屏。
+    if ! media_stack_alive; then
+        log "回退后媒体栈不出帧（探针 0 字节）→ 再重启一次媒体栈"
+        dex 'setprop ctl.restart media' >/dev/null
+        sleep 12
+        if media_stack_alive; then
+            log "重启媒体栈后已恢复出帧"
+        else
+            log "重启媒体栈后仍不出帧：需重启 Android 容器（docker restart $CT）才能恢复投屏"
+        fi
+    fi
+
     echo "disabled" > "$STATUS"
+    date +%s > "$VAR_DIR/hwenc.last_run" 2>/dev/null || true
     log "已禁用：ccodec=1（软件编码），XML 无残留、daemon 已停"
     return 0
 }
@@ -661,6 +693,21 @@ do_enable() {
     rm -f "$HINT"
     log "检测通过：$_ARCH / $_GPU / ${_ENC} 个编码入口"
     [ -n "${_WARN_RADEON:-}" ] && log "注意：$_WARN_RADEON；手机/平板分辨率会退回软件编码"
+
+    ### 3.9.9-r21：当前分辨率超过驱动上限 → **不注入**，只记「用户要启用、暂缓生效」。
+    ### 原因见 hwenc_res_exceeded 注释：超限时注入留下的「XML 有条目 + HAL 被重启带走
+    ### + ccodec 被改回 1」组合会让 MediaCodec 选中不存在的硬编码器，直接黑屏。
+    ### 状态仍写 enabled（表示用户意愿），deferred 标记表示「等分辨率合适再注入」，
+    ### repair / resync 看到 deferred 就知道该不该动手。
+    if hwenc_res_exceeded; then
+        echo "enabled" > "$STATUS"
+        : > "$VAR_DIR/hwenc.deferred" 2>/dev/null || true
+        date +%s > "$VAR_DIR/hwenc.last_run" 2>/dev/null || true
+        log "当前分辨率 $(current_wh) 超过驱动上限 $(hwenc_max_size)：本次不注入硬编组件，走软件编码"
+        echo "当前分辨率 $(current_wh) 超过驱动上限 $(hwenc_max_size)，已跳过注入；切到适用分辨率后会自动启用"
+        return 0
+    fi
+    rm -f "$VAR_DIR/hwenc.deferred" 2>/dev/null || true
 
     ### 3.9.9-r15：只在 orig 不存在时备份。旧写法每次 enable 都无条件 cp -f 覆盖，
     ### 一旦上一次 disable 没还原干净 / 中途失败，当前 XML 已带注入条目，备份就被污染；
@@ -701,6 +748,9 @@ do_enable() {
     log "启用成功：≤$(hwenc_max_size) 走硬件编码，更高分辨率退回软件编码"
     ### 立刻按当前实际分辨率校准一次（避免启用时正处在手机/平板分辨率而错选硬件编码器）
     do_resync
+    ### 3.9.9-r20：整轮跑完（含 resync 里的媒体栈重启）才记时间戳，
+    ### 供命令行入口的 90 秒冷却判断，避免巡检/回调在 60 秒内再触发一轮注入。
+    date +%s > "$VAR_DIR/hwenc.last_run" 2>/dev/null || true
     log "提示：容器重启后需 repair（boot_guard 会自动执行）；分辨率切换后需 resync"
     return 0
 }
@@ -715,16 +765,58 @@ do_repair() {
     ### 3.9.9：ccodec 的期望值取决于当前分辨率（超限时本来就该是 0）。
     ### 早期实现固定期望 4，手机分辨率下每 300 秒都会被判「缺失」并重跑 enable，
     ### 表现为 media 反复重启、投屏卡顿。
-    local need=0 cur w h want
+    local need=0 cur w h want _mx _mw _mh
     cur=$(current_wh)
     w=${cur%x*}; h=${cur#*x}
-    if [ "${w:-0}" -le 1920 ] && [ "${h:-9999}" -le 1088 ]; then want=4; else want=0; fi
+    _mx=$(hwenc_max_size); _mw=${_mx%x*}; _mh=${_mx#*x}
+    if [ "${w:-0}" -le "${_mw:-1920}" ] && [ "${h:-9999}" -le "${_mh:-1088}" ]; then want=4; else want=0; fi
+
+    ### 3.9.9-r21：分辨率超限时（want=0）整段维护逻辑都不该跑。
+    ###   · 已经是 deferred → 什么都不用做，等分辨率变化；
+    ###   · 之前注入过（没有 deferred）→ 立刻撤回注入，回到干净的软件编码状态。
+    ### 这是「注入后反复重建 → 媒体栈卡死 → 投屏黑屏」的最终封堵点。
+    if [ "$want" = "0" ]; then
+        if [ -f "$VAR_DIR/hwenc.deferred" ]; then
+            ### 超限时连硬解 daemon 也不该常驻：它只服务 VA-API 编解码，
+            ### 留着就是一条没有用途的宿主进程（审核侧看进程清单会多一条）。
+            if [ -n "$(daemon_pids | head -1)" ]; then
+                for _p in $(daemon_pids); do kill -9 "$_p" 2>/dev/null || true; done
+                log "已停止闲置的硬解 daemon（当前分辨率走软件编码）"
+            fi
+            log "当前分辨率 ${cur:-未知} 超过驱动上限 ${_mx}，保持软件编码，无需维护注入"
+            return 0
+        fi
+        log "当前分辨率 ${cur:-未知} 超过驱动上限 ${_mx}，撤回硬编注入（避免选中不存在的硬件编码器）"
+        do_disable >/dev/null 2>&1 || true
+        echo "enabled" > "$STATUS"
+        : > "$VAR_DIR/hwenc.deferred" 2>/dev/null || true
+        date +%s > "$VAR_DIR/hwenc.last_run" 2>/dev/null || true
+        return 0
+    fi
+
+    ### 分辨率回到了驱动上限以内，且之前是 deferred → 现在才真正注入。
+    if [ -f "$VAR_DIR/hwenc.deferred" ]; then
+        log "分辨率 ${cur} 已进入驱动上限 ${_mx}，重新启用硬件编解码"
+        rm -f "$VAR_DIR/hwenc.deferred" 2>/dev/null || true
+        do_enable
+        return $?
+    fi
 
     [ "$(dex 'ls /vendor/bin/hw/android.hardware.media.c2@1.1-vaapi-service 2>/dev/null | wc -l')" -lt 1 ] && need=1
     [ "$(dex 'grep -c "c2.hardware.encoder.h264" /vendor/etc/media_codecs.xml 2>/dev/null')" -lt 1 ] && need=1
-    [ -n "$(daemon_pids | head -1)" ] || need=1
-    [ "$(dex 'lshal 2>/dev/null | grep -c "media.c2@1.1::IComponentStore/default"')" -lt 1 ] && need=1
     [ "$(dex 'getprop debug.stagefright.ccodec')" != "$want" ] && need=1
+    ### 3.9.9-r20：daemon / HIDL 只在「当前分辨率真的该走硬编」（want=4）时才要求在线。
+    ### 2026-11-15 13:40-13:46 实测的死亡循环：resync 切 ccodec=0 时的
+    ### `ctl.restart media` 会顺带把 C2 HAL（lazy service）一起带走，而这里仍要求
+    ### lshal 有注册 → 每轮 repair 都判「注入缺失」→ 重跑 enable（又一次重启媒体栈）
+    ### → HAL 再丢 → 再判缺失……300 秒一轮无限循环，最后 mediaserver 停进
+    ### 「能 configure、零帧输出」状态，投屏黑屏、screenrecord 0 字节。
+    ### 分辨率超上限时本来就走 OMX 软件编码，HAL 在不在线与当前播放无关，
+    ### 只要 XML 条目与 vaapi-service 还在，切回 PC 分辨率时能重新启用即可。
+    if [ "$want" = "4" ]; then
+        [ -n "$(daemon_pids | head -1)" ] || need=1
+        [ "$(dex 'lshal 2>/dev/null | grep -c "media.c2@1.1::IComponentStore/default"')" -lt 1 ] && need=1
+    fi
 
     if [ "$need" = "0" ]; then
         log "注入完整（当前 ${cur:-未知}，ccodec 期望 $want），无需修复"
@@ -732,7 +824,13 @@ do_repair() {
     fi
 
     log "注入缺失（当前 ${cur:-未知}，ccodec 期望 $want），重新应用"
-    do_enable
+    ### 3.9.9-r20：do_enable 失败时它内部已经回退到软件编码（并重启过媒体栈），
+    ### 这里不能无条件再跟一次 do_resync —— 那会再重启一次媒体栈，
+    ### 正是「20 秒内连着重启两轮 → mediaserver 卡死 → 投屏黑屏」的来源之一。
+    if ! do_enable; then
+        log "重新应用失败，保持软件编码，跳过本次 resync"
+        return 1
+    fi
     do_resync
     return 0
 }
@@ -752,6 +850,29 @@ current_wh() {
     ov=$(echo "$raw" | grep -oE 'Override size: [0-9]+x[0-9]+' | grep -oE '[0-9]+x[0-9]+' | tail -1)
     [ -n "$ov" ] && { echo "$ov"; return; }
     echo "$raw" | grep -oE '[0-9]+x[0-9]+' | tail -1
+}
+
+### ---------------------------------------------------------------------------
+### 3.9.9-r21：当前分辨率是否超过**当前驱动**的编解码尺寸上限
+### 为什么要单列这一条：2026-11-15 现场查明，手机分辨率（576x1280，高度 1280）
+### 在这台 radeonsi-legacy（上限 1920x1088）上**硬编根本不参与编码**，
+### 但只要注入了 /vendor，就会留下一个致命组合：
+###   XML 里有 c2.hardware.encoder.h264（MediaCodecList 会把它算进去）
+###   + resync 时 ctl.restart media 把 lazy 的 C2 HAL 一起带走
+###   + 属性 ccodec 被系统改回 1（此时才去枚举 Codec2）
+### → MediaCodec 选中一个已经不存在的硬编码器 → dequeueOutputBuffer 抛
+###   IllegalStateException → CoreService 退出、投屏黑屏、screenrecord 0 字节。
+### 结论：超限时**一开始就不要注入**，让 Android 安安静静走 OMX 软件编码。
+### ---------------------------------------------------------------------------
+hwenc_res_exceeded() {
+    local cur w h mx mw mh
+    cur=$(current_wh)
+    [ -z "$cur" ] && return 1
+    w=${cur%x*}; h=${cur#*x}
+    mx=$(hwenc_max_size); mw=${mx%x*}; mh=${mx#*x}
+    case "$w" in ''|*[!0-9]*) return 1 ;; esac
+    case "$h" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$w" -gt "${mw:-1920}" ] || [ "$h" -gt "${mh:-1088}" ]
 }
 
 ### 3.9.9：等媒体栈真正就绪再返回。实测（2026-11-09 分辨率矩阵）切换后立刻录制
@@ -785,6 +906,30 @@ do_resync() {
         target=0
     fi
 
+    ### 3.9.9-r21：超限分辨率不参与硬编，这一段**不再 setprop、不再重启媒体栈**。
+    ### 之前的实现会 setprop ccodec 0 + ctl.restart media，而系统很快把 ccodec 改回 1，
+    ### 于是 XML 里的 c2.hardware 条目被重新枚举到、HAL 却已被重启带走 → 选中死编码器。
+    if [ "$target" = "0" ]; then
+        if [ -f "$VAR_DIR/hwenc.deferred" ]; then
+            log "resync：分辨率 ${cur} 超过驱动上限 ${_mx}，保持软件编码，无需变更"
+            return 0
+        fi
+        log "resync：分辨率 ${cur} 超过驱动上限 ${_mx}，撤回硬编注入"
+        do_disable >/dev/null 2>&1 || true
+        echo "enabled" > "$STATUS"
+        : > "$VAR_DIR/hwenc.deferred" 2>/dev/null || true
+        date +%s > "$VAR_DIR/hwenc.last_run" 2>/dev/null || true
+        return 0
+    fi
+
+    ### 分辨率回到了上限以内，且之前是 deferred → 现在才注入。
+    if [ -f "$VAR_DIR/hwenc.deferred" ]; then
+        log "resync：分辨率 ${cur} 已进入驱动上限 ${_mx}，重新注入并启用"
+        rm -f "$VAR_DIR/hwenc.deferred" 2>/dev/null || true
+        do_enable
+        return $?
+    fi
+
     now=$(dex 'getprop debug.stagefright.ccodec')
     if [ "$now" = "$target" ]; then
         log "resync：当前 ${cur}，ccodec 已是 $target，无需变更"
@@ -805,6 +950,13 @@ setprop ctl.restart media" >/dev/null
         dex "setprop debug.stagefright.ccodec 4
 setprop debug.stagefright.c2software 0
 dumpsys media.player >/dev/null 2>&1" >/dev/null
+        ### 3.9.9-r20：`ctl.restart media` 会把这个 lazy HIDL 服务一起带走。
+        ### 不重新拉起的话，ccodec 就算是 4，列表里也没有硬件编码器（0 处），
+        ### 而且下一轮 repair 会判「注入缺失」再跑一遍 enable → 又是一次媒体栈重启。
+        if [ "$(dex 'lshal 2>/dev/null | grep -c "media.c2@1.1::IComponentStore/default"')" -lt 1 ]; then
+            log "resync：媒体栈重启后 C2 HAL 未注册 → 重新拉起"
+            service_start >/dev/null 2>&1 || true
+        fi
         sleep 3
     else
         sleep 10
@@ -835,6 +987,9 @@ do_status() {
         echo "HIDL default : $(dex 'lshal 2>/dev/null | grep -c "media.c2@1.1::IComponentStore/default"') 个"
         echo "硬件编码器   : $(dex 'dumpsys media.player 2>/dev/null | grep -c "c2.hardware.encoder.h264"') 处"
         echo "硬件解码器   : $(dex 'dumpsys media.player 2>/dev/null | grep -c "c2.hardware.decoder"') 处"
+        ### 3.9.9-r21：enabled 但暂缓注入时要说清楚，否则用户看到「已启用、0 处硬件编码器」会困惑。
+        [ -f "$VAR_DIR/hwenc.deferred" ] && \
+            echo "注入状态     : 暂缓 —— 当前分辨率超过驱动上限 $(hwenc_max_size)，走软件编码（切到适用分辨率后自动启用）"
     fi
     echo "硬件解码开关 : $(decode_enabled && echo 'on（默认开启）' || echo off)   驱动/上限: $(va_driver_name) / $(hwenc_max_size)"
     echo "hwdec daemon : $([ -x "$DAEMON_HWDEC" ] && echo 已安装 || echo '未安装（先在 CI 构建）')"
@@ -882,7 +1037,47 @@ do_decode() {
     fi
 }
 
-case "${1:-status}" in
+### ---------------------------------------------------------------------------
+### 3.9.9-r20：注入流程互斥 + 自动路径冷却
+### 2026-11-15 13:45 实测：同一次启用过程中，do_repair 在 21 秒内被触发了两次，
+### 每次都「注入 /vendor → setprop ccodec → ctl.restart media」，两轮下来
+### mediaserver 进了「能 configure、零帧输出」的卡死态：面板照常连得上、画面全黑，
+### screenrecord 也录出 0 字节，只有 docker restart 容器才恢复。
+### 现在：① flock 保证同一时刻只有一个注入流程在跑（防并发重入）；
+###       ② enable/repair/resync 距上次动作不足 90 秒直接跳过（防连发重启媒体栈）。
+### 需要强制重跑：ANDROIDEMU_HWENC_FORCE=1。
+### disable 与 decode 是用户主动操作，只加锁不加冷却。
+### ---------------------------------------------------------------------------
+ACTION="${1:-status}"
+case "$ACTION" in
+    enable|disable|repair|resync|decode)
+        if exec 7>"$VAR_DIR/.hwenc.lock" 2>/dev/null; then
+            if command -v flock >/dev/null 2>&1 && ! flock -n 7 2>/dev/null; then
+                log "另一个注入流程正在运行，跳过本次 $ACTION"
+                echo "另一个注入流程正在运行，请稍后再试"
+                exit 0
+            fi
+        fi
+        case "$ACTION" in
+            enable|repair|resync)
+                if [ "${FORCE:-0}" != "1" ]; then
+                    _ln=$(cat "$VAR_DIR/hwenc.last_run" 2>/dev/null | tr -d '\r\n')
+                    case "$_ln" in ''|*[!0-9]*) _ln=0 ;; esac
+                    if [ "$_ln" -gt 0 ]; then
+                        _gap=$(( $(date +%s) - _ln ))
+                        if [ "$_gap" -lt 90 ]; then
+                            log "冷却中（距上次注入 ${_gap}s < 90s），跳过本次 $ACTION"
+                            echo "冷却中（${_gap}s 前刚执行过注入），跳过本次 $ACTION"
+                            exit 0
+                        fi
+                    fi
+                fi
+                ;;
+        esac
+        ;;
+esac
+
+case "$ACTION" in
     status)  do_status ;;
     decode)  do_decode "${2:-status}" ;;
     enable)  do_enable ;;
