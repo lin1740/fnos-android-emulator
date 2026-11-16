@@ -76,6 +76,124 @@ def gw_binary():
     return ""
 
 
+def _pkg_user_name():
+    return os.environ.get("TRIM_RUN_USERNAME", "docker-androidemu")
+
+
+def _spawn_as_pkg(args, cwd=None, timeout=None):
+    """以降权方式拉起宿主进程。
+    ### 3.9.9-r26：飞牛调用 cmd/main 时会用系统身份（main.log 属主是 root）。
+    ### 从这里拉起的网关/看护若不降权，就会变成两个宿主 root 常驻进程 ——
+    ### 直接违反本应用的运行级别约定，审核也过不去。所以 euid==0 时一律走 runuser。
+    ### runuser 在 /usr/sbin，飞牛回调的 PATH 常常不含它，这里显式找绝对路径。
+    """
+    _u = _pkg_user_name()
+    if os.geteuid() == 0:
+        _ru = shutil.which("runuser") or "/usr/sbin/runuser"
+        if os.path.exists(_ru):
+            return subprocess.Popen([_ru, "-u", _u, "--"] + args,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    cwd=cwd, start_new_session=True)
+        log("警告：未找到 runuser，拒绝以系统身份常驻启动 %s" % args[0])
+        return None
+    return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            cwd=cwd, start_new_session=True)
+
+
+def _spawn_backend(args, cwd=None):
+    """后端看护（boot_guard）启动。
+    ### 3.9.9-r28：官方口径「前台进程不要 root，后端可酌情允许 root」。
+    ### 后端要起容器、杀卡死进程、改容器文件属主，包用户做不到，所以允许以当前身份
+    ### （通常是 root）运行。**只给后端用**：对外的前端网关仍走 _spawn_as_pkg 降权。
+    """
+    return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            cwd=cwd, start_new_session=True)
+
+
+def _start_guard_service():
+    """优先用 systemd 拉起后端看护 —— 这是「NAS 重启后自动恢复」的唯一可靠入口。"""
+    if os.geteuid() != 0:
+        return False
+    try:
+        r = subprocess.run(["systemctl", "start", "androidemu-guard"],
+                           capture_output=True, timeout=40)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _gateway_alive():
+    r = run("ps -eo args 2>/dev/null | grep -F '%s/server/gateway' "
+            "| grep -E 'gateway(_amd64|_arm64) (supervise|serve)' | grep -v grep" % APP_DEST,
+            timeout=10)
+    return bool(r and (r.stdout or b"").strip())
+
+
+def _image_pulling():
+    """后台是否正在拉取镜像（start_pull_bg 在跑）。
+    ### 3.9.9-r29：全新安装到容器建出来之间有一段正常空窗 —— 要下约 2GB 镜像。
+    ### 旧逻辑此时 status 直接返回 3，飞牛立刻显示「已停止 / docker 不可用」，
+    ### 群友 2026-11-16 反馈的「重新安装后 Docker 不可用、Android-Emu 无法启动」
+    ### 正是撞在这个窗口里。只要拉取进程还活着、且没超过 40 分钟，就算「准备中」。
+    """
+    pid_file = os.path.join(VAR_DIR, "pull.pid")
+    try:
+        with open(pid_file) as f:
+            pid = int((f.read().strip() or "0"))
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except Exception:
+        return False
+    try:
+        age = time.time() - os.path.getmtime(pid_file)
+    except Exception:
+        age = 0
+    return age < 2400
+
+
+def ensure_gateway_quiet():
+    """**只在网关缺失时补起**，成功与否都不影响调用方返回值。
+    ### 3.9.9-r26：这是开机后唯一会被飞牛周期性触发的入口（它只轮询 status，不调 start）。
+    ### NAS 重启后安卓容器会被 docker 自己拉起来，而网关与 boot_guard 属宿主进程、没人启动，
+    ### 于是 app.sock 变成关机前的僵尸 → 飞牛反代 502 Bad Gateway，等多久都不会好。
+    ### 这里 30 秒防抖，避免 status 被高频调用时反复 spawn。
+    """
+    if _gateway_alive():
+        return
+    _stamp = os.path.join(VAR_DIR, ".gw_heal_at")
+    try:
+        _last = int((open(_stamp).read().strip() or "0"))
+    except Exception:
+        _last = 0
+    if time.time() - _last < 30:
+        return
+    try:
+        open(_stamp, "w").write(str(int(time.time())))
+    except Exception:
+        pass
+    log("状态检查：容器在运行但网关缺失 → 补起网关与看护（按包用户身份）")
+    _bin = gw_binary()
+    if _bin:
+        _p = _spawn_as_pkg([_bin, "start"], cwd=APP_DEST)
+        if _p is None:
+            log("网关补起失败：无法降权")
+    _bg = os.path.join(APP_DEST, "scripts", "boot_guard.sh")
+    if os.path.exists(_bg):
+        ### 3.9.9-r28：后端看护优先交给 systemd（root），它才起得来被停掉的容器。
+        if _start_guard_service():
+            log("后端看护已由 systemd 拉起（状态检查触发）")
+        else:
+            try:
+                _spawn_backend(["bash", _bg, "start"], cwd=APP_DEST)
+                log("开机守护已补起（非 systemd 路径）")
+            except Exception as e:
+                log("开机守护补起失败：%r" % (e,))
+
+
 def start_gateway():
     """网关自带守护循环与自愈（Go 实现），这里只做幂等启动。
     健康时 start 不会重启（避免掐断在线会话），并会清理上一版遗留的网关进程。"""
@@ -84,7 +202,15 @@ def start_gateway():
         log("未找到 Go 网关二进制（server/gateway_amd64|gateway_arm64）")
         return
     try:
-        r = subprocess.run([binp, "start"], capture_output=True, timeout=60,
+        ### 3.9.9-r26：euid==0（飞牛以系统身份调用）时降权，避免宿主 root 常驻。
+        _ru = None
+        if os.geteuid() == 0:
+            _ru = shutil.which("runuser") or "/usr/sbin/runuser"
+            if not os.path.exists(_ru):
+                log("警告：未找到 runuser，跳过网关启动（不允许以系统身份常驻）")
+                return
+        _cmd = ([_ru, "-u", _pkg_user_name(), "--"] if _ru else []) + [binp, "start"]
+        r = subprocess.run(_cmd, capture_output=True, timeout=60,
                            env={**os.environ, "TRIM_APPDEST": APP_DEST, "TRIM_PKGVAR": VAR_DIR})
         out = (r.stdout or b"").decode("utf-8", "replace").strip()
         err = (r.stderr or b"").decode("utf-8", "replace").strip()
@@ -386,10 +512,15 @@ def heal_tree_perm():
         log("已纠正应用树内 %d 个物件的属主（3.9.3 权限修正）" % fixed)
 
 
-def _wait_docker(max_wait=90):
+def _wait_docker(max_wait=300):
     """3.9.4 加固：等待 docker 守护就绪，避免开机/重启后立刻点「启用」时
     docker 尚未起来，所有 docker 调用直接失败，飞牛据此弹出「docker不可用」。
     实测（2026-11-02 用户反馈）该提示多数不是真的不可用，而是时序问题。
+    ### 3.9.9-r23：90 秒 → 300 秒。2026-11-15 群友反馈「NAS 重启后应用起不来、
+    ### 提示 docker 不可用、等很久也不行」。慢盘/容器多的机器上 dockerd 起步
+    ### 常常超过 90 秒，而这一步超时之后紧接着就是 compose up，一旦 docker 还没好，
+    ### 容器就建不出来；此时只有等 boot_guard 下一轮巡检（60 秒一次）再来，
+    ### 用户看到的就是「一直在转圈」。等满 5 分钟的成本远低于让用户手动点一次启用。
     这里最多等 max_wait 秒；超时也不退出（后续每步都各自容错并重试），
     仅记录日志，绝不因等待失败而让整个启用失败。"""
     try:
@@ -412,6 +543,44 @@ def _wait_docker(max_wait=90):
 def start():
     log("=== 启动 androidemu 3.9.8 ===")
     _wait_docker()
+    ### 3.9.9-r25：快速恢复路径 —— NAS 重启后最常见的就是「容器被 docker 自己拉起、
+    ### 网关和看护没起」。这种状态下走完整启动流程（heal → compose up → 等 boot）
+    ### 要几十秒，而实际只缺网关与 boot_guard。先看一眼，缺什么补什么，秒级恢复。
+    ### 判断是只读的，任何异常都回落到完整流程，不影响原有行为。
+    try:
+        _ps = run("docker ps --filter name=androidemu-android --format '{{.Names}}'", timeout=10)
+        _cn = (_ps.stdout or b"").decode("utf-8", "replace") if _ps else ""
+        _gw = run("ps -eo args 2>/dev/null | grep -F '%s/server/gateway' "
+                  "| grep -E 'gateway(_amd64|_arm64) (supervise|serve)' | grep -v grep" % APP_DEST,
+                  timeout=10)
+        _gwn = (_gw.stdout or b"").decode("utf-8", "replace") if _gw else ""
+        if "androidemu-android" in _cn and not _gwn.strip():
+            log("快速恢复：安卓容器已在运行，只缺网关/看护 → 直接补齐，不重建容器")
+            start_gateway()
+            _bg = os.path.join(APP_DEST, "scripts", "boot_guard.sh")
+            if os.path.exists(_bg):
+                ### 3.9.9-r28：优先 systemd（root 后端），它才起得来被停掉的容器
+                if _start_guard_service():
+                    log("后端看护已由 systemd 拉起（快速恢复）")
+                else:
+                    try:
+                        _spawn_backend(["bash", _bg, "start"], cwd=APP_DEST)
+                        log("开机守护已启动（快速恢复，非 systemd 路径）")
+                    except Exception as e:
+                        log("开机守护启动失败（快速恢复）：%r" % (e,))
+            # 画面服务容器也确认在
+            try:
+                _wp = run("docker ps --filter name=androidemu-webrtc --format '{{.Names}}'", timeout=10)
+                if not (_wp and b"androidemu-webrtc" in _wp.stdout):
+                    run("cd %s && docker compose -p androidemu up -d webrtc"
+                        % os.path.dirname(COMPOSE), timeout=180)
+                    log("快速恢复：画面服务容器缺失 → 已补建")
+            except Exception as e:
+                log("快速恢复补建画面服务失败：%r" % (e,))
+            log("快速恢复完成")
+            return
+    except Exception as e:
+        log("快速恢复判断异常，走完整流程：%r" % (e,))
     heal_var_perm()
     heal_tree_perm()
     # 3.9.3：标记「用户希望本应用运行」—— boot_guard 见容器不存在时会主动创建
@@ -615,10 +784,16 @@ def stop():
         run("for p in $(ps -eo pid,args | grep -F '%s/server/audio_fix.py' | grep -v grep | awk '{print $1}'); do kill -9 $p 2>/dev/null; done" % _pre, timeout=20)
         ### 3.9.4：看护类进程已清理，此时再停容器，避免停机过程中被重新拉起
     if os.path.exists(COMPOSE):
-        run("cd %s && docker compose -p androidemu stop -t 60" % os.path.dirname(COMPOSE), timeout=90)
+        ### 3.9.9-r23：等 SIGTERM 的时间从 60 秒降到 8 秒。
+        ### 2026-11-15 实测（浏览器点「停用」全程采样）：redroid 容器**根本不响应 SIGTERM**，
+        ### compose stop 一路等到自己超时才发 SIGKILL，最终退出码 137。
+        ### 也就是那 60 秒是纯白等 —— 用户看到「停用中」转圈 100 秒，还以为卡死了。
+        ### 安卓的 /data 由内核文件系统管理，强杀不会丢数据；真正要保护的写入在
+        ### 容器停之前就已经落盘。这里只留 8 秒给还活着的进程收尾。
+        run("cd %s && docker compose -p androidemu stop -t 8" % os.path.dirname(COMPOSE), timeout=40)
         # 兜底：compose 停不掉（容器状态卡死）时强制停止
         run("docker ps --filter name=androidemu --format '{{.Names}}' | "
-            "xargs -r docker stop -t 20 >/dev/null 2>&1 || true", timeout=120)
+            "xargs -r docker stop -t 8 >/dev/null 2>&1 || true", timeout=60)
     ### 3.9.4：压制复查 —— 停止后再观察 3 轮，若仍有容器被外部拉起则重复停止。
     ### 保证「点停用后确实停住」，而不是停完几秒又被某条看护链路拉起。
     for _round in range(3):
@@ -628,17 +803,38 @@ def stop():
             break
         log("检测到容器仍在运行（第 %d 轮复查）：%s → 再次停止" % (_round + 1, names.replace("\n", " ")))
         if os.path.exists(COMPOSE):
-            run("cd %s && docker compose -p androidemu stop -t 20" % os.path.dirname(COMPOSE), timeout=60)
+            run("cd %s && docker compose -p androidemu stop -t 8" % os.path.dirname(COMPOSE), timeout=40)
         run("docker ps --filter name=androidemu --format '{{.Names}}' | "
-            "xargs -r docker stop -t 15 >/dev/null 2>&1 || true", timeout=90)
+            "xargs -r docker stop -t 8 >/dev/null 2>&1 || true", timeout=60)
         time.sleep(4)
     log("停止完成")
 
 def status():
+    """应用是否在运行 —— 以**容器**为准，同时把 status 当成开机自愈的最后一个入口。
+    ### 3.9.9-r26（修正 r25 的回归，重要）：
+    ### r25 曾把这里改成「缺网关就报未运行」，结果飞牛据此判定应用起不来：
+    ###   应用中心一直转「启用中」→ 超时退回「停用」→ 用户点了启用也没用。
+    ### 实测证据（20:25-20:32 的 main.log，13 条全是 status，**没有一条 start**）：
+    ### **飞牛开机后只轮询 status，从不主动调 start**。
+    ### 所以这里绝不能因为「网关没起」就报未运行 —— 那会形成死锁：
+    ###   status 说没运行 → 飞牛不启动 → status 一直没运行。
+    ### 现在的策略：
+    ###   · 返回值只看容器（保证飞牛状态机稳定，不再卡「启用中」）；
+    ###   · 顺手检查网关，缺失就以包用户身份补起（ensure_gateway_quiet，30 秒防抖）。
+    ###     status 是开机后唯一被周期性调用的入口，也是唯一能做自愈的位置。
+    """
     result = run("docker ps --filter name=androidemu --format '{{.Names}}'", timeout=10)
-    if result and b"androidemu-android" in result.stdout:
-        sys.exit(0)
-    sys.exit(3)
+    if not (result and b"androidemu-android" in result.stdout):
+        ### 3.9.9-r29：装完到容器建出来之间正在下镜像，别让飞牛把这当成「没运行」
+        if _image_pulling():
+            log("状态检查：容器尚未创建，但镜像仍在后台拉取 → 视为「准备中」")
+            sys.exit(0)
+        sys.exit(3)
+    try:
+        ensure_gateway_quiet()
+    except Exception as e:
+        log("状态检查补起网关异常：%r" % (e,))
+    sys.exit(0)
 
 if __name__ == "__main__":
     action = sys.argv[1] if len(sys.argv) > 1 else "start"
