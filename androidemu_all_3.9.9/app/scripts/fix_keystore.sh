@@ -36,6 +36,15 @@ KFILE="/data/misc/keystore/persistent.sqlite"
 SYS_DIR="/data/system"
 SYS_UID=1000
 SYS_GID=1000
+### 3.9.9-r27：容器未运行时一律退出，绝不在「已停用」状态下把容器拉起来。
+### 2026-11-15 21:11 实测：用户点「停用」→ 容器 exited → 本脚本的 docker exec 全部失败，
+### 被判为「异常」→ 走修复路径 → docker restart，容器 1 秒后又被拉起，
+### 用户看到「停用了但容器还在跑」。容器没在跑时，修容器内的问题没有意义。
+_st=$(docker inspect -f '{{.State.Status}}' "$ANDROID_C" 2>/dev/null || echo none)
+case "$_st" in
+    exited|created|dead) exit 0 ;;
+esac
+
 
 mkdir -p "$VAR_DIR" 2>/dev/null || true
 
