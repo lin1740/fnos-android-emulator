@@ -233,7 +233,9 @@ if [ -f "$INDEX_HTML" ] && ! grep -q "androidemu-ui-parity" "$INDEX_HTML" 2>/dev
 <script id="androidemu-ui-parity">
 (function(){
   try{
-    var css = "@media(max-width:768px){body,html{overflow-x:auto!important;-webkit-overflow-scrolling:touch!important;}"
+    var css = "@media(max-width:768px){body,html{overflow-x:hidden!important;-webkit-overflow-scrolling:touch!important;height:auto!important;min-height:100%!important;}"
+      + "@media(max-width:768px){#app,#root,.app,.app-container,.layout,.main,.page,.content{min-height:100vh!important;height:auto!important;}}"
+      + "@media(max-width:768px){img,video,canvas{max-width:100vw!important;}}"
       + "div[style*='position:fixed'][style*='bottom'],div[class*='bottom-panel'],div[class*='terminal-panel'],div[class*='tool-panel'],div[class*='drawer']{max-width:100vw!important;overflow-x:auto!important;overflow-y:hidden!important;}"
       + "div[class*='window'],div[class*='modal'],div[class*='dialog']{max-width:100vw!important;left:0!important;right:auto!important;}"
       + "button[class*='close'],button[aria-label*='close'],button[title*='关闭']{position:sticky!important;left:0!important;z-index:9999!important;}"
