@@ -621,8 +621,17 @@ for _d in "${SCRIPT_DIR}/../translation/houdini" "${TRIM_PKGVAR:-/var/apps/andro
     fi
 done
 if [ -z "$ARM_SET" ]; then
-    echo "tune_compose[$ARCH]: 未找到 ARM 系统库集，尝试自动获取（约 100MB，用于微信等 Tinker 应用）..." >&2
-    bash "${SCRIPT_DIR}/download_houdini.sh" "${SCRIPT_DIR}/../translation/houdini" >/dev/null 2>&1 || true
+    ### 3.9.9-r29：安装/升级阶段绝不在这里下载。
+    ### 该库整包 150-250MB，download_houdini 内置「4 轮 × 30 分钟」续传，
+    ### 官方实测「安装中的状态持续很久」就是卡在这一步（安装回调同步等它）。
+    ### 现在安装回调传 AE_SKIP_ARM_FETCH=1 直接跳过，由 start_pull_bg 在后台
+    ### 与镜像并行下载；下载好了下一次 tune/重建就自动带上。
+    if [ "${AE_SKIP_ARM_FETCH:-0}" = "1" ]; then
+        echo "tune_compose[$ARCH]: 未找到 ARM 系统库集；安装阶段跳过下载（后台会补），本次不挂 ARM 库集" >&2
+    else
+        echo "tune_compose[$ARCH]: 未找到 ARM 系统库集，尝试自动获取（约 100MB，用于微信等 Tinker 应用）..." >&2
+        bash "${SCRIPT_DIR}/download_houdini.sh" "${SCRIPT_DIR}/../translation/houdini" >/dev/null 2>&1 || true
+    fi
     _d="${SCRIPT_DIR}/../translation/houdini"
     if [ -n "$(ls "$_d/lib/arm"/*.so 2>/dev/null | head -1)" ]; then ARM_SET="$_d"; fi
     if [ -n "$(ls "$_d/lib/arm/arm"/*.so 2>/dev/null | head -1)" ]; then ARM_SET="$_d|nested"; fi
