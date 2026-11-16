@@ -335,6 +335,14 @@ log "性能优化：动画半速(0.5)/蓝牙/NFC/GPS/系统更新已优化，限
         SECRET_FLAG="-device-secret ${DEVICE_SECRET}"
         log "检测到 CLOUDPHONE_DEVICE_SECRET，agent 将携带设备注册密钥注册"
     fi
+    ### 3.9.9-r19：agent 起来之前先确保 shell(2000) 能执行 app_process。
+    ### 面板「连接」失败报 fork/exec /system/bin/app_process: permission denied 时，
+    ### 过去只能等下一轮 60 秒巡检才自愈（群友 2026-11-15 实测正好卡在这个窗口里）。
+    ### 放在启动 agent 之前，agent 只要是新起的就一定具备投屏条件。
+    if [ -f "${APP_DIR_RT}/scripts/app_process_caps.sh" ]; then
+        TRIM_PKGVAR="$VAR_DIR" TRIM_APPDEST="$APP_DIR_RT" \
+            bash "${APP_DIR_RT}/scripts/app_process_caps.sh" --preflight >>"$LOG" 2>&1 || true
+    fi
     for SCHEME in $( [ "$WANT_TLS" = "1" ] && echo "wss ws" || echo "ws wss" ); do
         ### 3.9.9：agent 必须以系统内高权限 运行 —— 回退 3.9.8 的 uid 2000 改法。
         ### 实测 2026-11-08（主 NAS，Android 12）：/system/bin/app_process 在非系统身份
