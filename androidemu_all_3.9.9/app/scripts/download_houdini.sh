@@ -21,6 +21,26 @@ if [ -z "$HOUDINI_DIR" ]; then
 fi
 mkdir -p "$HOUDINI_DIR/lib64" "$HOUDINI_DIR/lib" 2>/dev/null || true
 
+### 3.9.9-r30：下载成功后立即存档到「应用数据目录」，之后升级/重装直接复用。
+### 之前只有「保留数据卸载」才把它挪进 vol-data，升级时 app 目录被整体替换 →
+### 库丢失 → 每次升级都要重新下 150-250MB（用户实测和官方反馈都卡在这）。
+### 存档位置与应用数据目录一致（$TRIM_PKGVAR/armlibs），tune_compose 本来就优先读它。
+VAR_DIR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+ARCHIVE_DIR="$VAR_DIR/armlibs"
+archive_libs(){
+    [ -d "$HOUDINI_DIR" ] || return 0
+    case "$HOUDINI_DIR" in "$ARCHIVE_DIR"|"$ARCHIVE_DIR"/*) return 0 ;; esac
+    [ -n "$(ls "$HOUDINI_DIR/lib64/libhoudini.so" "$HOUDINI_DIR/lib/arm" 2>/dev/null | head -1)" ] || return 0
+    mkdir -p "$ARCHIVE_DIR" 2>/dev/null || return 0
+    rm -rf "$ARCHIVE_DIR.new" "$ARCHIVE_DIR.old" 2>/dev/null || true
+    cp -a "$HOUDINI_DIR"/. "$ARCHIVE_DIR.new"/ 2>/dev/null || { rm -rf "$ARCHIVE_DIR.new"; return 0; }
+    mv "$ARCHIVE_DIR" "$ARCHIVE_DIR.old" 2>/dev/null || true
+    mv "$ARCHIVE_DIR.new" "$ARCHIVE_DIR" 2>/dev/null || true
+    rm -rf "$ARCHIVE_DIR.old" 2>/dev/null || true
+    echo "  已存档到 $ARCHIVE_DIR（下次升级/重装直接复用，不再下载）"
+}
+
+
 ### 已存在则跳过
 _HAVE_SZ=$(stat -c %s "$HOUDINI_DIR/lib64/libhoudini.so" 2>/dev/null || echo 0)
 if [ "$_HAVE_SZ" -gt 5000000 ] 2>/dev/null; then
@@ -226,6 +246,7 @@ if [ -n "$_PREB" ] && [ -f "$_PREB/lib64/libhoudini.so" ]; then
     echo "  翻译器: bin/houdini$( [ -f "$HOUDINI_DIR/bin/houdini64" ] && echo -n ' + bin/houdini64' )$( [ -f "$HOUDINI_DIR/bin/arm64/linker64" ] && echo -n ' + linkers' )"
     echo "  ARM64 库集: $(find "$HOUDINI_DIR/lib64/arm64" -name '*.so' 2>/dev/null | wc -l) 个 .so | ARM32 库集: $(find "$HOUDINI_DIR/lib/arm" -name '*.so' 2>/dev/null | wc -l) 个 .so"
     rm -rf "$TMP_DIR"
+    archive_libs
     echo "download_houdini: 完成！libhoudini 已安装到 $HOUDINI_DIR"
     echo "  设置 ANDROIDEMU_TRANSLATION=houdini 或 auto 即可启用"
     exit 0
@@ -270,6 +291,7 @@ done
 rm -rf "$TMP_DIR"
 
 if [ -f "$HOUDINI_DIR/lib64/libhoudini.so" ] || [ -f "$HOUDINI_DIR/lib/libhoudini.so" ]; then
+    archive_libs
     echo "download_houdini: 完成！libhoudini 已安装到 $HOUDINI_DIR"
     echo "  设置 ANDROIDEMU_TRANSLATION=houdini 或 auto 即可启用"
     exit 0
