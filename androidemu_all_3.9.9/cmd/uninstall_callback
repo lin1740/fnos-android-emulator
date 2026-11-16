@@ -86,6 +86,13 @@ pkill -f "redroid/redroid" 2>/dev/null || true
 pkill -f "scrcpy-over-webrtc" 2>/dev/null || true
 rm -f "$VAR_DIR/pull.pid" "$VAR_DIR/pull.log" "$VAR_DIR/pull-progress.log" "$VAR_DIR/eta.state" 2>/dev/null || true
 
+### 3.9.9-r28：先注销 systemd 服务，否则卸载后它会把看护一直拉起来（残留进程 + 重启后复活）。
+if [ -f "${TRIM_APPDEST}/scripts/guard_service.sh" ] && [ "$(id -u)" = "0" ] \
+        && command -v systemctl >/dev/null 2>&1; then
+    bash "${TRIM_APPDEST}/scripts/guard_service.sh" remove >/dev/null 2>&1 || true
+    echo "[$(date '+%F %T')] 已注销 systemd 后端看护服务"
+fi
+
 ### 2.5) 兜底：再次停止本应用全部后台守护（3.8.9）。
 ###   与 uninstall_init 用同一套匹配规则（唯一脚本名 + cmdline 含 androidemu），
 ###   防止 init 阶段漏杀、或卸载过程中守护被重新拉起而残留。
@@ -232,6 +239,23 @@ _ae_rm_network
 
 ### 5.6) 选了「删除数据」时，先把应用数据目录里包用户能删的部分清掉；
 ###   剩下的在「第 8.1 段」按同样的规则处理，不再依赖本地镜像。
+### 3.9.9-r31：ARM 系统库集改为跟「是否保留镜像」同生命周期（用户 2026-11-16 建议）。
+### 它和镜像一样属于「重装免下载」的缓存，不属于用户数据 —— 放在「保留数据」下面
+### 语义不对（用户删数据但保留镜像时，库会被一起清掉，重装又得下 250MB）。
+### 这里在删目录之前，把它打包成一个镜像存起来；重装时 install_callback 会从镜像恢复。
+_ARMLIB_IMG="${CANON_ARMLIBS:-androidemu-cache/armlibs:12}"
+if [ "${wizard_delete_images:-false}" != "true" ] && [ "${wizard_keep_data:-true}" = "false" ]; then
+    _ARM_SRC="${TRIM_PKGVAR:-/var/apps/androidemu/var}/armlibs"
+    [ -d "$_ARM_SRC" ] || _ARM_SRC="${TRIM_PKGVAR:-/var/apps/androidemu/var}/vol-data/.houdini_keep"
+    if [ -d "$_ARM_SRC" ] && [ -n "$(ls "$_ARM_SRC/lib64/libhoudini.so" 2>/dev/null)" ]; then
+        if tar -C "$_ARM_SRC" -cf - . 2>/dev/null | docker import - "$_ARMLIB_IMG" >/dev/null 2>&1; then
+            echo "[$(date '+%F %T')] 已把 ARM 系统库集保存为镜像 $_ARMLIB_IMG（重装直接复用，不再下载）"
+        else
+            echo "[$(date '+%F %T')] ARM 库集保存为镜像失败（重装时会重新下载）"
+        fi
+    fi
+fi
+
 if [ "${wizard_keep_data:-true}" = "false" ]; then
     _AE_PRE="$(readlink -f "${TRIM_PKGVAR:-/var/apps/androidemu/var}" 2>/dev/null)"
     case "$_AE_PRE" in
@@ -250,7 +274,7 @@ if [ -f "${TRIM_APPDEST}/scripts/rtconf.sh" ]; then
     . "${TRIM_APPDEST}/scripts/rtconf.sh"
     rtconf_load
 fi
-for IMG in "${CANON_REDROID:-}" "${OFF_REDROID:-}" "${CANON_WEBRTC:-}" "${OFF_WEBRTC:-}" \
+for IMG in "${CANON_REDROID:-}" "${OFF_REDROID:-}" "${CANON_WEBRTC:-}" "${OFF_WEBRTC:-}" "androidemu-cache/armlibs:12" \
            "${CACHE_REDROID:-}" "${CACHE_WEBRTC:-}" \
            "docker.m.daocloud.io/${REDROID_REPO:-redroid/redroid}:${REDROID_TAG:-12.0.0-latest}" \
            "docker.m.daocloud.io/${WEBRTC_REPO:-buutuu/scrcpy-over-webrtc}:${WEBRTC_TAG:-latest}"; do
@@ -296,13 +320,20 @@ else
     ### 3.9.8：把 ARM 系统库集（约 100MB）挪进保留的数据卷，供重装复用。
     ### 以前它随 @appcenter 一起被删，保留数据重装仍要重新下载 5~10 分钟，
     ### 与向导「重装秒级完成」的承诺不符。mv 是同卷瞬时操作，失败不影响卸载主流程。
-    _HSRC="${TRIM_APPDEST:-/var/apps/androidemu/target}/translation/houdini"
     _HKEEP="${TRIM_PKGVAR:-/var/apps/androidemu/var}/vol-data/.houdini_keep"
-    if [ -d "$_HSRC" ] && [ -d "$(dirname "$_HKEEP")" ]; then
-        rm -rf "$_HKEEP" 2>/dev/null || true
-        if mv "$_HSRC" "$_HKEEP" 2>/dev/null; then
-            echo "[$(date '+%F %T')] 已把 ARM 系统库集移入保留数据卷，重装时无需重新下载"
-        fi
+    _HARCH="${TRIM_PKGVAR:-/var/apps/androidemu/var}/armlibs"
+    _HDEST_UN="${TRIM_APPDEST:-/var/apps/androidemu/target}/translation/houdini"
+    ### 3.9.9-r30：归档目录（armlibs）优先；它是下载后自动存档的位置。
+    if [ -d "$(dirname "$_HKEEP")" ]; then
+        for _hs in "$_HARCH" "$_HDEST_UN"; do
+            if [ -d "$_hs" ] && [ -n "$(ls "$_hs/lib64/libhoudini.so" "$_hs/lib/arm" 2>/dev/null | head -1)" ]; then
+                rm -rf "$_HKEEP" 2>/dev/null || true
+                if mv "$_hs" "$_HKEEP" 2>/dev/null; then
+                    echo "[$(date '+%F %T')] 已把 ARM 系统库集移入保留数据卷，重装时无需重新下载"
+                fi
+                break
+            fi
+        done
     fi
     ### 3.9.1：保留数据 ≠ 保留坏掉的表面缓存。
     ### 只清「桌面图标缓存 + 桌面布局」这类可再生记录，并修正 APK 权限，
