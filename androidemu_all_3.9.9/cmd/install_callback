@@ -255,15 +255,37 @@ _ae_compose_to_docker(){
 
 ### 3.9.8：优先复用「保留数据卸载」时挪进数据卷的 ARM 系统库集（约 100MB），
 ### 避免重装再下载 5~10 分钟；没有该缓存时走原有自动获取流程，行为不变。
-_HKEEP="${TRIM_PKGVAR:-/var/apps/androidemu/var}/vol-data/.houdini_keep"
+_VARDIR_R30="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
+_HKEEP="$_VARDIR_R30/vol-data/.houdini_keep"
+_HARCH="$_VARDIR_R30/armlibs"
 _HDEST="${TRIM_APPDEST}/translation/houdini"
-if [ -d "$_HKEEP" ]; then
-    ### 解包后通常已有一个空的 translation/houdini 目录，同样要复用。
-    if [ ! -d "$_HDEST" ] || [ -z "$(ls -A "$_HDEST" 2>/dev/null)" ]; then
-        rm -rf "$_HDEST" 2>/dev/null || true
-        mkdir -p "$(dirname "$_HDEST")" 2>/dev/null || true
-        if mv "$_HKEEP" "$_HDEST" 2>/dev/null; then
-            echo "[$(date '+%F %T')] 复用保留的 ARM 系统库集，无需重新下载"
+_has_armlibs(){ [ -n "$(ls "$1/lib64/libhoudini.so" "$1/lib/arm" 2>/dev/null | head -1)" ]; }
+### 3.9.9-r30：复用顺序 数据目录归档 → 卸载保留的缓存 → 包内自带。
+### 一律用 cp（旧代码用 mv，把缓存吃掉了：下次升级又得重下 250MB）。
+if ! _has_armlibs "$_HARCH"; then
+    for _src in "$_HKEEP" "$_HDEST"; do
+        if _has_armlibs "$_src"; then
+            rm -rf "$_HARCH" 2>/dev/null || true
+            if cp -a "$_src" "$_HARCH" 2>/dev/null; then
+                echo "[$(date '+%F %T')] 复用已存档的 ARM 系统库集（$_src），无需重新下载"
+            fi
+            break
+        fi
+    done
+fi
+### 3.9.9-r31：前面都没有，就看「卸载时保存的镜像」—— 它跟镜像同生命周期，
+### 用户选「保留镜像」就能跨重装复用，不再受「删不删数据」影响。
+if ! _has_armlibs "$_HARCH"; then
+    _ARMLIB_IMG="${CANON_ARMLIBS:-androidemu-cache/armlibs:12}"
+    if docker image inspect "$_ARMLIB_IMG" >/dev/null 2>&1; then
+        _armcid=$(docker create "$_ARMLIB_IMG" 2>/dev/null)
+        if [ -n "$_armcid" ]; then
+            rm -rf "$_HARCH" 2>/dev/null || true
+            mkdir -p "$_HARCH" 2>/dev/null || true
+            if docker cp "$_armcid:/." "$_HARCH" >/dev/null 2>&1; then
+                echo "[$(date '+%F %T')] 已从镜像 $_ARMLIB_IMG 恢复 ARM 系统库集，无需重新下载"
+            fi
+            docker rm -f "$_armcid" >/dev/null 2>&1 || true
         fi
     fi
 fi
@@ -377,7 +399,10 @@ rm -f "${TRIM_PKGVAR:-/var/apps/androidemu/var}/gpu_fallback.done" \
       "${TRIM_PKGVAR:-/var/apps/androidemu/var}/gpu_artifact.done" \
       "${TRIM_PKGVAR:-/var/apps/androidemu/var}/dri_release.done" 2>/dev/null || true
 if [ -f "$COMPOSE" ] && [ -f "${TRIM_APPDEST}/scripts/tune_compose.sh" ]; then
-    bash "${TRIM_APPDEST}/scripts/tune_compose.sh" "$COMPOSE" || true
+    ### 3.9.9-r29：安装回调里**禁止**下载 ARM 转译库（150-250MB，最坏 4×30 分钟）。
+    ### 这是「安装中状态持续很久」的直接原因（官方 2026-11-16 反馈）。
+    ### 由 start_pull_bg 在后台与镜像并行下载，安装流程立即返回。
+    AE_SKIP_ARM_FETCH=1 bash "${TRIM_APPDEST}/scripts/tune_compose.sh" "$COMPOSE" || true
 
 ### 3.9.1：设备与 compose 兜底校验。
 ### 宿主缺少 /dev/binder 或 /dev/net/tun 时，compose 的 devices 段会导致创建失败
@@ -830,6 +855,17 @@ if [ -f "${TRIM_APPDEST}/scripts/start_pull_bg.sh" ]; then
     else
         bash "${TRIM_APPDEST}/scripts/start_pull_bg.sh" >/dev/null 2>&1 || true
     fi
+fi
+
+### 3.9.9-r28：把后端看护交给 systemd 托管（官方口径：前台不要 root，后端可 root）。
+### 目的：NAS 重启后由 systemd 自动拉起看护，不再依赖飞牛调用 cmd/main start
+### （已证实飞牛只轮询 status、从不调 start），从根上消掉「重启后 Bad Gateway 永不恢复」。
+### 看护自己是 root（要操作 docker），但它拉起的网关会降权到包用户，前端不出现 root 常驻。
+if [ -f "${TRIM_APPDEST}/scripts/guard_service.sh" ] && [ "$(id -u)" = "0" ] \
+        && command -v systemctl >/dev/null 2>&1; then
+    bash "${TRIM_APPDEST}/scripts/guard_service.sh" install >/dev/null 2>&1 \
+        && echo "[$(date '+%F %T')] 后端看护已注册为 systemd 服务（开机自启）" \
+        || echo "[$(date '+%F %T')] 后端看护 systemd 注册失败，回退为 start_pull_bg 启动"
 fi
 
 ### 3.9.2 修正：镜像没就绪时不要在这里 up —— 否则 compose 会同步去拉约 2GB 镜像，
