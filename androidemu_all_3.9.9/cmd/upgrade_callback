@@ -429,7 +429,18 @@ _ae_spawn_guard(){
 ### 3.9.9：清掉 upgrade_init 留下的升级窗口标记 —— 否则新拉起的看护会继续静默
 ### 30 分钟，期间容器崩溃/丢失都无人补建。
 rm -f "$_AE_VAR/.upgrade_window" 2>/dev/null || true
-_ae_spawn_guard boot_guard.sh
+### 3.9.9-r28：boot_guard 改由 systemd 托管（root，开机自启）；register 成功后
+### 不再用降权方式起第二个实例，否则两边抢 boot_guard.lock。
+if [ -f "${TRIM_APPDEST}/scripts/guard_service.sh" ] && [ "$(id -u)" = "0" ] \
+        && command -v systemctl >/dev/null 2>&1; then
+    if bash "${TRIM_APPDEST}/scripts/guard_service.sh" install >/dev/null 2>&1; then
+        echo "[$(date '+%F %T')] 后端看护已注册为 systemd 服务（开机自启）"
+    else
+        _ae_spawn_guard boot_guard.sh
+    fi
+else
+    _ae_spawn_guard boot_guard.sh
+fi
 _ae_spawn_guard webrtc_watchdog.sh
 
 if [ -f "${TRIM_APPDEST}/scripts/gw_socket.sh" ]; then
