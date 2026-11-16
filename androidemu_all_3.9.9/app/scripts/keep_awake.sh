@@ -18,6 +18,15 @@ APP_DIR="${TRIM_APPDEST:-/var/apps/androidemu/target}"
 VAR_DIR="${TRIM_PKGVAR:-/var/apps/androidemu/var}"
 LOG="$VAR_DIR/keep_awake.log"
 C="androidemu-android"
+### 3.9.9-r27：容器未运行时一律退出，绝不在「已停用」状态下把容器拉起来。
+### 2026-11-15 21:11 实测：用户点「停用」→ 容器 exited → 本脚本的 docker exec 全部失败，
+### 被判为「异常」→ 走修复路径 → docker restart，容器 1 秒后又被拉起，
+### 用户看到「停用了但容器还在跑」。容器没在跑时，修容器内的问题没有意义。
+_st=$(docker inspect -f '{{.State.Status}}' "$C" 2>/dev/null || echo none)
+case "$_st" in
+    exited|created|dead) exit 0 ;;
+esac
+
 mkdir -p "$VAR_DIR" 2>/dev/null || true
 
 log() { echo "[$(date '+%F %T')] keep_awake: $*" >> "$LOG" 2>/dev/null || true; }
@@ -63,10 +72,20 @@ log "svc power stayon true 已执行"
 exec_android 'input keyevent KEYCODE_WAKEUP' 2>/dev/null
 log "屏幕唤醒命令已发送"
 
-# 5. 【3.8.9 性能加强】定期修剪应用缓存（防国内 APP 缓存膨胀挤占内存；
-#    目标为保留 1G 空闲空间，空闲充足时为空操作，低频幂等无副作用）
-exec_android 'pm trim-caches 1G' 2>/dev/null
-log "应用缓存修剪已执行 (trim-caches 1G)"
+# 5. 【3.8.9 性能加强】修剪应用缓存（防国内 APP 缓存膨胀挤占内存）。
+#    3.9.9-r32：本脚本由看护每 60 秒调用一次，原来每次都跑 trim ——
+#    实测（2026-11-16 用户反馈「点一下没没多久像重启，内存从 3G 掉到 2G」）
+#    等于每分钟清一次缓存：应用每次都要重新加载、内存曲线周期性跳水。
+#    这里改为「每 6 小时最多一次」，保留防膨胀能力，去掉高频副作用。
+_TRIM_MARK="$VAR_DIR/.trim_caches_at"
+_now_ts=$(date +%s)
+_last_ts=$(cat "$_TRIM_MARK" 2>/dev/null || echo 0)
+case "$_last_ts" in ''|*[!0-9]*) _last_ts=0 ;; esac
+if [ $(( _now_ts - _last_ts )) -ge 21600 ]; then
+    exec_android 'pm trim-caches 1G' 2>/dev/null
+    echo "$_now_ts" > "$_TRIM_MARK" 2>/dev/null || true
+    log "应用缓存修剪已执行 (trim-caches 1G，每 6 小时一次)"
+fi
 
 log "保持唤醒设置完成"
 exit 0
